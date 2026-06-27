@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Lock
 from types import SimpleNamespace
 
 import pytest
@@ -79,7 +80,8 @@ def _pipeline() -> ZImagePipeline:
     pipeline.transformer = _FakeTransformer()
     pipeline.vae = _FakeVAE()
     pipeline.vae_scale_factor = 8
-    pipeline.stage_durations = None
+    pipeline._profiler_lock = Lock()
+    pipeline._stage_durations = {}
     pipeline.encode_prompt = lambda **kwargs: (
         [
             torch.tensor([[1.0, 1.0], [1.0, 1.0]], dtype=torch.float32),
