@@ -556,6 +556,41 @@ class OmniServeCommand(CLISubcommand):
             action="store_true",
             help="Enable per-step diffusion execution so running requests can be aborted between denoise steps.",
         )
+        omni_config_group.add_argument(
+            "--enable-diffusion-state-manager",
+            action="store_true",
+            help="Persist step-execution diffusion latents for checkpoint, abort, and resume flows.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-state-manager-gpu-budget-bytes",
+            type=int,
+            default=0,
+            help="GPU budget in bytes for retained diffusion checkpoints.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-state-manager-cpu-budget-bytes",
+            type=int,
+            default=0,
+            help="CPU budget in bytes for retained diffusion checkpoints.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-state-manager-theta-h",
+            type=float,
+            default=0.7,
+            help="Value-score threshold for lossless checkpoint retention.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-state-manager-theta-w",
+            type=float,
+            default=0.3,
+            help="Value-score threshold for compressed checkpoint retention.",
+        )
+        omni_config_group.add_argument(
+            "--diffusion-state-manager-disk-path",
+            type=str,
+            default=None,
+            help="Disk spill directory for retained diffusion checkpoints.",
+        )
 
         # VAE memory optimization parameters
         omni_config_group.add_argument(

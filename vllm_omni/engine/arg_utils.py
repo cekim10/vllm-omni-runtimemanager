@@ -198,6 +198,12 @@ class OmniEngineArgs(EngineArgs):
     log_stats: bool = False
     custom_pipeline_args: dict[str, Any] | None = None
     has_sampling_extra_args: bool = False
+    enable_diffusion_state_manager: bool = False
+    diffusion_state_manager_gpu_budget_bytes: int = 0
+    diffusion_state_manager_cpu_budget_bytes: int = 0
+    diffusion_state_manager_theta_h: float = 0.7
+    diffusion_state_manager_theta_w: float = 0.3
+    diffusion_state_manager_disk_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.worker_cls is None:
@@ -464,6 +470,12 @@ class OrchestratorArgs:
     cache_config: str | None = None
     enable_cache_dit_summary: bool = False
     step_execution: bool = False
+    enable_diffusion_state_manager: bool = False
+    diffusion_state_manager_gpu_budget_bytes: int = 0
+    diffusion_state_manager_cpu_budget_bytes: int = 0
+    diffusion_state_manager_theta_h: float = 0.7
+    diffusion_state_manager_theta_w: float = 0.3
+    diffusion_state_manager_disk_path: str | None = None
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
     enable_multithread_weight_load: bool = True

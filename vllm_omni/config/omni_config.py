@@ -464,6 +464,12 @@ class _DiffusionConfigProjection:
     force_cutlass_fp8: bool = False
     enable_diffusion_pipeline_profiler: bool = False
     step_execution: bool = False
+    enable_diffusion_state_manager: bool = False
+    diffusion_state_manager_gpu_budget_bytes: int = 0
+    diffusion_state_manager_cpu_budget_bytes: int = 0
+    diffusion_state_manager_theta_h: float = 0.7
+    diffusion_state_manager_theta_w: float = 0.3
+    diffusion_state_manager_disk_path: str | None = None
     supports_multimodal_inputs: bool = False
     max_multimodal_image_inputs: int | None = None
     model_paths: dict[str, str] = field(default_factory=dict)

@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.entrypoints.utils import filter_dataclass_kwargs
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
@@ -122,6 +124,38 @@ def test_default_stage_config_includes_default_sampling_params():
         "generator_device": "cpu",
         "guidance_scale": 7.5,
     }
+
+
+def test_default_stage_config_includes_diffusion_state_manager_args():
+    """Ensure diffusion state manager knobs survive default stage creation."""
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(
+        {
+            "step_execution": True,
+            "enable_diffusion_state_manager": True,
+            "diffusion_state_manager_gpu_budget_bytes": 123,
+            "diffusion_state_manager_cpu_budget_bytes": 456,
+            "diffusion_state_manager_theta_h": 0.8,
+            "diffusion_state_manager_theta_w": 0.2,
+            "diffusion_state_manager_disk_path": "/tmp/diffusion-state-manager",
+        }
+    )[0]
+
+    engine_args = stage_cfg["engine_args"]
+    filtered_engine_args = filter_dataclass_kwargs(OmniEngineArgs, engine_args)
+
+    assert engine_args["step_execution"] is True
+    assert engine_args["enable_diffusion_state_manager"] is True
+    assert engine_args["diffusion_state_manager_gpu_budget_bytes"] == 123
+    assert engine_args["diffusion_state_manager_cpu_budget_bytes"] == 456
+    assert engine_args["diffusion_state_manager_theta_h"] == pytest.approx(0.8)
+    assert engine_args["diffusion_state_manager_theta_w"] == pytest.approx(0.2)
+    assert engine_args["diffusion_state_manager_disk_path"] == "/tmp/diffusion-state-manager"
+    assert filtered_engine_args["enable_diffusion_state_manager"] is True
+    assert filtered_engine_args["diffusion_state_manager_gpu_budget_bytes"] == 123
+    assert filtered_engine_args["diffusion_state_manager_cpu_budget_bytes"] == 456
+    assert filtered_engine_args["diffusion_state_manager_theta_h"] == pytest.approx(0.8)
+    assert filtered_engine_args["diffusion_state_manager_theta_w"] == pytest.approx(0.2)
+    assert filtered_engine_args["diffusion_state_manager_disk_path"] == "/tmp/diffusion-state-manager"
 
 
 def test_default_stage_config_includes_diffusion_attention_backend():
@@ -256,6 +290,51 @@ def test_serve_cli_accepts_diffusion_pipeline_profiler_flag():
 
     assert args.enable_diffusion_pipeline_profiler is True
     assert stage_cfg["engine_args"]["enable_diffusion_pipeline_profiler"] is True
+
+
+def test_serve_cli_accepts_diffusion_state_manager_flags():
+    """Ensure diffusion serve CLI exposes state-manager knobs."""
+    parser = TrackingArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    OmniServeCommand().subparser_init(subparsers)
+
+    args = parser.parse_args(
+        [
+            "serve",
+            "Tongyi-MAI/Z-Image-Turbo",
+            "--omni",
+            "--step-execution",
+            "--enable-diffusion-state-manager",
+            "--diffusion-state-manager-gpu-budget-bytes",
+            "1024",
+            "--diffusion-state-manager-cpu-budget-bytes",
+            "2048",
+            "--diffusion-state-manager-theta-h",
+            "0.9",
+            "--diffusion-state-manager-theta-w",
+            "0.4",
+            "--diffusion-state-manager-disk-path",
+            "/tmp/dsm",
+        ]
+    )
+
+    explicit_kwargs = args.get_explicit_kwargs_dict()
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(explicit_kwargs)[0]
+    engine_args = stage_cfg["engine_args"]
+
+    assert args.enable_diffusion_state_manager is True
+    assert args.diffusion_state_manager_gpu_budget_bytes == 1024
+    assert args.diffusion_state_manager_cpu_budget_bytes == 2048
+    assert args.diffusion_state_manager_theta_h == pytest.approx(0.9)
+    assert args.diffusion_state_manager_theta_w == pytest.approx(0.4)
+    assert args.diffusion_state_manager_disk_path == "/tmp/dsm"
+    assert engine_args["step_execution"] is True
+    assert engine_args["enable_diffusion_state_manager"] is True
+    assert engine_args["diffusion_state_manager_gpu_budget_bytes"] == 1024
+    assert engine_args["diffusion_state_manager_cpu_budget_bytes"] == 2048
+    assert engine_args["diffusion_state_manager_theta_h"] == pytest.approx(0.9)
+    assert engine_args["diffusion_state_manager_theta_w"] == pytest.approx(0.4)
+    assert engine_args["diffusion_state_manager_disk_path"] == "/tmp/dsm"
 
 
 def test_serve_cli_accepts_diffusion_attention_backend():
