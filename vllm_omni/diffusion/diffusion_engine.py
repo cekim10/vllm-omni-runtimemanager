@@ -362,7 +362,7 @@ class DiffusionEngine:
                 sched_output = self.scheduler.schedule()
 
             if sched_output.is_empty:
-                if self.od_config.streaming_output:
+                if self._streaming_output_enabled():
                     self._handle_empty_streaming_requests(sched_output.finished_req_ids)
                 else:
                     self._handle_finished_requests(sched_output.finished_req_ids, None)
@@ -390,7 +390,7 @@ class DiffusionEngine:
             self._process_rpc_queue()
             self._capture_step_states(runner_output)
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
-            if self.od_config.streaming_output:
+            if self._streaming_output_enabled():
                 self._handle_step_streaming_runner_output(
                     finished_req_ids,
                     sched_output.scheduled_request_ids,
@@ -542,7 +542,7 @@ class DiffusionEngine:
         with self._cv:
             if self._closed:
                 raise RuntimeError("DiffusionEngine is closed.")
-            if not self.od_config.streaming_output:
+            if not self._streaming_output_enabled():
                 fut = self.main_loop.create_future()
                 request_id = self.scheduler.add_request(request)
                 self._out_queue[request_id] = fut
@@ -837,6 +837,10 @@ class DiffusionEngine:
             loop.call_soon_threadsafe(_set_result)
         else:
             _set_result()
+
+    def _streaming_output_enabled(self) -> bool:
+        od_config = getattr(self, "od_config", None)
+        return bool(getattr(od_config, "streaming_output", False))
 
     def _iter_runner_outputs(self, runner_output: BaseRunnerOutput) -> Iterable[RunnerOutput]:
         if isinstance(runner_output, RunnerOutput):
