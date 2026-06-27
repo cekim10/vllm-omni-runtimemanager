@@ -95,6 +95,8 @@ class MingImagePipeline(ZImagePipeline):
                                 ships ``byt5/``)
     """
 
+    supports_step_execution = False
+
     def __init__(
         self,
         *,

@@ -44,6 +44,7 @@ batching only becomes relevant when `--max-num-seqs > 1`.
 | Pipeline | Example models | Step execution |
 |----------|----------------|----------------|
 | `QwenImagePipeline` | `Qwen/Qwen-Image`, `Qwen/Qwen-Image-2512` | Yes |
+| `ZImagePipeline` | `Tongyi-MAI/Z-Image-Turbo` | Yes |
 | All other diffusion pipelines | `QwenImageEditPipeline`, `QwenImageEditPlusPipeline`, `QwenImageLayeredPipeline`, GLM-Image, Wan, Flux, etc. | No |
 
 !!! warning "Experimental continuous batching"
@@ -119,11 +120,11 @@ On a single 48GB GPU, `Qwen/Qwen-Image` may initialize close to the memory
 limit. The helper enables CPU and layerwise offload automatically for that
 configuration, and still retries with offload after a CUDA OOM if needed.
 
-Small text-to-image models such as `Tongyi-MAI/Z-Image-Turbo` and
-`stabilityai/stable-diffusion-3.5-medium` are valid vLLM-Omni models, but they
-do not currently support `step_execution=True`. That means they cannot be used
-with the recovery smoke test's real-model backend yet. For single-GPU
-development on those models, keep using the default `--backend stub` path.
+`Tongyi-MAI/Z-Image-Turbo` now supports the same stepwise runtime contract, so
+it can be used as a smaller real-model target for recovery smoke and failure
+injection experiments on a single GPU. `stabilityai/stable-diffusion-3.5-medium`
+is still a valid vLLM-Omni model for normal generation, but it does not yet
+support `step_execution=True`.
 
 ## For Model Authors
 

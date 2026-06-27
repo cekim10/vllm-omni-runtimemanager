@@ -26,12 +26,12 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import build_text_to_image_prompt, get_model_class_name
 
 _KNOWN_REAL_MODEL_STEP_EXECUTION_TARGETS = (
+    "Tongyi-MAI/Z-Image-Turbo",
     "Qwen/Qwen-Image",
     "Qwen/Qwen-Image-2512",
 )
 
 _KNOWN_REAL_MODEL_STEP_EXECUTION_UNSUPPORTED = (
-    "Tongyi-MAI/Z-Image-Turbo",
     "stabilityai/stable-diffusion-3-medium",
     "stabilityai/stable-diffusion-3.5-medium",
 )

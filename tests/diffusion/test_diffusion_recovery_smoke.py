@@ -19,8 +19,8 @@ def _args(*, backend: str, model: str) -> SimpleNamespace:
     )
 
 
-def test_preflight_rejects_known_small_model_without_step_execution() -> None:
-    args = _args(backend="real-model", model="Tongyi-MAI/Z-Image-Turbo")
+def test_preflight_rejects_known_model_without_step_execution() -> None:
+    args = _args(backend="real-model", model="stabilityai/stable-diffusion-3.5-medium")
 
     with pytest.raises(ValueError, match="step execution support"):
         _preflight_real_model_args(args)
@@ -28,6 +28,12 @@ def test_preflight_rejects_known_small_model_without_step_execution() -> None:
 
 def test_preflight_allows_validated_real_model_target() -> None:
     args = _args(backend="real-model", model="Qwen/Qwen-Image")
+
+    _preflight_real_model_args(args)
+
+
+def test_preflight_allows_z_image_real_model_target() -> None:
+    args = _args(backend="real-model", model="Tongyi-MAI/Z-Image-Turbo")
 
     _preflight_real_model_args(args)
 
