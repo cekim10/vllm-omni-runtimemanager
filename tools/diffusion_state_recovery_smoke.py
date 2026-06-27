@@ -5,15 +5,22 @@ import argparse
 import asyncio
 import copy
 import json
+import queue
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import torch
 
+from vllm_omni.diffusion.data import DiffusionOutput
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.sched import StepScheduler
+from vllm_omni.diffusion.state import DiffusionStateManager
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import build_text_to_image_prompt, get_model_class_name
@@ -22,6 +29,12 @@ from vllm_omni.model_extras import build_text_to_image_prompt, get_model_class_n
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Smoke-test diffusion checkpoint capture, abort, restore, and resume."
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["stub", "real-model"],
+        default="stub",
+        help="Smoke backend: lightweight runtime stub (default) or a real diffusion model.",
     )
     parser.add_argument("--model", default="Qwen/Qwen-Image", help="Diffusion model name or local path.")
     parser.add_argument("--stage-configs-path", type=str, default=None, help="Optional Omni stage config YAML.")
@@ -38,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("/tmp/diffusion-state-smoke"),
-        help="Directory for baseline/resumed outputs and summary JSON.",
+        help="Directory for smoke artifacts and summary JSON.",
     )
     parser.add_argument(
         "--disk-path",
@@ -101,7 +114,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-equality",
         action="store_true",
-        help="Fail if the resumed output is not pixel-identical to the baseline output.",
+        help="Fail if the resumed output is not exactly equal to the baseline output.",
+    )
+    parser.add_argument(
+        "--step-delay",
+        type=float,
+        default=0.02,
+        help="Per-step delay in seconds for the stub backend to make abort timing deterministic.",
     )
     return parser.parse_args()
 
@@ -133,6 +152,10 @@ def _build_prompt(omni: Omni, args: argparse.Namespace) -> Any:
         height=args.height,
         width=args.width,
     )
+
+
+def _build_stub_prompt(args: argparse.Namespace) -> Any:
+    return {"prompt": args.prompt}
 
 
 def _looks_like_cuda_oom(exc: BaseException) -> bool:
@@ -197,12 +220,16 @@ def _initialize_omni_with_retry(args: argparse.Namespace) -> tuple[Omni, dict[st
             "Detected a single <=48GB GPU with Qwen-Image; enabling CPU and layerwise offload for the first attempt.",
             flush=True,
         )
+
     try:
-        return Omni(**_make_omni_kwargs(
-            args,
-            enable_cpu_offload=first_cpu_offload,
-            enable_layerwise_offload=first_layerwise_offload,
-        )), {
+        omni = Omni(
+            **_make_omni_kwargs(
+                args,
+                enable_cpu_offload=first_cpu_offload,
+                enable_layerwise_offload=first_layerwise_offload,
+            )
+        )
+        return omni, {
             "enable_cpu_offload": first_cpu_offload,
             "enable_layerwise_offload": first_layerwise_offload,
             "retried_after_oom": False,
@@ -222,11 +249,13 @@ def _initialize_omni_with_retry(args: argparse.Namespace) -> tuple[Omni, dict[st
             "enable_cpu_offload=True and enable_layerwise_offload=True.",
             flush=True,
         )
-        omni = Omni(**_make_omni_kwargs(
-            args,
-            enable_cpu_offload=True,
-            enable_layerwise_offload=True,
-        ))
+        omni = Omni(
+            **_make_omni_kwargs(
+                args,
+                enable_cpu_offload=True,
+                enable_layerwise_offload=True,
+            )
+        )
         return omni, {
             "enable_cpu_offload": True,
             "enable_layerwise_offload": True,
@@ -245,6 +274,95 @@ def _make_request(
         request_id=request_id,
         sampling_params=copy.deepcopy(sampling_params),
     )
+
+
+def _make_runtime_stub_engine(args: argparse.Namespace) -> DiffusionEngine:
+    engine = object.__new__(DiffusionEngine)
+    engine.od_config = SimpleNamespace(streaming_output=False)
+    engine.scheduler = StepScheduler()
+    engine.scheduler.initialize(SimpleNamespace())
+    engine._out_queue = {}
+    engine._out_queue_streaming = {}
+    engine.abort_queue = queue.Queue()
+    engine._rpc_queue = queue.Queue()
+    engine._rpc_lock = threading.RLock()
+    engine._cv = threading.Condition(engine._rpc_lock)
+    engine._init_lock = asyncio.Lock()
+    engine._closed = False
+    engine._shutdown_complete = False
+    engine._loop_started = False
+    engine.main_loop = None
+    engine.stop_event = None
+    engine.worker_thread = None
+    engine.executor = SimpleNamespace(shutdown=lambda: None)
+    engine.state_manager = DiffusionStateManager(
+        gpu_budget_bytes=args.gpu_budget_bytes,
+        cpu_budget_bytes=args.cpu_budget_bytes,
+        theta_h=args.theta_h,
+        theta_w=args.theta_w,
+        disk_path=args.disk_path,
+    )
+
+    request_latents: dict[str, torch.Tensor] = {}
+
+    def _initial_latent(req: OmniDiffusionRequest) -> torch.Tensor:
+        base = float((req.sampling_params.seed or 0) % 17)
+        return torch.full((1, 4, 8), base / 10.0, dtype=torch.float32)
+
+    def _execute_step(sched_output) -> BatchRunnerOutput:
+        runner_outputs: list[RunnerOutput] = []
+        for request_id in sched_output.scheduled_request_ids:
+            state = engine.scheduler.get_request_state(request_id)
+            if state is None:
+                continue
+
+            req = state.req
+            current_step = int(req.sampling_params.step_index or 0)
+            total_steps = int(req.sampling_params.num_inference_steps or 0)
+
+            restored_latent = req.sampling_params.latents
+            if restored_latent is not None and current_step > 0:
+                previous = restored_latent.detach().clone().to(torch.float32)
+            else:
+                previous = request_latents.get(request_id)
+                if previous is None:
+                    previous = _initial_latent(req)
+
+            delta = torch.full_like(previous, float(current_step + 1) / max(total_steps, 1))
+            next_latent = previous + delta
+            next_step = current_step + 1
+            finished = next_step >= total_steps
+            request_latents[request_id] = next_latent.detach().clone()
+            req.sampling_params.latents = next_latent.detach().clone()
+
+            result = (
+                DiffusionOutput(
+                    output=next_latent.detach().clone(),
+                    finished=True,
+                    custom_output={"final_step": next_step},
+                    to_cpu=True,
+                )
+                if finished
+                else None
+            )
+
+            runner_outputs.append(
+                RunnerOutput(
+                    request_id=request_id,
+                    step_index=next_step,
+                    total_steps=total_steps,
+                    finished=finished,
+                    result=result,
+                    latent_snapshot=next_latent.detach().clone(),
+                    value_score=max(0.0, 1.0 - (next_step / max(total_steps, 1))),
+                )
+            )
+
+        time.sleep(args.step_delay)
+        return BatchRunnerOutput.from_list(runner_outputs)
+
+    engine.execute_fn = _execute_step
+    return engine
 
 
 def _get_inline_diffusion_engine(omni: Omni) -> DiffusionEngine:
@@ -309,21 +427,113 @@ def _image_metrics(lhs_path: Path, rhs_path: Path) -> dict[str, Any]:
     max_abs = float(np.max(np.abs(diff)))
     identical = bool(np.array_equal(lhs, rhs))
     return {
-        "pixel_identical": identical,
+        "exact_equal": identical,
         "mse": mse,
         "max_abs_diff": max_abs,
     }
 
 
-async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
-    if args.failure_step < 0 or args.failure_step >= args.num_inference_steps:
-        raise ValueError(
-            f"--failure-step must be in [0, {args.num_inference_steps - 1}], got {args.failure_step}."
+def _tensor_metrics(lhs: torch.Tensor, rhs: torch.Tensor) -> dict[str, Any]:
+    lhs_cpu = lhs.detach().cpu().to(torch.float32)
+    rhs_cpu = rhs.detach().cpu().to(torch.float32)
+    diff = lhs_cpu - rhs_cpu
+    return {
+        "exact_equal": bool(torch.equal(lhs_cpu, rhs_cpu)),
+        "max_abs_diff": float(diff.abs().max().item()),
+        "mse": float(torch.mean(diff * diff).item()),
+        "shape": list(lhs_cpu.shape),
+    }
+
+
+async def _run_stub_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    engine = _make_runtime_stub_engine(args)
+    try:
+        prompt = _build_stub_prompt(args)
+        sampling_params = _build_sampling_params(args)
+
+        initial_request = _make_request("recovery-smoke", prompt, sampling_params)
+        await engine._check_and_start_background_loop()
+        run_task = asyncio.create_task(engine.async_add_req_and_wait_for_response(initial_request))
+
+        checkpoint_state = await _wait_for_checkpoint(
+            engine,
+            request_id=initial_request.request_id,
+            target_step=args.failure_step,
+            poll_interval=args.poll_interval,
+            timeout_s=args.checkpoint_timeout,
         )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    args.disk_path.mkdir(parents=True, exist_ok=True)
+        engine.abort(initial_request.request_id)
+        aborted_output = await run_task
+        if not aborted_output.aborted:
+            raise RuntimeError(f"Expected aborted output after injected failure, got: {aborted_output!r}")
 
+        resume_template = _make_request(initial_request.request_id, prompt, sampling_params)
+        resumed_request = engine.restore_request_from_state(resume_template, request_id=initial_request.request_id)
+        resumed_output = await engine.async_add_req_and_wait_for_response(resumed_request)
+        if resumed_output.output is None:
+            raise RuntimeError("Resumed stub run produced no final tensor output.")
+
+        baseline_request = _make_request("baseline-smoke", prompt, sampling_params)
+        baseline_output = await engine.async_add_req_and_wait_for_response(baseline_request)
+        if baseline_output.output is None:
+            raise RuntimeError("Baseline stub run produced no final tensor output.")
+
+        resumed_tensor = resumed_output.output
+        baseline_tensor = baseline_output.output
+        assert isinstance(resumed_tensor, torch.Tensor)
+        assert isinstance(baseline_tensor, torch.Tensor)
+
+        metrics = _tensor_metrics(baseline_tensor, resumed_tensor)
+        if args.strict_equality and not metrics["exact_equal"]:
+            raise RuntimeError(f"Resumed output diverged from baseline: {metrics}")
+
+        baseline_path = args.output_dir / "baseline.pt"
+        resumed_path = args.output_dir / "resumed.pt"
+        torch.save(baseline_tensor, baseline_path)
+        torch.save(resumed_tensor, resumed_path)
+
+        summary = {
+            "backend": "stub",
+            "model": args.model,
+            "prompt": args.prompt,
+            "seed": args.seed,
+            "num_inference_steps": args.num_inference_steps,
+            "failure_step": args.failure_step,
+            "checkpoint": {
+                "step_idx": checkpoint_state.step_idx,
+                "total_steps": checkpoint_state.total_steps,
+                "fidelity": checkpoint_state.fidelity.value,
+                "placement": checkpoint_state.placement.value,
+                "value_score": checkpoint_state.value_score,
+                "size_bytes": checkpoint_state.size_bytes,
+                "disk_path": checkpoint_state.disk_path,
+            },
+            "aborted": {
+                "aborted": aborted_output.aborted,
+                "abort_message": aborted_output.abort_message,
+            },
+            "restore": {
+                "restored_step_index": resumed_request.sampling_params.step_index,
+                "restored_latents_shape": list(resumed_request.sampling_params.latents.shape),
+            },
+            "comparison": metrics,
+            "artifacts": {
+                "baseline_tensor": str(baseline_path),
+                "resumed_tensor": str(resumed_path),
+                "checkpoint_dir": str(args.disk_path),
+            },
+        }
+
+        summary_path = args.output_dir / "summary.json"
+        summary["artifacts"]["summary_json"] = str(summary_path)
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        return summary
+    finally:
+        engine.close()
+
+
+async def _run_real_model_smoke(args: argparse.Namespace) -> dict[str, Any]:
     omni, init_config = _initialize_omni_with_retry(args)
     try:
         prompt = _build_prompt(omni, args)
@@ -359,10 +569,11 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         _save_first_image(baseline_outputs, baseline_path)
 
         metrics = _image_metrics(baseline_path, resumed_path)
-        if args.strict_equality and not metrics["pixel_identical"]:
+        if args.strict_equality and not metrics["exact_equal"]:
             raise RuntimeError(f"Resumed output diverged from baseline: {metrics}")
 
         summary = {
+            "backend": "real-model",
             "model": args.model,
             "prompt": args.prompt,
             "seed": args.seed,
@@ -400,6 +611,20 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
         return summary
     finally:
         omni.close()
+
+
+async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    if args.failure_step < 0 or args.failure_step >= args.num_inference_steps:
+        raise ValueError(
+            f"--failure-step must be in [0, {args.num_inference_steps - 1}], got {args.failure_step}."
+        )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.disk_path.mkdir(parents=True, exist_ok=True)
+
+    if args.backend == "stub":
+        return await _run_stub_smoke(args)
+    return await _run_real_model_smoke(args)
 
 
 def main() -> None:

@@ -92,6 +92,22 @@ captured `x_t`, and compares the resumed output against a baseline run:
 
 ```bash
 python tools/diffusion_state_recovery_smoke.py \
+  --prompt "A brass astrolabe on a wooden desk" \
+  --num-inference-steps 20 \
+  --failure-step 10 \
+  --output-dir /tmp/diffusion-state-smoke
+```
+
+By default this uses a lightweight runtime stub backend, so it exercises the
+checkpoint/abort/restore/resume control path without loading a large model.
+This is the recommended smoke path for single-GPU development and server bringup.
+
+If you explicitly want to run the same smoke against a real step-execution
+model, switch to the real-model backend:
+
+```bash
+python tools/diffusion_state_recovery_smoke.py \
+  --backend real-model \
   --model Qwen/Qwen-Image \
   --prompt "A brass astrolabe on a wooden desk" \
   --num-inference-steps 20 \
@@ -99,20 +115,9 @@ python tools/diffusion_state_recovery_smoke.py \
   --output-dir /tmp/diffusion-state-smoke
 ```
 
-This helper currently expects a step-execution-capable diffusion pipeline and
-an inline single-stage diffusion runtime.
-
 On a single 48GB GPU, `Qwen/Qwen-Image` may initialize close to the memory
-limit. The smoke helper now enables CPU and layerwise offload automatically for
-that configuration, and still retries with offload after a CUDA OOM if needed.
-You can also force that behavior explicitly:
-
-```bash
-python tools/diffusion_state_recovery_smoke.py \
-  --model Qwen/Qwen-Image \
-  --enable-cpu-offload \
-  --enable-layerwise-offload
-```
+limit. The helper enables CPU and layerwise offload automatically for that
+configuration, and still retries with offload after a CUDA OOM if needed.
 
 ## For Model Authors
 
