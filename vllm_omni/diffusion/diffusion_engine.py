@@ -846,7 +846,8 @@ class DiffusionEngine:
         return []
 
     def _capture_step_states(self, runner_output: BaseRunnerOutput | None) -> None:
-        if self.state_manager is None or runner_output is None:
+        state_manager = getattr(self, "state_manager", None)
+        if state_manager is None or runner_output is None:
             return
 
         for req_output in self._iter_runner_outputs(runner_output):
@@ -857,7 +858,7 @@ class DiffusionEngine:
                 or req_output.value_score is None
             ):
                 continue
-            self.state_manager.on_step_complete(
+            state_manager.on_step_complete(
                 request_id=req_output.request_id,
                 step_idx=req_output.step_index,
                 total_steps=req_output.total_steps,
@@ -870,10 +871,11 @@ class DiffusionEngine:
         request: OmniDiffusionRequest,
         request_id: str | None = None,
     ) -> OmniDiffusionRequest:
-        if self.state_manager is None:
+        state_manager = getattr(self, "state_manager", None)
+        if state_manager is None:
             raise RuntimeError("Diffusion state manager is disabled for this engine.")
         restored_request = copy.deepcopy(request)
-        return self.state_manager.restore_request(restored_request, request_id=request_id)
+        return state_manager.restore_request(restored_request, request_id=request_id)
 
     def _put_streaming_queue_output(
         self,
@@ -930,8 +932,9 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
-        if self.state_manager is not None:
-            self.state_manager.clear()
+        state_manager = getattr(self, "state_manager", None)
+        if state_manager is not None:
+            state_manager.clear()
         self.scheduler.close()
         self.executor.shutdown()
         self._shutdown_complete = True
@@ -982,16 +985,18 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-            if self.state_manager is not None:
-                self.state_manager.release_request(request_id)
+            state_manager = getattr(self, "state_manager", None)
+            if state_manager is not None:
+                state_manager.release_request(request_id)
             return DiffusionOutput(
                 aborted=True,
                 abort_message=f"Request {state.req.request_id} aborted.",
             )
 
         if runner_output is not None and runner_output.result is not None:
-            if state.status == DiffusionRequestStatus.FINISHED_COMPLETED and self.state_manager is not None:
-                self.state_manager.release_request(request_id)
+            state_manager = getattr(self, "state_manager", None)
+            if state.status == DiffusionRequestStatus.FINISHED_COMPLETED and state_manager is not None:
+                state_manager.release_request(request_id)
             return runner_output.result
 
         return DiffusionOutput(error=missing_result_error)
