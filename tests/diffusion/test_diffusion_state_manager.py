@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.state import DiffusionStateManager, FidelityPolicy, Placement, ValueEstimator
+from vllm_omni.diffusion.state import DiffusionStateManager, Fidelity, FidelityPolicy, Placement, ValueEstimator
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
