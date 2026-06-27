@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import csv
 import json
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -14,6 +15,10 @@ from typing import Any
 
 import numpy as np
 import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from tools.diffusion_state_recovery_smoke import (
     _build_prompt,
