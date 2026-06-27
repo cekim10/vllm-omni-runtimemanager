@@ -145,8 +145,11 @@ class RunnerOutput(BaseRunnerOutput):
 
     request_id: str
     step_index: int | None = None
+    total_steps: int | None = None
     finished: bool = False
     result: DiffusionOutput | None = None
+    latent_snapshot: torch.Tensor | dict[str, Any] | None = None
+    value_score: float | None = None
 
     def get_request_output(self, request_id: str) -> RunnerOutput | None:
         return self if self.request_id == request_id else None

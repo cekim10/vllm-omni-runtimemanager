@@ -37,6 +37,7 @@ from vllm_omni.diffusion.offloader import get_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
+from vllm_omni.diffusion.state import ValueEstimator
 from vllm_omni.diffusion.worker.input_batch import InputBatch, scatter_latents
 from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -506,6 +507,20 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
             return {}
         return prepare_attn(input_batch)
 
+    @staticmethod
+    def _snapshot_latents(state: DiffusionRequestState) -> torch.Tensor | None:
+        if state.latents is None:
+            return None
+        return state.latents.detach().to(device="cpu", dtype=torch.float32).contiguous()
+
+    @staticmethod
+    def _estimate_value_score(state: DiffusionRequestState) -> float | None:
+        try:
+            estimator = ValueEstimator.from_request_state(state)
+        except ValueError:
+            return None
+        return estimator.get_value(state.step_index)
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BatchRunnerOutput:
         """Execute one step for one scheduled request and return runner output."""
         assert self.pipeline is not None, "Model not loaded. Call load_model() first."
@@ -539,8 +554,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             RunnerOutput(
                                 request_id=state.request_id,
                                 step_index=state.step_index,
+                                total_steps=state.total_steps,
                                 finished=True,
                                 result=DiffusionOutput(error="stepwise denoise interrupted"),
+                                latent_snapshot=self._snapshot_latents(state),
+                                value_score=self._estimate_value_score(state),
                             )
                         )
 
@@ -569,8 +587,11 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                             RunnerOutput(
                                 request_id=req.request_id,
                                 step_index=req.step_index,
+                                total_steps=req.total_steps,
                                 finished=finished,
                                 result=result,
+                                latent_snapshot=self._snapshot_latents(req),
+                                value_score=self._estimate_value_score(req),
                             )
                         )
 

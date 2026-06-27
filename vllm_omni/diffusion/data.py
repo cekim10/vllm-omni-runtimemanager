@@ -745,6 +745,14 @@ class OmniDiffusionConfig:
     # Step mode settings
     step_execution: bool = False
 
+    # Runtime diffusion state manager.
+    enable_diffusion_state_manager: bool = False
+    diffusion_state_manager_gpu_budget_bytes: int = 0
+    diffusion_state_manager_cpu_budget_bytes: int = 0
+    diffusion_state_manager_theta_h: float = 0.7
+    diffusion_state_manager_theta_w: float = 0.3
+    diffusion_state_manager_disk_path: str | None = None
+
     # Streaming mode settings
     streaming_output: bool = False  # Start (video) generation with initial prompt, but streaming output in chunks
 

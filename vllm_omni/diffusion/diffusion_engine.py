@@ -12,6 +12,7 @@ import time
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
+import copy
 
 import numpy as np
 import PIL.Image
@@ -45,6 +46,7 @@ from vllm_omni.diffusion.registry import (
 from vllm_omni.diffusion.request import DUMMY_DIFFUSION_REQUEST_ID, OmniDiffusionRequest
 from vllm_omni.diffusion.sched import RequestScheduler, SchedulerInterface, StepScheduler
 from vllm_omni.diffusion.sched.interface import DiffusionRequestStatus
+from vllm_omni.diffusion.state import DiffusionStateManager
 from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput, RunnerOutput
 from vllm_omni.errors import client_error_from_metadata, is_client_error_status
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -159,10 +161,19 @@ class DiffusionEngine:
         self._shutdown_complete = False
         self.abort_queue: queue.Queue[str] = queue.Queue()
         self._rpc_queue: queue.Queue[_RpcTask] = queue.Queue()
+        self.state_manager: DiffusionStateManager | None = None
         if self.step_execution:
             self.execute_fn = self.executor.execute_step
         else:
             self.execute_fn = self.executor.execute_request
+        if self.step_execution and getattr(self.od_config, "enable_diffusion_state_manager", False):
+            self.state_manager = DiffusionStateManager(
+                gpu_budget_bytes=getattr(self.od_config, "diffusion_state_manager_gpu_budget_bytes", 0),
+                cpu_budget_bytes=getattr(self.od_config, "diffusion_state_manager_cpu_budget_bytes", 0),
+                theta_h=getattr(self.od_config, "diffusion_state_manager_theta_h", 0.7),
+                theta_w=getattr(self.od_config, "diffusion_state_manager_theta_w", 0.3),
+                disk_path=getattr(self.od_config, "diffusion_state_manager_disk_path", None),
+            )
 
         try:
             self._dummy_run()
@@ -377,6 +388,7 @@ class DiffusionEngine:
 
             self._process_aborts_queue()
             self._process_rpc_queue()
+            self._capture_step_states(runner_output)
             finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
             if self.od_config.streaming_output:
                 self._handle_step_streaming_runner_output(
@@ -620,6 +632,7 @@ class DiffusionEngine:
                     )
 
                 self._process_aborts_queue()
+                self._capture_step_states(runner_output)
 
                 finished_req_ids = self.scheduler.update_from_output(sched_output, runner_output)
 
@@ -825,6 +838,43 @@ class DiffusionEngine:
         else:
             _set_result()
 
+    def _iter_runner_outputs(self, runner_output: BaseRunnerOutput) -> Iterable[RunnerOutput]:
+        if isinstance(runner_output, RunnerOutput):
+            return [runner_output]
+        if isinstance(runner_output, BatchRunnerOutput):
+            return runner_output.runner_outputs
+        return []
+
+    def _capture_step_states(self, runner_output: BaseRunnerOutput | None) -> None:
+        if self.state_manager is None or runner_output is None:
+            return
+
+        for req_output in self._iter_runner_outputs(runner_output):
+            if (
+                req_output.latent_snapshot is None
+                or req_output.step_index is None
+                or req_output.total_steps is None
+                or req_output.value_score is None
+            ):
+                continue
+            self.state_manager.on_step_complete(
+                request_id=req_output.request_id,
+                step_idx=req_output.step_index,
+                total_steps=req_output.total_steps,
+                latent=req_output.latent_snapshot,
+                value_score=req_output.value_score,
+            )
+
+    def restore_request_from_state(
+        self,
+        request: OmniDiffusionRequest,
+        request_id: str | None = None,
+    ) -> OmniDiffusionRequest:
+        if self.state_manager is None:
+            raise RuntimeError("Diffusion state manager is disabled for this engine.")
+        restored_request = copy.deepcopy(request)
+        return self.state_manager.restore_request(restored_request, request_id=request_id)
+
     def _put_streaming_queue_output(
         self,
         queue: asyncio.Queue[DiffusionOutput],
@@ -880,6 +930,8 @@ class DiffusionEngine:
         else:
             self._loop_started = False
 
+        if self.state_manager is not None:
+            self.state_manager.clear()
         self.scheduler.close()
         self.executor.shutdown()
         self._shutdown_complete = True
@@ -930,12 +982,16 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            if self.state_manager is not None:
+                self.state_manager.release_request(request_id)
             return DiffusionOutput(
                 aborted=True,
                 abort_message=f"Request {state.req.request_id} aborted.",
             )
 
         if runner_output is not None and runner_output.result is not None:
+            if state.status == DiffusionRequestStatus.FINISHED_COMPLETED and self.state_manager is not None:
+                self.state_manager.release_request(request_id)
             return runner_output.result
 
         return DiffusionOutput(error=missing_result_error)

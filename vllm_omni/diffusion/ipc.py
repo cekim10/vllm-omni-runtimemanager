@@ -135,6 +135,16 @@ def _is_rpc_result_envelope(output: object) -> bool:
     return isinstance(output, dict) and output.get("type") == DIFFUSION_RPC_RESULT_ENVELOPE
 
 
+def _pack_runner_state_fields(output: object) -> object:
+    latent_snapshot = getattr(output, "latent_snapshot", None)
+    if isinstance(latent_snapshot, torch.Tensor):
+        output.latent_snapshot = _pack_tensor_if_large(latent_snapshot)
+    result = getattr(output, "result", None)
+    if isinstance(result, DiffusionOutput):
+        output.result = _pack_diffusion_fields(result)
+    return output
+
+
 def pack_diffusion_output_shm(output: object) -> object:
     """Replace large tensors in diffusion worker outputs with SHM handles.
 
@@ -151,6 +161,13 @@ def pack_diffusion_output_shm(output: object) -> object:
             output["result"] = _pack_diffusion_fields(result)
         return output
 
+    runner_outputs = getattr(output, "runner_outputs", None)
+    if isinstance(runner_outputs, list):
+        for runner_output in runner_outputs:
+            _pack_runner_state_fields(runner_output)
+        return output
+
+    _pack_runner_state_fields(output)
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
         output.result = _pack_diffusion_fields(result)
@@ -165,6 +182,15 @@ def _unpack_diffusion_fields(output: DiffusionOutput) -> DiffusionOutput:
     return output
 
 
+def _unpack_runner_state_fields(output: object) -> object:
+    latent_snapshot = getattr(output, "latent_snapshot", None)
+    output.latent_snapshot = _unpack_if_shm_handle(latent_snapshot)
+    result = getattr(output, "result", None)
+    if isinstance(result, DiffusionOutput):
+        output.result = _unpack_diffusion_fields(result)
+    return output
+
+
 def unpack_diffusion_output_shm(output: object) -> object:
     """Reconstruct tensors from SHM handles in diffusion worker outputs."""
     if isinstance(output, DiffusionOutput):
@@ -176,6 +202,13 @@ def unpack_diffusion_output_shm(output: object) -> object:
             output["result"] = _unpack_diffusion_fields(result)
         return output
 
+    runner_outputs = getattr(output, "runner_outputs", None)
+    if isinstance(runner_outputs, list):
+        for runner_output in runner_outputs:
+            _unpack_runner_state_fields(runner_output)
+        return output
+
+    _unpack_runner_state_fields(output)
     result = getattr(output, "result", None)
     if isinstance(result, DiffusionOutput):
         output.result = _unpack_diffusion_fields(result)

@@ -15,6 +15,7 @@ from vllm_omni.diffusion.ipc import (
     pack_diffusion_output_shm,
     unpack_diffusion_output_shm,
 )
+from vllm_omni.diffusion.worker.utils import BatchRunnerOutput, RunnerOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -207,3 +208,30 @@ def test_pack_value_packs_non_contiguous_large_tensor_values() -> None:
         torch.testing.assert_close(unpacked, tensor)
     finally:
         _cleanup_shm_handle(packed)
+
+
+def test_batch_runner_output_latent_snapshot_round_trips_through_shm() -> None:
+    latent = torch.arange(300_000, dtype=torch.float32)
+    output = BatchRunnerOutput.from_list(
+        [
+            RunnerOutput(
+                request_id="req-1",
+                step_index=1,
+                total_steps=4,
+                latent_snapshot=latent,
+                value_score=0.75,
+            )
+        ]
+    )
+
+    pack_diffusion_output_shm(output)
+
+    packed_latent = output.runner_outputs[0].latent_snapshot
+    assert isinstance(packed_latent, dict)
+    assert packed_latent["__tensor_shm__"] is True
+
+    unpack_diffusion_output_shm(output)
+
+    unpacked_latent = output.runner_outputs[0].latent_snapshot
+    assert isinstance(unpacked_latent, torch.Tensor)
+    torch.testing.assert_close(unpacked_latent, latent)
