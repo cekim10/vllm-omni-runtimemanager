@@ -51,9 +51,22 @@ def test_fidelity_policy_round_trips_lossy_and_lossless_tiers() -> None:
         restored = policy.decompress(compressed, scale, fidelity)
         assert restored.shape == latent.shape
         if fidelity.name == "LOSSLESS":
-            torch.testing.assert_close(restored, latent.to(torch.float16).float(), atol=0.0, rtol=0.0)
+            assert restored.dtype == latent.dtype
+            torch.testing.assert_close(restored, latent, atol=0.0, rtol=0.0)
         else:
             torch.testing.assert_close(restored, latent, atol=0.05, rtol=0.05)
+
+
+def test_fidelity_policy_preserves_bfloat16_for_lossless_tier() -> None:
+    policy = FidelityPolicy(theta_h=0.7, theta_w=0.3)
+    latent = torch.arange(32, dtype=torch.float32).reshape(1, 4, 8).to(torch.bfloat16)
+
+    compressed, scale = policy.compress(latent, Fidelity.LOSSLESS)
+    restored = policy.decompress(compressed, scale, Fidelity.LOSSLESS)
+
+    assert compressed.dtype == torch.bfloat16
+    assert restored.dtype == torch.bfloat16
+    torch.testing.assert_close(restored, latent, atol=0.0, rtol=0.0)
 
 
 def test_state_manager_restores_latest_checkpoint_from_memory() -> None:
@@ -70,7 +83,8 @@ def test_state_manager_restores_latest_checkpoint_from_memory() -> None:
 
     restored = manager.restore(state)
     assert state.placement == Placement.CPU
-    torch.testing.assert_close(restored, latent.to(torch.float16).float(), atol=0.0, rtol=0.0)
+    assert restored.dtype == latent.dtype
+    torch.testing.assert_close(restored, latent, atol=0.0, rtol=0.0)
 
 
 def test_state_manager_restores_checkpoint_from_disk_and_builds_resume_request(tmp_path) -> None:

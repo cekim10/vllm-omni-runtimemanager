@@ -26,9 +26,10 @@ class FidelityPolicy:
         latent: torch.Tensor,
         fidelity: Fidelity,
     ) -> tuple[torch.Tensor, torch.Tensor | float | None]:
-        tensor = latent.detach().to(dtype=torch.float32, device="cpu").contiguous()
         if fidelity == Fidelity.LOSSLESS:
-            return tensor.to(torch.float16), None
+            return latent.detach().to(device="cpu").contiguous(), None
+
+        tensor = latent.detach().to(dtype=torch.float32, device="cpu").contiguous()
 
         if fidelity == Fidelity.COMPRESSED:
             scale = tensor.abs().max().clamp_min(1e-8) / 127.0
@@ -50,7 +51,7 @@ class FidelityPolicy:
         fidelity: Fidelity,
     ) -> torch.Tensor:
         if fidelity == Fidelity.LOSSLESS:
-            return latent.to(torch.float32)
+            return latent
         if scale is None:
             raise ValueError(f"Missing scale for fidelity={fidelity.value}")
         return latent.to(torch.float32) * scale
