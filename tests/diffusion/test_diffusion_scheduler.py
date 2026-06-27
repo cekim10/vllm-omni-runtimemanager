@@ -515,6 +515,20 @@ class TestDiffusionEngine:
         assert output.aborted is True
         assert output.abort_message == "Request req-finalize aborted."
 
+    def test_finalize_finished_request_keeps_checkpoint_for_aborted_request(self, mocker: MockerFixture) -> None:
+        engine = DiffusionEngine.__new__(DiffusionEngine)
+        engine.scheduler = StepScheduler()
+        engine.scheduler.initialize(SimpleNamespace())
+        engine.state_manager = mocker.Mock()
+
+        req_id = engine.scheduler.add_request(_make_request("req-preserve"))
+        engine.scheduler.finish_requests(req_id, DiffusionRequestStatus.FINISHED_ABORTED)
+
+        output = engine._finalize_finished_request(req_id)
+
+        assert output.aborted is True
+        engine.state_manager.release_request.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_streaming_runner_output_notifies_each_chunk(self) -> None:
         engine = DiffusionEngine.__new__(DiffusionEngine)

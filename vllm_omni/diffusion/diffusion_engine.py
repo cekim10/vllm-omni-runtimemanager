@@ -989,9 +989,6 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
-            state_manager = getattr(self, "state_manager", None)
-            if state_manager is not None:
-                state_manager.release_request(request_id)
             return DiffusionOutput(
                 aborted=True,
                 abort_message=f"Request {state.req.request_id} aborted.",

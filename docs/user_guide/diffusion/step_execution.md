@@ -84,6 +84,24 @@ If model loading fails with a message mentioning `prepare_encode()`,
 `denoise_step()`, `step_scheduler()`, and `post_decode()`, the selected
 pipeline does not support step execution.
 
+## Recovery Smoke Test
+
+The diffusion state manager is built on top of step execution. To run a local
+smoke test that checkpoints a request, aborts it mid-denoise, restores from the
+captured `x_t`, and compares the resumed output against a baseline run:
+
+```bash
+python tools/diffusion_state_recovery_smoke.py \
+  --model Qwen/Qwen-Image \
+  --prompt "A brass astrolabe on a wooden desk" \
+  --num-inference-steps 20 \
+  --failure-step 10 \
+  --output-dir /tmp/diffusion-state-smoke
+```
+
+This helper currently expects a step-execution-capable diffusion pipeline and
+an inline single-stage diffusion runtime.
+
 ## For Model Authors
 
 If you want to add step execution support to a new diffusion pipeline, see the
