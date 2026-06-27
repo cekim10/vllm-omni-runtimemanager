@@ -119,6 +119,12 @@ On a single 48GB GPU, `Qwen/Qwen-Image` may initialize close to the memory
 limit. The helper enables CPU and layerwise offload automatically for that
 configuration, and still retries with offload after a CUDA OOM if needed.
 
+Small text-to-image models such as `Tongyi-MAI/Z-Image-Turbo` and
+`stabilityai/stable-diffusion-3.5-medium` are valid vLLM-Omni models, but they
+do not currently support `step_execution=True`. That means they cannot be used
+with the recovery smoke test's real-model backend yet. For single-GPU
+development on those models, keep using the default `--backend stub` path.
+
 ## For Model Authors
 
 If you want to add step execution support to a new diffusion pipeline, see the
