@@ -103,8 +103,9 @@ This helper currently expects a step-execution-capable diffusion pipeline and
 an inline single-stage diffusion runtime.
 
 On a single 48GB GPU, `Qwen/Qwen-Image` may initialize close to the memory
-limit. The smoke helper automatically retries with CPU and layerwise offload
-after a CUDA OOM. You can also enable that explicitly:
+limit. The smoke helper now enables CPU and layerwise offload automatically for
+that configuration, and still retries with offload after a CUDA OOM if needed.
+You can also force that behavior explicitly:
 
 ```bash
 python tools/diffusion_state_recovery_smoke.py \

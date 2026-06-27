@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable the automatic OOM retry path.",
     )
     parser.add_argument(
+        "--disable-auto-offload",
+        action="store_true",
+        help="Disable the conservative single-GPU auto-offload heuristic.",
+    )
+    parser.add_argument(
         "--poll-interval",
         type=float,
         default=0.05,
@@ -137,6 +142,24 @@ def _looks_like_cuda_oom(exc: BaseException) -> bool:
     return "cuda out of memory" in text or "torch.outofmemoryerror" in text
 
 
+def _should_auto_enable_offload(args: argparse.Namespace) -> bool:
+    if args.disable_auto_offload:
+        return False
+    if args.enable_cpu_offload or args.enable_layerwise_offload:
+        return False
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        return False
+
+    try:
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+    except Exception:
+        return False
+
+    model_name = args.model.lower()
+    likely_large_qwen_image = "qwen/qwen-image" in model_name
+    return likely_large_qwen_image and total_memory <= (48 << 30)
+
+
 def _make_omni_kwargs(
     args: argparse.Namespace,
     *,
@@ -166,8 +189,14 @@ def _make_omni_kwargs(
 
 
 def _initialize_omni_with_retry(args: argparse.Namespace) -> tuple[Omni, dict[str, bool]]:
-    first_cpu_offload = bool(args.enable_cpu_offload)
-    first_layerwise_offload = bool(args.enable_layerwise_offload)
+    auto_offload = _should_auto_enable_offload(args)
+    first_cpu_offload = bool(args.enable_cpu_offload or auto_offload)
+    first_layerwise_offload = bool(args.enable_layerwise_offload or auto_offload)
+    if auto_offload:
+        print(
+            "Detected a single <=48GB GPU with Qwen-Image; enabling CPU and layerwise offload for the first attempt.",
+            flush=True,
+        )
     try:
         return Omni(**_make_omni_kwargs(
             args,
@@ -177,6 +206,7 @@ def _initialize_omni_with_retry(args: argparse.Namespace) -> tuple[Omni, dict[st
             "enable_cpu_offload": first_cpu_offload,
             "enable_layerwise_offload": first_layerwise_offload,
             "retried_after_oom": False,
+            "auto_offload": auto_offload,
         }
     except Exception as exc:
         if (
@@ -201,6 +231,7 @@ def _initialize_omni_with_retry(args: argparse.Namespace) -> tuple[Omni, dict[st
             "enable_cpu_offload": True,
             "enable_layerwise_offload": True,
             "retried_after_oom": True,
+            "auto_offload": auto_offload,
         }
 
 
