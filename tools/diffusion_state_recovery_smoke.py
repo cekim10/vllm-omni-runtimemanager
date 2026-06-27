@@ -470,6 +470,8 @@ async def _run_stub_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
         resume_template = _make_request(initial_request.request_id, prompt, sampling_params)
         resumed_request = engine.restore_request_from_state(resume_template, request_id=initial_request.request_id)
+        restored_step_index = resumed_request.sampling_params.step_index
+        restored_latents_shape = list(resumed_request.sampling_params.latents.shape)
         resumed_output = await engine.async_add_req_and_wait_for_response(resumed_request)
         if resumed_output.output is None:
             raise RuntimeError("Resumed stub run produced no final tensor output.")
@@ -514,8 +516,8 @@ async def _run_stub_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "abort_message": aborted_output.abort_message,
             },
             "restore": {
-                "restored_step_index": resumed_request.sampling_params.step_index,
-                "restored_latents_shape": list(resumed_request.sampling_params.latents.shape),
+                "restored_step_index": restored_step_index,
+                "restored_latents_shape": restored_latents_shape,
             },
             "comparison": metrics,
             "artifacts": {
@@ -559,6 +561,8 @@ async def _run_real_model_smoke(args: argparse.Namespace) -> dict[str, Any]:
 
         resume_template = _make_request(initial_request.request_id, prompt, sampling_params)
         resumed_request = engine.restore_request_from_state(resume_template, request_id=initial_request.request_id)
+        restored_step_index = resumed_request.sampling_params.step_index
+        restored_latents_shape = list(resumed_request.sampling_params.latents.shape)
         resumed_outputs = await engine.step(resumed_request)
         resumed_path = args.output_dir / "resumed.png"
         _save_first_image(resumed_outputs, resumed_path)
@@ -594,8 +598,8 @@ async def _run_real_model_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "abort_message": aborted_output.abort_message,
             },
             "restore": {
-                "restored_step_index": resumed_request.sampling_params.step_index,
-                "restored_latents_shape": list(resumed_request.sampling_params.latents.shape),
+                "restored_step_index": restored_step_index,
+                "restored_latents_shape": restored_latents_shape,
             },
             "comparison": metrics,
             "artifacts": {
