@@ -102,6 +102,17 @@ python tools/diffusion_state_recovery_smoke.py \
 This helper currently expects a step-execution-capable diffusion pipeline and
 an inline single-stage diffusion runtime.
 
+On a single 48GB GPU, `Qwen/Qwen-Image` may initialize close to the memory
+limit. The smoke helper automatically retries with CPU and layerwise offload
+after a CUDA OOM. You can also enable that explicitly:
+
+```bash
+python tools/diffusion_state_recovery_smoke.py \
+  --model Qwen/Qwen-Image \
+  --enable-cpu-offload \
+  --enable-layerwise-offload
+```
+
 ## For Model Authors
 
 If you want to add step execution support to a new diffusion pipeline, see the

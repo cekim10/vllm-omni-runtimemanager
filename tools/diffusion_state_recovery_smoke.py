@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -59,6 +60,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--enforce-eager", action="store_true", help="Disable torch.compile for easier debugging.")
     parser.add_argument(
+        "--enable-cpu-offload",
+        action="store_true",
+        help="Enable CPU offload from the first initialization attempt.",
+    )
+    parser.add_argument(
+        "--enable-layerwise-offload",
+        action="store_true",
+        help="Enable layerwise offload from the first initialization attempt.",
+    )
+    parser.add_argument(
+        "--retry-with-offload",
+        action="store_true",
+        default=True,
+        help="Retry model initialization with CPU/layerwise offload after a CUDA OOM.",
+    )
+    parser.add_argument(
+        "--no-retry-with-offload",
+        dest="retry_with_offload",
+        action="store_false",
+        help="Disable the automatic OOM retry path.",
+    )
+    parser.add_argument(
         "--poll-interval",
         type=float,
         default=0.05,
@@ -105,6 +128,80 @@ def _build_prompt(omni: Omni, args: argparse.Namespace) -> Any:
         height=args.height,
         width=args.width,
     )
+
+
+def _looks_like_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    text = str(exc).lower()
+    return "cuda out of memory" in text or "torch.outofmemoryerror" in text
+
+
+def _make_omni_kwargs(
+    args: argparse.Namespace,
+    *,
+    enable_cpu_offload: bool,
+    enable_layerwise_offload: bool,
+) -> dict[str, Any]:
+    omni_kwargs = {
+        "model": args.model,
+        "mode": "text-to-image",
+        "step_execution": True,
+        "enable_diffusion_state_manager": True,
+        "diffusion_state_manager_gpu_budget_bytes": args.gpu_budget_bytes,
+        "diffusion_state_manager_cpu_budget_bytes": args.cpu_budget_bytes,
+        "diffusion_state_manager_theta_h": args.theta_h,
+        "diffusion_state_manager_theta_w": args.theta_w,
+        "diffusion_state_manager_disk_path": str(args.disk_path),
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "init_timeout": args.init_timeout,
+        "stage_init_timeout": args.stage_init_timeout,
+        "enforce_eager": args.enforce_eager,
+        "enable_cpu_offload": enable_cpu_offload,
+        "enable_layerwise_offload": enable_layerwise_offload,
+    }
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+    return omni_kwargs
+
+
+def _initialize_omni_with_retry(args: argparse.Namespace) -> tuple[Omni, dict[str, bool]]:
+    first_cpu_offload = bool(args.enable_cpu_offload)
+    first_layerwise_offload = bool(args.enable_layerwise_offload)
+    try:
+        return Omni(**_make_omni_kwargs(
+            args,
+            enable_cpu_offload=first_cpu_offload,
+            enable_layerwise_offload=first_layerwise_offload,
+        )), {
+            "enable_cpu_offload": first_cpu_offload,
+            "enable_layerwise_offload": first_layerwise_offload,
+            "retried_after_oom": False,
+        }
+    except Exception as exc:
+        if (
+            not args.retry_with_offload
+            or not _looks_like_cuda_oom(exc)
+            or first_cpu_offload
+            or first_layerwise_offload
+        ):
+            raise
+
+        print(
+            "Initial model load hit CUDA OOM; retrying with "
+            "enable_cpu_offload=True and enable_layerwise_offload=True.",
+            flush=True,
+        )
+        omni = Omni(**_make_omni_kwargs(
+            args,
+            enable_cpu_offload=True,
+            enable_layerwise_offload=True,
+        ))
+        return omni, {
+            "enable_cpu_offload": True,
+            "enable_layerwise_offload": True,
+            "retried_after_oom": True,
+        }
 
 
 def _make_request(
@@ -196,25 +293,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.disk_path.mkdir(parents=True, exist_ok=True)
 
-    omni_kwargs = {
-        "model": args.model,
-        "mode": "text-to-image",
-        "step_execution": True,
-        "enable_diffusion_state_manager": True,
-        "diffusion_state_manager_gpu_budget_bytes": args.gpu_budget_bytes,
-        "diffusion_state_manager_cpu_budget_bytes": args.cpu_budget_bytes,
-        "diffusion_state_manager_theta_h": args.theta_h,
-        "diffusion_state_manager_theta_w": args.theta_w,
-        "diffusion_state_manager_disk_path": str(args.disk_path),
-        "tensor_parallel_size": args.tensor_parallel_size,
-        "init_timeout": args.init_timeout,
-        "stage_init_timeout": args.stage_init_timeout,
-        "enforce_eager": args.enforce_eager,
-    }
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
-
-    omni = Omni(**omni_kwargs)
+    omni, init_config = _initialize_omni_with_retry(args)
     try:
         prompt = _build_prompt(omni, args)
         sampling_params = _build_sampling_params(args)
@@ -258,6 +337,7 @@ async def run_smoke(args: argparse.Namespace) -> dict[str, Any]:
             "seed": args.seed,
             "num_inference_steps": args.num_inference_steps,
             "failure_step": args.failure_step,
+            "init_config": init_config,
             "checkpoint": {
                 "step_idx": checkpoint_state.step_idx,
                 "total_steps": checkpoint_state.total_steps,
