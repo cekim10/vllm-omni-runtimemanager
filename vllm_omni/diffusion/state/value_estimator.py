@@ -9,7 +9,15 @@ from vllm_omni.diffusion.worker.utils import DiffusionRequestState
 
 
 class ValueEstimator:
-    """Estimate checkpoint value from the request's diffusion noise schedule."""
+    """Estimate checkpoint value from the request's diffusion noise schedule.
+
+    The serving policy reasons about checkpoints in execution order: the first
+    denoising step should receive the highest value and later steps should
+    become progressively cheaper to compress. Different schedulers expose their
+    schedules with opposite SNR directions, so we normalize relative to the
+    first executed step and flip the ratio when the schedule's SNR increases
+    over time.
+    """
 
     def __init__(
         self,
@@ -47,8 +55,13 @@ class ValueEstimator:
         else:
             snr = alpha_snr
 
-        denom = snr[0].clamp_min(1e-8)
-        return (snr / denom).clamp_min(0.0)
+        first = snr[0].clamp_min(1e-8)
+        last = snr[-1].clamp_min(1e-8)
+        if last > first:
+            values = first / snr.clamp_min(1e-8)
+        else:
+            values = snr / first
+        return values.clamp_min(0.0)
 
     @staticmethod
     def _normalize_timesteps(

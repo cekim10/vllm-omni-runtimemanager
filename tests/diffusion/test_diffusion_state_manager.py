@@ -41,6 +41,16 @@ def test_value_estimator_falls_back_to_sigmas() -> None:
     assert values[2] == pytest.approx(0.0625)
 
 
+def test_value_estimator_inverts_increasing_execution_snr_from_sigmas() -> None:
+    scheduler = SimpleNamespace(sigmas=torch.tensor([4.0, 2.0, 1.0], dtype=torch.float32))
+    estimator = ValueEstimator(scheduler, timesteps=torch.tensor([1000, 500, 0]))
+
+    values = [estimator.get_value(i) for i in range(3)]
+    assert values[0] == pytest.approx(1.0)
+    assert values[1] == pytest.approx(0.25)
+    assert values[2] == pytest.approx(0.0625)
+
+
 def test_fidelity_policy_round_trips_lossy_and_lossless_tiers() -> None:
     policy = FidelityPolicy(theta_h=0.7, theta_w=0.3)
     latent = torch.linspace(-2.0, 2.0, 32, dtype=torch.float32).reshape(1, 4, 8)
