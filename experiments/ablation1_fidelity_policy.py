@@ -109,13 +109,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234, help="Base seed; prompt_id is added per prompt.")
     parser.add_argument("--height", type=int, default=512, help="Image height.")
     parser.add_argument("--width", type=int, default=512, help="Image width.")
-    parser.add_argument("--num-inference-steps", type=int, default=20, help="Total denoising steps.")
+    parser.add_argument("--num-inference-steps", type=int, default=50, help="Total denoising steps.")
+    parser.add_argument(
+        "--failure-steps",
+        type=int,
+        nargs="+",
+        default=[10, 25, 40],
+        help="Absolute denoising-step indices to fail at. Defaults target early/mid/late phases for 50-step runs.",
+    )
     parser.add_argument(
         "--failure-fracs",
         type=float,
         nargs="+",
-        default=[0.25, 0.5, 0.75],
-        help="Failure-step fractions of total denoising steps.",
+        default=None,
+        help="Optional failure-step fractions of total denoising steps. Overrides --failure-steps when provided.",
     )
     parser.add_argument("--runs-per-condition", type=int, default=3, help="Number of runs per condition.")
     parser.add_argument("--guidance-scale", type=float, default=4.0, help="CFG guidance scale.")
@@ -191,6 +198,23 @@ def _ensure_failure_step(frac: float, total_steps: int) -> int:
     if not 0.0 < frac < 1.0:
         raise ValueError(f"Failure fraction must be in (0, 1), got {frac}.")
     return max(1, min(total_steps - 1, int(total_steps * frac)))
+
+
+def _resolve_failure_points(args: argparse.Namespace) -> list[tuple[int, float]]:
+    if args.failure_fracs:
+        return [
+            (_ensure_failure_step(frac, args.num_inference_steps), float(frac))
+            for frac in args.failure_fracs
+        ]
+
+    failure_points: list[tuple[int, float]] = []
+    for step_idx in args.failure_steps:
+        if step_idx <= 0 or step_idx >= args.num_inference_steps:
+            raise ValueError(
+                f"Failure step must be in [1, {args.num_inference_steps - 1}], got {step_idx}."
+            )
+        failure_points.append((int(step_idx), float(step_idx / args.num_inference_steps)))
+    return failure_points
 
 
 def _artifact_dir(args: argparse.Namespace) -> Path:
@@ -406,9 +430,23 @@ def _aggregate_rows(rows: list[dict[str, Any]], group_keys: tuple[str, ...]) -> 
     return aggregates
 
 
+def _count_rows(rows: list[dict[str, Any]], group_keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], int] = defaultdict(int)
+    for row in rows:
+        grouped[tuple(row[key] for key in group_keys)] += 1
+
+    counts: list[dict[str, Any]] = []
+    for key in sorted(grouped):
+        record = {name: value for name, value in zip(group_keys, key, strict=True)}
+        record["count"] = grouped[key]
+        counts.append(record)
+    return counts
+
+
 async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     prompts = _load_prompts(args)
     _preflight_real_model_args(args)
+    failure_points = _resolve_failure_points(args)
 
     artifact_dir = _artifact_dir(args)
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -449,8 +487,7 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 flush=True,
             )
 
-            for frac in args.failure_fracs:
-                failure_step_idx = _ensure_failure_step(frac, args.num_inference_steps)
+            for failure_step_idx, frac in failure_points:
                 for fidelity_mode in args.fidelity_modes:
                     for run_idx in range(args.runs_per_condition):
                         result, resumed_image = await _run_condition(
@@ -489,7 +526,8 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         _append_csv_row(args.output, csv_row)
                         print(
                             f"[{fidelity_mode}] prompt_id={prompt_id} run_idx={run_idx} "
-                            f"failure_frac={frac:.2f} checkpoint={csv_row['checkpoint_size_bytes']}B "
+                            f"failure_step={failure_step_idx}/{args.num_inference_steps} "
+                            f"(frac={frac:.2f}) checkpoint={csv_row['checkpoint_size_bytes']}B "
                             f"fidelity={csv_row['assigned_fidelity']} "
                             f"ssim={csv_row['output_ssim']:.6f} mse={csv_row['output_mse']:.6f} "
                             f"exact={csv_row['exact_equal']}",
@@ -501,7 +539,8 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "model": args.model,
         "num_inference_steps": args.num_inference_steps,
-        "failure_fracs": args.failure_fracs,
+        "failure_steps": [step for step, _ in failure_points],
+        "failure_fracs": [frac for _, frac in failure_points],
         "fidelity_modes": args.fidelity_modes,
         "runs_per_condition": args.runs_per_condition,
         "init_config": init_config,
@@ -509,7 +548,9 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "csv_path": str(args.output),
         "artifact_dir": str(artifact_dir),
         "aggregates_by_mode_frac": _aggregate_rows(rows, ("fidelity_mode", "failure_step_frac")),
+        "aggregates_by_mode_step": _aggregate_rows(rows, ("fidelity_mode", "failure_step_idx")),
         "aggregates_by_mode": _aggregate_rows(rows, ("fidelity_mode",)),
+        "assigned_fidelity_counts": _count_rows(rows, ("fidelity_mode", "assigned_fidelity")),
         "num_rows": len(rows),
     }
     summary_path = args.output.with_suffix(".summary.json")
