@@ -480,41 +480,43 @@ async def _run_condition(
             _run_request_with_finish_time(engine, _make_request(request_id, prompt_obj, sampling_params))
         )
 
-    oldest_request_id = request_ids[0]
     with _fidelity_mode_override(engine, fidelity_mode):
-        await _start_request(cases[0], oldest_request_id)
-
-        for idx in range(1, concurrency):
-            gate_step = max(1, args.phase_max_step - target_steps[idx])
-            await _wait_for_checkpoint(
-                engine,
-                request_id=oldest_request_id,
-                target_step=gate_step,
-                poll_interval=args.poll_interval,
-                timeout_s=args.checkpoint_timeout,
-            )
+        for idx in range(concurrency):
             await _start_request(cases[idx], request_ids[idx])
 
         target_by_request = {request_ids[idx]: target_steps[idx] for idx in range(concurrency)}
-        for request_id, target_step in target_by_request.items():
-            await _wait_for_checkpoint(
-                engine,
-                request_id=request_id,
-                target_step=target_step,
-                poll_interval=args.poll_interval,
-                timeout_s=args.checkpoint_timeout,
-            )
-
         checkpoint_states = {}
-        for request_id in request_ids:
-            state = state_manager.on_failure(request_id)
-            if state is None:
-                raise RuntimeError(f"Missing checkpoint for request {request_id}.")
-            checkpoint_states[request_id] = state
+        checkpoint_wait_tasks = {
+            request_id: asyncio.create_task(
+                _wait_for_checkpoint(
+                    engine,
+                    request_id=request_id,
+                    target_step=target_step,
+                    poll_interval=args.poll_interval,
+                    timeout_s=args.checkpoint_timeout,
+                )
+            )
+            for request_id, target_step in target_by_request.items()
+        }
+        wait_task_to_request = {task: request_id for request_id, task in checkpoint_wait_tasks.items()}
 
-        engine.abort(request_ids)
-        aborted_results = await asyncio.gather(*(initial_tasks[request_id] for request_id in request_ids))
-        for request_id, (output, _finish_time) in zip(request_ids, aborted_results, strict=True):
+        pending_waits = set(checkpoint_wait_tasks.values())
+        while pending_waits:
+            done, pending_waits = await asyncio.wait(pending_waits, return_when=asyncio.FIRST_COMPLETED)
+            for wait_task in done:
+                request_id = wait_task_to_request[wait_task]
+                checkpoint_states[request_id] = wait_task.result()
+                engine.abort(request_id)
+                output, _finish_time = await initial_tasks[request_id]
+                if not output.aborted:
+                    raise RuntimeError(f"Expected aborted output for {request_id}, got: {output!r}")
+
+        for request_id in request_ids:
+            if request_id not in checkpoint_states:
+                raise RuntimeError(f"Missing checkpoint for request {request_id}.")
+
+        for request_id in request_ids:
+            output, _finish_time = await initial_tasks[request_id]
             if not output.aborted:
                 raise RuntimeError(f"Expected aborted output for {request_id}, got: {output!r}")
 
