@@ -256,10 +256,72 @@ def _append_csv_row(path: Path, row: dict[str, Any], fieldnames: list[str]) -> N
         csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
 
 
-def _extract_first_image(outputs: list[Any]) -> np.ndarray:
-    if not outputs or not outputs[0].images:
+def _normalize_image(image: Any) -> Any:
+    from PIL import Image
+
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+    if isinstance(image, np.ndarray):
+        if image.dtype != np.uint8:
+            if np.issubdtype(image.dtype, np.floating):
+                if image.min() < 0:
+                    image = np.clip(image, -1.0, 1.0) * 0.5 + 0.5
+                else:
+                    image = np.clip(image, 0.0, 1.0)
+                image = (image * 255).astype(np.uint8)
+            else:
+                image = np.clip(image, 0, 255).astype(np.uint8)
+        return Image.fromarray(image).convert("RGB")
+    return image
+
+
+def _extract_images(result: Any) -> list[Any]:
+    images: list[Any] = []
+
+    if isinstance(result, list):
+        for item in result:
+            extracted = _extract_images(item)
+            if extracted:
+                return extracted
+        return []
+
+    if hasattr(result, "images") and result.images:
+        images = result.images
+    elif hasattr(result, "request_output"):
+        request_output = result.request_output
+        if isinstance(request_output, dict) and request_output.get("images"):
+            images = request_output["images"]
+        elif hasattr(request_output, "images") and request_output.images:
+            images = request_output.images
+    elif hasattr(result, "output"):
+        output = result.output
+        if isinstance(output, dict):
+            if output.get("images"):
+                images = output["images"]
+            elif output.get("image") is not None:
+                images = [output["image"]]
+        elif isinstance(output, (list, tuple)):
+            images = list(output)
+        elif output is not None:
+            images = [output]
+
+    if images and isinstance(images[0], np.ndarray) and images[0].ndim == 5 and images[0].shape[0] > 1:
+        images = list(images[0])
+
+    flattened: list[Any] = []
+    for image in images:
+        if isinstance(image, list):
+            flattened.extend(image)
+        else:
+            flattened.append(image)
+    return [_normalize_image(image) for image in flattened]
+
+
+def _extract_first_image(result: Any) -> np.ndarray:
+    images = _extract_images(result)
+    if not images:
         raise RuntimeError("No image output produced.")
-    return np.asarray(outputs[0].images[0].convert("RGB"), dtype=np.uint8)
+    return np.asarray(images[0], dtype=np.uint8)
 
 
 def _save_image(image: np.ndarray, path: Path) -> None:
