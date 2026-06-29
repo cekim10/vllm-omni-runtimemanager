@@ -261,6 +261,15 @@ def _normalize_image(image: Any) -> Any:
 
     if isinstance(image, Image.Image):
         return image.convert("RGB")
+    if isinstance(image, torch.Tensor):
+        tensor = image.detach().cpu().to(torch.float32)
+        if tensor.ndim == 4:
+            if tensor.shape[0] != 1:
+                raise ValueError(f"Expected a single image tensor, got batch shape {tuple(tensor.shape)}.")
+            tensor = tensor[0]
+        if tensor.ndim == 3 and tensor.shape[0] in (1, 3, 4):
+            tensor = tensor.permute(1, 2, 0)
+        image = tensor.numpy()
     if isinstance(image, np.ndarray):
         if image.dtype != np.uint8:
             if np.issubdtype(image.dtype, np.floating):
