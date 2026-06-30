@@ -70,6 +70,7 @@ REQUEST_CSV_FIELDS = [
     "checkpoint_value_score",
     "request_latency_sec",
     "recovery_latency_sec",
+    "slo_mode",
     "slo_threshold_sec",
     "slo_met",
     "output_ssim",
@@ -93,6 +94,7 @@ BATCH_CSV_FIELDS = [
     "max_request_latency_sec",
     "mean_recovery_latency_sec",
     "max_recovery_latency_sec",
+    "slo_mode",
     "slo_threshold_mean_sec",
     "slo_attainment",
     "mean_output_ssim",
@@ -170,8 +172,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cpu-budget-bytes",
         type=int,
-        default=524288,
-        help="Checkpoint CPU tier budget. Defaults to ~2 lossless Z-Image checkpoints at 512x512.",
+        default=262144,
+        help="Checkpoint CPU tier budget. Defaults to ~1 lossless Z-Image checkpoint at 512x512 to create a sharper spill cliff.",
     )
     parser.add_argument("--gpu-budget-bytes", type=int, default=0, help="Checkpoint GPU tier budget.")
     parser.add_argument("--theta-h", type=float, default=0.7, help="LOSSLESS threshold.")
@@ -222,8 +224,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--slo-multiplier",
         type=float,
-        default=1.25,
-        help="SLO threshold multiplier relative to serialized no-failure latency.",
+        default=1.05,
+        help="Relative SLO threshold multiplier against serialized no-failure latency. Defaults tighter than before.",
+    )
+    parser.add_argument(
+        "--slo-absolute-sec",
+        type=float,
+        default=None,
+        help="Optional absolute per-request SLO deadline in seconds. Overrides --slo-multiplier when set.",
     )
     parser.set_defaults(backend="real-model", disk_path=None, strict_equality=False, step_delay=0.02)
     return parser.parse_args()
@@ -408,6 +416,16 @@ def _phase_targets(concurrency: int, phase_min_step: int, phase_max_step: int) -
         return [phase_max_step]
     steps = np.linspace(phase_max_step, phase_min_step, concurrency)
     return [max(1, int(round(step))) for step in steps.tolist()]
+
+
+def _compute_slo_threshold(
+    baseline_ttfv_sec: float,
+    concurrency: int,
+    args: argparse.Namespace,
+) -> tuple[str, float]:
+    if args.slo_absolute_sec is not None:
+        return "absolute", float(args.slo_absolute_sec)
+    return "relative", float(baseline_ttfv_sec * concurrency * args.slo_multiplier)
 
 
 async def _wait_for_checkpoint(
@@ -632,7 +650,7 @@ async def _run_condition(
         metrics = _image_metrics(output_image, case.baseline_image)
         request_latency_sec = finish_time - launch_times[request_id]
         recovery_latency_sec = finish_time - resume_launch_times[request_id]
-        slo_threshold_sec = case.baseline_ttfv_sec * concurrency * args.slo_multiplier
+        slo_mode, slo_threshold_sec = _compute_slo_threshold(case.baseline_ttfv_sec, concurrency, args)
         slo_met = request_latency_sec <= slo_threshold_sec
 
         request_latencies.append(request_latency_sec)
@@ -663,6 +681,7 @@ async def _run_condition(
             "checkpoint_value_score": checkpoint_state.value_score,
             "request_latency_sec": request_latency_sec,
             "recovery_latency_sec": recovery_latency_sec,
+            "slo_mode": slo_mode,
             "slo_threshold_sec": slo_threshold_sec,
             "slo_met": slo_met,
             "output_ssim": metrics["output_ssim"],
@@ -689,6 +708,7 @@ async def _run_condition(
         "max_request_latency_sec": max(request_latencies),
         "mean_recovery_latency_sec": mean(request_recovery_latencies),
         "max_recovery_latency_sec": max(request_recovery_latencies),
+        "slo_mode": request_rows[0].request_row["slo_mode"],
         "slo_threshold_mean_sec": mean(float(row.request_row["slo_threshold_sec"]) for row in request_rows),
         "slo_attainment": mean(1.0 if row.request_row["slo_met"] else 0.0 for row in request_rows),
         "mean_output_ssim": mean(request_ssims),
@@ -808,6 +828,7 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "cpu_budget_bytes": args.cpu_budget_bytes,
         "gpu_budget_bytes": args.gpu_budget_bytes,
         "slo_multiplier": args.slo_multiplier,
+        "slo_absolute_sec": args.slo_absolute_sec,
         "init_config": init_config,
         "request_csv_path": str(request_csv_path),
         "batch_csv_path": str(batch_csv_path),
