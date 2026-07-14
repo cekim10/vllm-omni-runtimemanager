@@ -288,6 +288,10 @@ def _foreground_concurrency(level: str, args: argparse.Namespace) -> int:
     raise ValueError(f"Unexpected foreground level: {level}")
 
 
+def _maybe_mean(values: list[float | int]) -> float | None:
+    return mean(values) if values else None
+
+
 def _gpu_mem_snapshot() -> dict[str, int | None]:
     if not torch.cuda.is_available():
         return {"free_bytes": None, "total_bytes": None, "used_bytes": None}
@@ -683,6 +687,31 @@ def _aggregate_batch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for row in group_rows
             if row["foreground_mean_latency_sec"] is not None
         ]
+        paused_resume_latencies = [
+            float(row["paused_mean_resume_or_restart_latency_sec"])
+            for row in group_rows
+            if row["paused_mean_resume_or_restart_latency_sec"] is not None
+        ]
+        paused_ssims = [
+            float(row["paused_mean_output_ssim"])
+            for row in group_rows
+            if row["paused_mean_output_ssim"] is not None
+        ]
+        paused_gpu_footprint_ratios = [
+            float(row["post_pause_gpu_footprint_ratio"])
+            for row in group_rows
+            if row["post_pause_gpu_footprint_ratio"] is not None
+        ]
+        paused_recomputed_steps = [
+            float(row["paused_mean_recomputed_steps"])
+            for row in group_rows
+            if row["paused_mean_recomputed_steps"] is not None
+        ]
+        paused_wasted_compute_secs = [
+            float(row["paused_mean_wasted_compute_sec"])
+            for row in group_rows
+            if row["paused_mean_wasted_compute_sec"] is not None
+        ]
         aggregates.append(
             {
                 "policy": policy,
@@ -694,17 +723,15 @@ def _aggregate_batch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "mean_foreground_latency_sec": mean(foreground_latencies) if foreground_latencies else None,
                 "mean_foreground_success_rate": mean(float(row["foreground_success_rate"]) for row in group_rows),
                 "mean_foreground_batch_utilization": mean(float(row["foreground_batch_utilization"]) for row in group_rows),
-                "mean_paused_resume_or_restart_latency_sec": mean(
-                    float(row["paused_mean_resume_or_restart_latency_sec"]) for row in group_rows
-                ),
-                "mean_paused_output_ssim": mean(float(row["paused_mean_output_ssim"]) for row in group_rows),
-                "mean_paused_gpu_footprint_ratio": mean(
-                    float(row["post_pause_gpu_footprint_ratio"])
-                    for row in group_rows
-                    if row["post_pause_gpu_footprint_ratio"] is not None
-                ),
-                "mean_paused_recomputed_steps": mean(float(row["paused_mean_recomputed_steps"]) for row in group_rows),
-                "mean_paused_wasted_compute_sec": mean(float(row["paused_mean_wasted_compute_sec"]) for row in group_rows),
+                "mean_paused_resume_or_restart_latency_sec": mean(paused_resume_latencies)
+                if paused_resume_latencies
+                else None,
+                "mean_paused_output_ssim": mean(paused_ssims) if paused_ssims else None,
+                "mean_paused_gpu_footprint_ratio": mean(paused_gpu_footprint_ratios)
+                if paused_gpu_footprint_ratios
+                else None,
+                "mean_paused_recomputed_steps": mean(paused_recomputed_steps) if paused_recomputed_steps else None,
+                "mean_paused_wasted_compute_sec": mean(paused_wasted_compute_secs) if paused_wasted_compute_secs else None,
                 "mean_post_pause_gpu_free_bytes": mean(float(row["post_pause_gpu_free_bytes"]) for row in group_rows),
                 "mean_post_foreground_gpu_free_bytes": mean(float(row["post_foreground_gpu_free_bytes"]) for row in group_rows),
             }
@@ -785,19 +812,23 @@ async def _run_condition(
         raise RuntimeError("Diffusion state manager is disabled for this engine.")
 
     foreground_concurrency = _foreground_concurrency(foreground_level, args)
-    target_steps = _phase_targets(paused_request_count, args.phase_min_step, args.phase_max_step)
+    target_steps = _phase_targets(paused_request_count, args.phase_min_step, args.phase_max_step) if paused_request_count > 0 else []
     request_rows: list[dict[str, Any]] = []
 
     with _policy_override(engine, policy, args):
         pre_pause_mem = _gpu_mem_snapshot()
-        paused_records, post_pause_mem, pause_meta, _extra = await _pause_background_requests(
-            engine,
-            args,
-            policy=policy,
-            paused_request_count=paused_request_count,
-            baselines=baselines,
-            target_steps=target_steps,
-        )
+        if paused_request_count > 0:
+            paused_records, post_pause_mem, pause_meta, _extra = await _pause_background_requests(
+                engine,
+                args,
+                policy=policy,
+                paused_request_count=paused_request_count,
+                baselines=baselines,
+                target_steps=target_steps,
+            )
+        else:
+            paused_records = []
+            post_pause_mem = _gpu_mem_snapshot()
 
         await asyncio.sleep(pause_duration_sec)
 
@@ -811,19 +842,22 @@ async def _run_condition(
         )
         post_foreground_mem = _gpu_mem_snapshot()
 
-        paused_results = await _resume_background_requests(
-            engine,
-            args,
-            policy=policy,
-            paused_records=paused_records,
-            baselines=baselines,
-            artifact_dir=artifact_dir,
-            paused_request_count=paused_request_count,
-            pause_duration_sec=pause_duration_sec,
-            foreground_level=foreground_level,
-            foreground_concurrency=foreground_concurrency,
-            run_idx=run_idx,
-        )
+        if paused_request_count > 0:
+            paused_results = await _resume_background_requests(
+                engine,
+                args,
+                policy=policy,
+                paused_records=paused_records,
+                baselines=baselines,
+                artifact_dir=artifact_dir,
+                paused_request_count=paused_request_count,
+                pause_duration_sec=pause_duration_sec,
+                foreground_level=foreground_level,
+                foreground_concurrency=foreground_concurrency,
+                run_idx=run_idx,
+            )
+        else:
+            paused_results = []
         post_resume_mem = _gpu_mem_snapshot()
 
     placements = Counter()
@@ -934,7 +968,7 @@ async def _run_condition(
         "paused_cpu_count": placements.get(Placement.CPU.value, 0),
         "paused_disk_count": placements.get(Placement.DISK.value, 0),
         "paused_total_checkpoint_bytes": sum(checkpoint_sizes),
-        "paused_mean_checkpoint_bytes": mean(checkpoint_sizes) if checkpoint_sizes else 0.0,
+        "paused_mean_checkpoint_bytes": _maybe_mean(checkpoint_sizes) or 0.0,
         "paused_assigned_fidelity_counts": json.dumps(dict(sorted(fidelity_counts.items())), sort_keys=True),
         "paused_estimated_d2h_bytes": d2h_bytes,
         "paused_estimated_h2d_bytes": h2d_bytes,
@@ -946,19 +980,19 @@ async def _run_condition(
         "foreground_mean_admission_latency_sec": mean(foreground_admission_latencies)
         if foreground_admission_latencies
         else None,
-        "foreground_mean_latency_sec": mean(foreground_latencies) if foreground_latencies else None,
+        "foreground_mean_latency_sec": _maybe_mean(foreground_latencies),
         "foreground_max_latency_sec": max(foreground_latencies) if foreground_latencies else None,
         "foreground_success_rate": foreground_success_rate,
-        "paused_mean_completion_latency_sec": mean(paused_completion_latencies),
-        "paused_max_completion_latency_sec": max(paused_completion_latencies),
-        "paused_mean_resume_or_restart_latency_sec": mean(paused_resume_latencies),
-        "paused_mean_output_ssim": mean(paused_ssims),
-        "paused_min_output_ssim": min(paused_ssims),
-        "paused_mean_output_mse": mean(paused_mses),
-        "paused_max_output_mse": max(paused_mses),
-        "paused_exact_equal_rate": mean(paused_exacts),
-        "paused_mean_recomputed_steps": mean(paused_recomputed_steps),
-        "paused_mean_wasted_compute_sec": mean(paused_wasted_compute_secs),
+        "paused_mean_completion_latency_sec": _maybe_mean(paused_completion_latencies),
+        "paused_max_completion_latency_sec": max(paused_completion_latencies) if paused_completion_latencies else None,
+        "paused_mean_resume_or_restart_latency_sec": _maybe_mean(paused_resume_latencies),
+        "paused_mean_output_ssim": _maybe_mean(paused_ssims),
+        "paused_min_output_ssim": min(paused_ssims) if paused_ssims else None,
+        "paused_mean_output_mse": _maybe_mean(paused_mses),
+        "paused_max_output_mse": max(paused_mses) if paused_mses else None,
+        "paused_exact_equal_rate": _maybe_mean(paused_exacts),
+        "paused_mean_recomputed_steps": _maybe_mean(paused_recomputed_steps),
+        "paused_mean_wasted_compute_sec": _maybe_mean(paused_wasted_compute_secs),
     }
 
     for row in request_rows:
