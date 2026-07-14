@@ -372,7 +372,11 @@ def _prompt_and_sampling(engine: Any, args: argparse.Namespace, *, prompt: str, 
     prompt_args = argparse.Namespace(**vars(args))
     prompt_args.prompt = prompt
     prompt_args.seed = seed
-    return _build_prompt(engine.omni, prompt_args), _build_sampling_params(prompt_args)
+    sampling_params = _build_sampling_params(prompt_args)
+    generator_device = "cuda" if torch.cuda.is_available() else "cpu"
+    sampling_params.generator_device = generator_device
+    sampling_params.generator = torch.Generator(device=generator_device).manual_seed(int(seed))
+    return _build_prompt(engine.omni, prompt_args), sampling_params
 
 
 def _pairwise_image_metrics(images: list[np.ndarray]) -> dict[str, float]:
@@ -462,6 +466,9 @@ def _branch_request_from_state(
     )
     restored_request.request_id = branch_request_id
     restored_request.sampling_params.seed = branch_seed
+    generator_device = restored_request.sampling_params.generator_device or ("cuda" if torch.cuda.is_available() else "cpu")
+    restored_request.sampling_params.generator_device = generator_device
+    restored_request.sampling_params.generator = torch.Generator(device=generator_device).manual_seed(int(branch_seed))
 
     latents = restored_request.sampling_params.latents
     if latents is None:
@@ -630,7 +637,8 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         _append_csv_row(output_path, independent_row)
                         print(
                             f"[independent] prompt_id={prompt_id} run_idx={run_idx} "
-                            f"candidates={candidate_count} wall_sec={independent_total_wall:.3f} "
+                            f"candidates={candidate_count} seeds={[candidate.seed for candidate in independent_candidates]} "
+                            f"wall_sec={independent_total_wall:.3f} "
                             f"pairwise_ssim_dist={independent_metrics['mean_pairwise_ssim_distance']:.6f}",
                             flush=True,
                         )
