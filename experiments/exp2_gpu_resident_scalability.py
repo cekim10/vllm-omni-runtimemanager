@@ -23,12 +23,12 @@ from experiments.exp2_memory_pressure import (
     _append_csv_row,
     _artifact_dir,
     _attach_engine_owner,
-    _build_baselines,
     _case_args,
     _extract_first_image,
     _image_metrics,
     _load_prompts,
     _phase_targets,
+    _run_full_baseline,
     _run_request_with_finish_time,
     _wait_for_checkpoint,
     _write_csv_header,
@@ -332,6 +332,31 @@ def _prompt_and_sampling(engine: Any, args: argparse.Namespace, *, prompt: str, 
     prompt_args.prompt = prompt
     prompt_args.seed = seed
     return _build_prompt(engine.omni, prompt_args), _build_sampling_params(prompt_args)
+
+
+async def _build_background_baselines(
+    engine: Any,
+    args: argparse.Namespace,
+    prompts: list[str],
+    artifact_dir: Path,
+    count: int,
+) -> list[Any]:
+    baselines: list[Any] = []
+    for slot_idx in range(count):
+        prompt = prompts[slot_idx % len(prompts)]
+        baseline = await _run_full_baseline(
+            engine,
+            args,
+            slot_idx=slot_idx,
+            prompt=prompt,
+            artifact_dir=artifact_dir,
+        )
+        baselines.append(baseline)
+        print(
+            f"[baseline] slot_idx={slot_idx} seed={baseline.seed} ttfv_sec={baseline.baseline_ttfv_sec:.3f}",
+            flush=True,
+        )
+    return baselines
 
 
 async def _wait_for_admission(
@@ -896,7 +921,13 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
 
         max_background = max(args.paused_request_counts)
         baseline_prompts = [prompts[idx % len(prompts)] for idx in range(max_background)]
-        baselines = await _build_baselines(engine, args, baseline_prompts, artifact_dir)
+        baselines = await _build_background_baselines(
+            engine,
+            args,
+            baseline_prompts,
+            artifact_dir,
+            count=max_background,
+        )
 
         for paused_request_count in args.paused_request_counts:
             for pause_duration_sec in args.pause_durations_sec:
