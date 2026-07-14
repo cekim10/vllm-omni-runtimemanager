@@ -139,6 +139,27 @@ class OptionalMetricSuite:
             self.enable_lpips = False
             return False
 
+    @staticmethod
+    def _coerce_embedding_tensor(value: Any) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value
+        if isinstance(value, tuple) and value:
+            for item in value:
+                if isinstance(item, torch.Tensor):
+                    return item
+        if hasattr(value, "image_embeds") and isinstance(value.image_embeds, torch.Tensor):
+            return value.image_embeds
+        if hasattr(value, "text_embeds") and isinstance(value.text_embeds, torch.Tensor):
+            return value.text_embeds
+        if hasattr(value, "pooler_output") and isinstance(value.pooler_output, torch.Tensor):
+            return value.pooler_output
+        if hasattr(value, "last_hidden_state") and isinstance(value.last_hidden_state, torch.Tensor):
+            tensor = value.last_hidden_state
+            if tensor.ndim >= 2:
+                return tensor[:, 0]
+            return tensor
+        raise TypeError(f"Could not coerce CLIP embedding output to Tensor: {type(value)!r}")
+
     def compute_clip_metrics(self, prompt: str, images: list[np.ndarray]) -> dict[str, float | None]:
         if not self._ensure_clip():
             return {
@@ -153,11 +174,11 @@ class OptionalMetricSuite:
         pil_images = [Image.fromarray(image.astype(np.uint8), mode="RGB") for image in images]
         with torch.inference_mode():
             image_inputs = processor(images=pil_images, return_tensors="pt").to(device)
-            image_features = model.get_image_features(**image_inputs)
+            image_features = self._coerce_embedding_tensor(model.get_image_features(**image_inputs))
             image_features = torch.nn.functional.normalize(image_features, dim=-1)
 
             text_inputs = processor(text=[prompt], return_tensors="pt", padding=True).to(device)
-            text_features = model.get_text_features(**text_inputs)
+            text_features = self._coerce_embedding_tensor(model.get_text_features(**text_inputs))
             text_features = torch.nn.functional.normalize(text_features, dim=-1)
 
         clip_distances: list[float] = []
