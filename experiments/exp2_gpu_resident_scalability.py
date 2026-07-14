@@ -68,9 +68,16 @@ REQUEST_CSV_FIELDS = [
     "actual_step_idx",
     "assigned_fidelity",
     "placement",
+    "state_retained",
+    "dropped_state",
     "checkpoint_size_bytes",
     "checkpoint_value_score",
+    "checkpoint_gpu_footprint_bytes",
+    "checkpoint_gpu_footprint_ratio",
+    "recomputed_steps",
+    "wasted_compute_sec",
     "admitted",
+    "free_gpu_bytes_at_admission",
     "admission_latency_sec",
     "total_latency_sec",
     "resume_or_restart_latency_sec",
@@ -93,6 +100,8 @@ BATCH_CSV_FIELDS = [
     "post_pause_gpu_free_bytes",
     "post_foreground_gpu_free_bytes",
     "post_resume_gpu_free_bytes",
+    "post_pause_gpu_footprint_bytes",
+    "post_pause_gpu_footprint_ratio",
     "paused_gpu_count",
     "paused_cpu_count",
     "paused_disk_count",
@@ -101,6 +110,10 @@ BATCH_CSV_FIELDS = [
     "paused_assigned_fidelity_counts",
     "paused_estimated_d2h_bytes",
     "paused_estimated_h2d_bytes",
+    "foreground_admitted_count",
+    "foreground_failed_count",
+    "foreground_batch_utilization",
+    "foreground_min_free_gpu_bytes_at_admission",
     "foreground_admission_rate",
     "foreground_mean_admission_latency_sec",
     "foreground_mean_latency_sec",
@@ -114,6 +127,8 @@ BATCH_CSV_FIELDS = [
     "paused_mean_output_mse",
     "paused_max_output_mse",
     "paused_exact_equal_rate",
+    "paused_mean_recomputed_steps",
+    "paused_mean_wasted_compute_sec",
 ]
 
 
@@ -125,6 +140,7 @@ class ForegroundRequestResult:
     seed: int
     target_step_idx: int
     admitted: bool
+    free_gpu_bytes_at_admission: int | None
     admission_latency_sec: float | None
     total_latency_sec: float | None
     error_text: str | None
@@ -285,6 +301,12 @@ def _gpu_mem_snapshot() -> dict[str, int | None]:
     }
 
 
+def _safe_ratio(numerator: int | float | None, denominator: int | float | None) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return float(numerator) / float(denominator)
+
+
 @contextmanager
 def _policy_override(
     engine: Any,
@@ -365,7 +387,7 @@ async def _wait_for_admission(
     *,
     poll_interval: float,
     timeout_s: float,
-) -> tuple[float, Any]:
+) -> tuple[float, Any, dict[str, int | None]]:
     start = time.perf_counter()
     state = await _wait_for_checkpoint(
         engine,
@@ -374,7 +396,7 @@ async def _wait_for_admission(
         poll_interval=poll_interval,
         timeout_s=timeout_s,
     )
-    return time.perf_counter() - start, state
+    return time.perf_counter() - start, state, _gpu_mem_snapshot()
 
 
 def _estimated_transfer_bytes(policy: str, placement: Placement, size_bytes: int) -> tuple[int, int]:
@@ -475,7 +497,7 @@ async def _run_foreground_requests(
 ) -> list[ForegroundRequestResult]:
     request_ids = [f"foreground-{foreground_level}-slot{slot_idx}" for slot_idx in range(foreground_concurrency)]
     request_tasks: dict[str, asyncio.Task[tuple[Any, float]]] = {}
-    admission_tasks: dict[str, asyncio.Task[tuple[float, Any]]] = {}
+    admission_tasks: dict[str, asyncio.Task[tuple[float, Any, dict[str, int | None]]]] = {}
     launch_times: dict[str, float] = {}
     request_meta: dict[str, tuple[int, str, int]] = {}
 
@@ -498,18 +520,18 @@ async def _run_foreground_requests(
             )
         )
 
-    admission_results: dict[str, tuple[bool, float | None]] = {}
+    admission_results: dict[str, tuple[bool, float | None, int | None]] = {}
     for request_id, task in admission_tasks.items():
         try:
-            admission_latency_sec, _state = await task
-            admission_results[request_id] = (True, admission_latency_sec)
+            admission_latency_sec, _state, admission_mem = await task
+            admission_results[request_id] = (True, admission_latency_sec, admission_mem["free_bytes"])
         except Exception:
-            admission_results[request_id] = (False, None)
+            admission_results[request_id] = (False, None, None)
             engine.abort(request_id)
 
     results: list[ForegroundRequestResult] = []
     for request_id, task in request_tasks.items():
-        admitted, admission_latency_sec = admission_results[request_id]
+        admitted, admission_latency_sec, free_gpu_bytes_at_admission = admission_results[request_id]
         slot_idx, prompt, seed = request_meta[request_id]
         try:
             output, finish_time = await task
@@ -531,6 +553,7 @@ async def _run_foreground_requests(
                 seed=seed,
                 target_step_idx=1,
                 admitted=admitted,
+                free_gpu_bytes_at_admission=free_gpu_bytes_at_admission,
                 admission_latency_sec=admission_latency_sec,
                 total_latency_sec=total_latency_sec,
                 error_text=error_text,
@@ -574,6 +597,13 @@ async def _resume_background_requests(
     for idx, (record, case) in enumerate(zip(paused_records, baselines[:paused_request_count], strict=True)):
         request_id = record["request_id"]
         checkpoint_state = record["checkpoint_state"]
+        state_retained = policy != "restart"
+        recomputed_steps = checkpoint_state.step_idx if policy == "restart" else 0
+        wasted_compute_sec = (
+            case.baseline_ttfv_sec * (checkpoint_state.step_idx / max(args.num_inference_steps, 1))
+            if policy == "restart"
+            else 0.0
+        )
         resumed_output, finish_time = await resumed_tasks[request_id]
         if resumed_output.error is not None:
             raise RuntimeError(f"Paused request {request_id} failed after {policy}: {resumed_output.error}")
@@ -611,10 +641,17 @@ async def _resume_background_requests(
             "target_step_idx": checkpoint_state.step_idx,
             "actual_step_idx": checkpoint_state.step_idx,
             "assigned_fidelity": checkpoint_state.fidelity.value,
-            "placement": checkpoint_state.placement.value,
+            "placement": checkpoint_state.placement.value if state_retained else None,
+            "state_retained": state_retained,
+            "dropped_state": not state_retained,
             "checkpoint_size_bytes": checkpoint_state.size_bytes,
             "checkpoint_value_score": checkpoint_state.value_score,
+            "checkpoint_gpu_footprint_bytes": checkpoint_state.size_bytes if state_retained and checkpoint_state.placement == Placement.GPU else 0,
+            "checkpoint_gpu_footprint_ratio": None,
+            "recomputed_steps": recomputed_steps,
+            "wasted_compute_sec": wasted_compute_sec,
             "admitted": True,
+            "free_gpu_bytes_at_admission": None,
             "admission_latency_sec": None,
             "total_latency_sec": finish_time - record["launch_time"],
             "resume_or_restart_latency_sec": finish_time - resume_launch_times[request_id],
@@ -656,10 +693,18 @@ def _aggregate_batch_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "mean_foreground_admission_rate": mean(float(row["foreground_admission_rate"]) for row in group_rows),
                 "mean_foreground_latency_sec": mean(foreground_latencies) if foreground_latencies else None,
                 "mean_foreground_success_rate": mean(float(row["foreground_success_rate"]) for row in group_rows),
+                "mean_foreground_batch_utilization": mean(float(row["foreground_batch_utilization"]) for row in group_rows),
                 "mean_paused_resume_or_restart_latency_sec": mean(
                     float(row["paused_mean_resume_or_restart_latency_sec"]) for row in group_rows
                 ),
                 "mean_paused_output_ssim": mean(float(row["paused_mean_output_ssim"]) for row in group_rows),
+                "mean_paused_gpu_footprint_ratio": mean(
+                    float(row["post_pause_gpu_footprint_ratio"])
+                    for row in group_rows
+                    if row["post_pause_gpu_footprint_ratio"] is not None
+                ),
+                "mean_paused_recomputed_steps": mean(float(row["paused_mean_recomputed_steps"]) for row in group_rows),
+                "mean_paused_wasted_compute_sec": mean(float(row["paused_mean_wasted_compute_sec"]) for row in group_rows),
                 "mean_post_pause_gpu_free_bytes": mean(float(row["post_pause_gpu_free_bytes"]) for row in group_rows),
                 "mean_post_foreground_gpu_free_bytes": mean(float(row["post_foreground_gpu_free_bytes"]) for row in group_rows),
             }
@@ -784,30 +829,35 @@ async def _run_condition(
     placements = Counter()
     fidelity_counts = Counter()
     checkpoint_sizes: list[int] = []
+    checkpoint_gpu_footprints: list[int] = []
     paused_ssims: list[float] = []
     paused_mses: list[float] = []
     paused_exacts: list[float] = []
     paused_completion_latencies: list[float] = []
     paused_resume_latencies: list[float] = []
+    paused_recomputed_steps: list[int] = []
+    paused_wasted_compute_secs: list[float] = []
     d2h_bytes = 0
     h2d_bytes = 0
 
     for result in paused_results:
         row = result.request_row
         request_rows.append(row)
-        placements[row["placement"]] += 1
-        fidelity_counts[row["assigned_fidelity"]] += 1
+        if row["placement"] is not None:
+            placements[row["placement"]] += 1
+        if row["assigned_fidelity"] is not None:
+            fidelity_counts[row["assigned_fidelity"]] += 1
         checkpoint_sizes.append(int(row["checkpoint_size_bytes"]))
+        checkpoint_gpu_footprints.append(int(row["checkpoint_gpu_footprint_bytes"]))
         paused_ssims.append(float(row["output_ssim"]))
         paused_mses.append(float(row["output_mse"]))
         paused_exacts.append(1.0 if row["exact_equal"] else 0.0)
         paused_completion_latencies.append(float(row["total_latency_sec"]))
         paused_resume_latencies.append(float(row["resume_or_restart_latency_sec"]))
-        request_d2h_bytes, request_h2d_bytes = _estimated_transfer_bytes(
-            policy,
-            Placement(row["placement"]),
-            int(row["checkpoint_size_bytes"]),
-        )
+        paused_recomputed_steps.append(int(row["recomputed_steps"]))
+        paused_wasted_compute_secs.append(float(row["wasted_compute_sec"]))
+        placement = Placement(row["placement"]) if row["placement"] is not None else Placement.CPU
+        request_d2h_bytes, request_h2d_bytes = _estimated_transfer_bytes(policy, placement, int(row["checkpoint_size_bytes"]))
         d2h_bytes += request_d2h_bytes
         h2d_bytes += request_h2d_bytes
 
@@ -815,8 +865,15 @@ async def _run_condition(
     foreground_admission_latencies = [
         row.admission_latency_sec for row in foreground_results if row.admission_latency_sec is not None
     ]
+    foreground_free_gpu_bytes = [
+        row.free_gpu_bytes_at_admission
+        for row in foreground_results
+        if row.free_gpu_bytes_at_admission is not None
+    ]
     foreground_success_rate = mean(1.0 if row.error_text is None else 0.0 for row in foreground_results)
     foreground_admission_rate = mean(1.0 if row.admitted else 0.0 for row in foreground_results)
+    foreground_admitted_count = sum(1 for row in foreground_results if row.admitted)
+    foreground_failed_count = foreground_concurrency - foreground_admitted_count
 
     for foreground_result in foreground_results:
         request_rows.append(
@@ -838,9 +895,16 @@ async def _run_condition(
                 "actual_step_idx": None,
                 "assigned_fidelity": None,
                 "placement": None,
+                "state_retained": None,
+                "dropped_state": None,
                 "checkpoint_size_bytes": None,
                 "checkpoint_value_score": None,
+                "checkpoint_gpu_footprint_bytes": None,
+                "checkpoint_gpu_footprint_ratio": None,
+                "recomputed_steps": None,
+                "wasted_compute_sec": None,
                 "admitted": foreground_result.admitted,
+                "free_gpu_bytes_at_admission": foreground_result.free_gpu_bytes_at_admission,
                 "admission_latency_sec": foreground_result.admission_latency_sec,
                 "total_latency_sec": foreground_result.total_latency_sec,
                 "resume_or_restart_latency_sec": None,
@@ -864,6 +928,8 @@ async def _run_condition(
         "post_pause_gpu_free_bytes": post_pause_mem["free_bytes"],
         "post_foreground_gpu_free_bytes": post_foreground_mem["free_bytes"],
         "post_resume_gpu_free_bytes": post_resume_mem["free_bytes"],
+        "post_pause_gpu_footprint_bytes": sum(checkpoint_gpu_footprints),
+        "post_pause_gpu_footprint_ratio": _safe_ratio(sum(checkpoint_gpu_footprints), pre_pause_mem["free_bytes"]),
         "paused_gpu_count": placements.get(Placement.GPU.value, 0),
         "paused_cpu_count": placements.get(Placement.CPU.value, 0),
         "paused_disk_count": placements.get(Placement.DISK.value, 0),
@@ -872,6 +938,10 @@ async def _run_condition(
         "paused_assigned_fidelity_counts": json.dumps(dict(sorted(fidelity_counts.items())), sort_keys=True),
         "paused_estimated_d2h_bytes": d2h_bytes,
         "paused_estimated_h2d_bytes": h2d_bytes,
+        "foreground_admitted_count": foreground_admitted_count,
+        "foreground_failed_count": foreground_failed_count,
+        "foreground_batch_utilization": foreground_admitted_count / max(foreground_concurrency, 1),
+        "foreground_min_free_gpu_bytes_at_admission": min(foreground_free_gpu_bytes) if foreground_free_gpu_bytes else None,
         "foreground_admission_rate": foreground_admission_rate,
         "foreground_mean_admission_latency_sec": mean(foreground_admission_latencies)
         if foreground_admission_latencies
@@ -887,7 +957,16 @@ async def _run_condition(
         "paused_mean_output_mse": mean(paused_mses),
         "paused_max_output_mse": max(paused_mses),
         "paused_exact_equal_rate": mean(paused_exacts),
+        "paused_mean_recomputed_steps": mean(paused_recomputed_steps),
+        "paused_mean_wasted_compute_sec": mean(paused_wasted_compute_secs),
     }
+
+    for row in request_rows:
+        if row["request_role"] == "paused":
+            row["checkpoint_gpu_footprint_ratio"] = _safe_ratio(
+                row["checkpoint_gpu_footprint_bytes"],
+                pre_pause_mem["free_bytes"],
+            )
     return request_rows, batch_row
 
 
