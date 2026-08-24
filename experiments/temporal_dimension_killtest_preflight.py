@@ -111,6 +111,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--enable-cpu-offload", action="store_true")
     parser.add_argument(
+        "--disable-semantic-metric",
+        action="store_true",
+        help="Skip prompt-conditioned CLIP scoring for intermediate videos.",
+    )
+    parser.add_argument(
+        "--semantic-model",
+        default="openai/clip-vit-base-patch32",
+        help="Prompt-conditioned image-text model used for semantic trajectory scoring.",
+    )
+    parser.add_argument(
+        "--semantic-frame-count",
+        type=int,
+        default=4,
+        help="How many frames per video to sample for semantic scoring.",
+    )
+    parser.add_argument(
+        "--semantic-device",
+        default="cpu",
+        help="Device for semantic scoring, usually cpu to avoid perturbing diffusion memory.",
+    )
+    parser.add_argument(
         "--capture-progress",
         type=float,
         nargs="*",
@@ -242,6 +263,18 @@ def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     return max(0.0, min(1.0, 0.5 * (value + 1.0)))
 
 
+def _ratio_similarity(a: float, b: float, eps: float = 1e-6) -> float:
+    a = max(float(a), 0.0)
+    b = max(float(b), 0.0)
+    hi = max(a, b, eps)
+    lo = max(min(a, b), 0.0)
+    return max(0.0, min(1.0, lo / hi))
+
+
+def _safe_relative(value: float, reference: float, eps: float = 1e-6) -> float:
+    return max(0.0, min(1.5, float(value) / max(float(reference), eps)))
+
+
 def _motion_energy_profile(video_small: torch.Tensor) -> torch.Tensor:
     if video_small.shape[0] < 2:
         return torch.ones(1)
@@ -259,16 +292,137 @@ def _temporal_transition_profile(video_small: torch.Tensor) -> torch.Tensor:
     return torch.tensor(prof, dtype=torch.float32)
 
 
-def _temporal_metrics(video: np.ndarray, final_video: np.ndarray) -> tuple[float, float, float]:
+def _flow_magnitude_profile(video_small: torch.Tensor) -> torch.Tensor:
+    try:
+        import cv2
+    except ImportError:
+        return torch.zeros(max(video_small.shape[0] - 1, 1), dtype=torch.float32)
+
+    if video_small.shape[0] < 2:
+        return torch.zeros(1, dtype=torch.float32)
+    mags = []
+    frames = (video_small.clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+    for idx in range(frames.shape[0] - 1):
+        flow = cv2.calcOpticalFlowFarneback(
+            frames[idx],
+            frames[idx + 1],
+            None,
+            0.5,
+            3,
+            15,
+            3,
+            5,
+            1.2,
+            0,
+        )
+        mags.append(float(np.linalg.norm(flow, axis=2).mean()))
+    return torch.tensor(mags, dtype=torch.float32)
+
+
+def _flow_direction_histogram(video_small: torch.Tensor, bins: int = 8) -> torch.Tensor:
+    try:
+        import cv2
+    except ImportError:
+        return torch.zeros(max(video_small.shape[0] - 1, 1) * bins, dtype=torch.float32)
+
+    if video_small.shape[0] < 2:
+        return torch.zeros(bins, dtype=torch.float32)
+    histograms = []
+    frames = (video_small.clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+    edges = np.linspace(0.0, 2.0 * np.pi, bins + 1, dtype=np.float32)
+    for idx in range(frames.shape[0] - 1):
+        flow = cv2.calcOpticalFlowFarneback(
+            frames[idx],
+            frames[idx + 1],
+            None,
+            0.5,
+            3,
+            15,
+            3,
+            5,
+            1.2,
+            0,
+        )
+        mag = np.linalg.norm(flow, axis=2)
+        ang = np.mod(np.arctan2(flow[..., 1], flow[..., 0]), 2.0 * np.pi)
+        hist, _ = np.histogram(ang, bins=edges, weights=mag)
+        denom = float(hist.sum())
+        if denom > 1e-6:
+            hist = hist / denom
+        histograms.append(hist.astype(np.float32))
+    return torch.from_numpy(np.concatenate(histograms, axis=0))
+
+
+def _delta_map_similarity(video_small: torch.Tensor, final_small: torch.Tensor) -> float:
+    if video_small.shape[0] < 2 or final_small.shape[0] < 2:
+        return 1.0
+    steps = min(video_small.shape[0], final_small.shape[0]) - 1
+    delta = (video_small[1 : steps + 1] - video_small[:steps]).abs()
+    final_delta = (final_small[1 : steps + 1] - final_small[:steps]).abs()
+    diff = (delta - final_delta).abs().mean()
+    scale = final_delta.mean() + 1e-6
+    return max(0.0, min(1.0, 1.0 - float(diff / scale)))
+
+
+def _temporal_metrics(video: np.ndarray, final_video: np.ndarray) -> dict[str, float]:
     small = _video_tensor(video)
     final_small = _video_tensor(final_video)
-    energy = _cosine_similarity(_motion_energy_profile(small), _motion_energy_profile(final_small))
-    transition = _cosine_similarity(_temporal_transition_profile(small), _temporal_transition_profile(final_small))
-    motion = _cosine_similarity(
-        _motion_energy_profile(small) / (_motion_energy_profile(small).mean() + 1e-6),
-        _motion_energy_profile(final_small) / (_motion_energy_profile(final_small).mean() + 1e-6),
+
+    energy_profile = _motion_energy_profile(small)
+    final_energy_profile = _motion_energy_profile(final_small)
+    transition_profile = _temporal_transition_profile(small)
+    final_transition_profile = _temporal_transition_profile(final_small)
+    flow_profile = _flow_magnitude_profile(small)
+    final_flow_profile = _flow_magnitude_profile(final_small)
+    flow_direction = _flow_direction_histogram(small)
+    final_flow_direction = _flow_direction_histogram(final_small)
+
+    energy_cosine = _cosine_similarity(energy_profile, final_energy_profile)
+    transition_cosine = _cosine_similarity(transition_profile, final_transition_profile)
+    motion_profile_cosine = _cosine_similarity(
+        energy_profile / (energy_profile.mean() + 1e-6),
+        final_energy_profile / (final_energy_profile.mean() + 1e-6),
     )
-    return energy, transition, motion
+    motion_energy_mean = float(energy_profile.mean())
+    final_motion_energy_mean = float(final_energy_profile.mean())
+    flow_magnitude_mean = float(flow_profile.mean())
+    final_flow_magnitude_mean = float(final_flow_profile.mean())
+    motion_energy_ratio = _ratio_similarity(motion_energy_mean, final_motion_energy_mean)
+    flow_magnitude_cosine = _cosine_similarity(flow_profile, final_flow_profile)
+    flow_magnitude_ratio = _ratio_similarity(flow_magnitude_mean, final_flow_magnitude_mean)
+    flow_direction_cosine = _cosine_similarity(flow_direction, final_flow_direction)
+    flicker_similarity = _delta_map_similarity(small, final_small)
+
+    shape_composite = float(
+        (energy_cosine + transition_cosine + motion_profile_cosine) / 3.0
+    )
+    dynamic_composite = float(
+        (
+            motion_energy_ratio
+            + flow_magnitude_cosine
+            + flow_magnitude_ratio
+            + flow_direction_cosine
+            + flicker_similarity
+        )
+        / 5.0
+    )
+
+    return {
+        "temporal_metric_1": energy_cosine,
+        "temporal_metric_2": transition_cosine,
+        "motion_metric": motion_profile_cosine,
+        "motion_energy_mean_raw": motion_energy_mean,
+        "final_motion_energy_mean_raw": final_motion_energy_mean,
+        "motion_energy_ratio": motion_energy_ratio,
+        "flow_magnitude_mean_raw": flow_magnitude_mean,
+        "final_flow_magnitude_mean_raw": final_flow_magnitude_mean,
+        "flow_magnitude_cosine": flow_magnitude_cosine,
+        "flow_magnitude_ratio": flow_magnitude_ratio,
+        "flow_direction_cosine": flow_direction_cosine,
+        "flicker_similarity": flicker_similarity,
+        "temporal_shape_composite": shape_composite,
+        "temporal_dynamic_composite": dynamic_composite,
+    }
 
 
 def _spatial_metric(video: np.ndarray, final_video: np.ndarray) -> float:
@@ -309,17 +463,87 @@ def _median(values: list[float]) -> float:
     return statistics.median(values) if values else float("nan")
 
 
+def _sample_video_frames(video: np.ndarray, frame_count: int) -> list[np.ndarray]:
+    if video.ndim != 4:
+        raise ValueError(f"Expected [T,H,W,C] video array, got {video.shape}")
+    total = video.shape[0]
+    if total == 0:
+        return []
+    frame_count = max(1, min(frame_count, total))
+    indices = np.linspace(0, total - 1, num=frame_count, dtype=int)
+    return [video[idx] for idx in indices]
+
+
+class SemanticMetricEvaluator:
+
+    def __init__(self, model_name: str, device: str, frame_count: int) -> None:
+        self.model_name = model_name
+        self.device = device
+        self.frame_count = frame_count
+        self._model = None
+        self._processor = None
+        self._disabled_reason: str | None = None
+
+    def _ensure_loaded(self) -> None:
+        if self._model is not None or self._disabled_reason is not None:
+            return
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+        except Exception as exc:
+            self._disabled_reason = f"transformers unavailable: {exc}"
+            return
+        try:
+            self._processor = CLIPProcessor.from_pretrained(self.model_name)
+            self._model = CLIPModel.from_pretrained(self.model_name)
+            self._model.to(self.device)
+            self._model.eval()
+        except Exception as exc:
+            self._disabled_reason = f"failed to load semantic model {self.model_name}: {exc}"
+            self._model = None
+            self._processor = None
+
+    @property
+    def disabled_reason(self) -> str | None:
+        self._ensure_loaded()
+        return self._disabled_reason
+
+    @torch.inference_mode()
+    def score_video(self, prompt: str, video: np.ndarray) -> float:
+        self._ensure_loaded()
+        if self._model is None or self._processor is None:
+            return float("nan")
+
+        from PIL import Image
+
+        sampled_frames = _sample_video_frames(video, self.frame_count)
+        if not sampled_frames:
+            return float("nan")
+        pil_frames = [Image.fromarray(frame.astype(np.uint8), mode="RGB") for frame in sampled_frames]
+
+        text_inputs = self._processor(text=[prompt], return_tensors="pt", padding=True)
+        image_inputs = self._processor(images=pil_frames, return_tensors="pt")
+        text_inputs = {key: value.to(self.device) for key, value in text_inputs.items()}
+        image_inputs = {key: value.to(self.device) for key, value in image_inputs.items()}
+
+        text_features = self._model.get_text_features(**text_inputs)
+        image_features = self._model.get_image_features(**image_inputs)
+        text_features = F.normalize(text_features, dim=-1)
+        image_features = F.normalize(image_features, dim=-1)
+        sims = image_features @ text_features.T
+        return float(sims.mean().item())
+
+
 def _judgment(convergence_rows: list[dict[str, Any]]) -> str:
     valid_rows = [
         row
         for row in convergence_rows
-        if row["temporal_95_step"] is not None and row["spatial_95_step"] is not None
+        if row["temporal_dynamic_95_step"] is not None and row["spatial_95_step"] is not None
     ]
     if not valid_rows:
         return "NO-GO"
-    earlier = sum(int(row["temporal_95_step"]) < int(row["spatial_95_step"]) for row in valid_rows)
+    earlier = sum(int(row["temporal_dynamic_95_step"]) < int(row["spatial_95_step"]) for row in valid_rows)
     majority = earlier / len(valid_rows)
-    median_gap = _median([float(row["convergence_gap_fraction"]) for row in valid_rows])
+    median_gap = _median([float(row["dynamic_convergence_gap_fraction"]) for row in valid_rows])
     if majority >= 0.6 and median_gap >= 0.2:
         return "CONDITIONAL GO"
     if majority < 0.5 or median_gap < 0.05:
@@ -338,14 +562,17 @@ def _write_report(
     valid_rows = [
         row
         for row in convergence_rows
-        if row["temporal_95_step"] is not None and row["spatial_95_step"] is not None
+        if row["temporal_dynamic_95_step"] is not None and row["spatial_95_step"] is not None
     ]
     majority = (
-        sum(int(row["temporal_95_step"]) < int(row["spatial_95_step"]) for row in valid_rows) / len(valid_rows)
+        sum(int(row["temporal_dynamic_95_step"]) < int(row["spatial_95_step"]) for row in valid_rows) / len(valid_rows)
         if valid_rows
         else float("nan")
     )
-    median_gap = _median([float(row["convergence_gap_fraction"]) for row in valid_rows])
+    median_gap = _median([float(row["dynamic_convergence_gap_fraction"]) for row in valid_rows])
+    shape_saturated = sum(int(row.get("temporal_shape_95_step", -1) == 0) for row in convergence_rows)
+    dynamic_saturated = sum(int(row.get("temporal_dynamic_95_step", -1) == 0) for row in convergence_rows)
+    semantic_available = any(not math.isnan(float(row.get("semantic_95_step", float("nan")))) for row in convergence_rows)
 
     lines = [
         "# Temporal Dimension Kill Test (Preflight)",
@@ -369,8 +596,8 @@ def _write_report(
         "",
         "## NEGATIVE RESULTS",
         "",
-        "- Semantic alignment is not directly measured yet because no prompt-conditioned video metric is available in the current local environment.",
         "- This preflight does not yet test oracle temporal reduction; it only checks whether temporal-vs-spatial convergence separation is visible.",
+        "- A temporal metric that saturates at step 0 should be treated as a calibration failure, not as evidence of early temporal convergence.",
         "",
         "## UNKNOWN",
         "",
@@ -381,8 +608,11 @@ def _write_report(
         "## Preflight Summary",
         "",
         f"- Prompts analyzed: `{len(convergence_rows)}`",
-        f"- Majority with temporal_95 earlier than spatial_95: `{majority:.3f}`" if valid_rows else "- Majority with temporal_95 earlier than spatial_95: `n/a`",
-        f"- Median convergence gap fraction: `{median_gap:.3f}`" if valid_rows else "- Median convergence gap fraction: `n/a`",
+        f"- Majority with temporal_dynamic_95 earlier than spatial_95: `{majority:.3f}`" if valid_rows else "- Majority with temporal_dynamic_95 earlier than spatial_95: `n/a`",
+        f"- Median dynamic convergence gap fraction: `{median_gap:.3f}`" if valid_rows else "- Median dynamic convergence gap fraction: `n/a`",
+        f"- Temporal-shape metric saturated at step 0 for `{shape_saturated}/{len(convergence_rows)}` prompts",
+        f"- Temporal-dynamic metric saturated at step 0 for `{dynamic_saturated}/{len(convergence_rows)}` prompts",
+        f"- Semantic convergence available: `{semantic_available}`",
         "",
         "## Judgment",
         "",
@@ -403,6 +633,11 @@ def main() -> None:
     config_path.write_text(json.dumps(vars(args), indent=2))
 
     omni = _build_omni(args)
+    semantic_evaluator = None if args.disable_semantic_metric else SemanticMetricEvaluator(
+        model_name=args.semantic_model,
+        device=args.semantic_device,
+        frame_count=args.semantic_frame_count,
+    )
     trajectory_rows: list[dict[str, Any]] = []
     convergence_rows: list[dict[str, Any]] = []
 
@@ -450,6 +685,13 @@ def main() -> None:
         final_mp4_path = prompt_artifact_dir / f"{request_label}_final.mp4"
         torch.save(torch.from_numpy(final_video), final_frames_path)
         _save_video(final_mp4_path, final_video, fps=args.fps)
+        final_semantic_metric_raw = (
+            semantic_evaluator.score_video(prompt, final_video)
+            if semantic_evaluator is not None
+            else float("nan")
+        )
+        if semantic_evaluator is not None and semantic_evaluator.disabled_reason is not None:
+            print(f"[preflight] semantic metric disabled: {semantic_evaluator.disabled_reason}")
 
         probe_meta_path = output.custom_output.get("trajectory_probe_metadata_path")
         if not probe_meta_path:
@@ -462,8 +704,13 @@ def main() -> None:
             if not frames_path:
                 continue
             checkpoint_video = torch.load(frames_path, map_location="cpu").numpy()
-            temporal_metric_1, temporal_metric_2, motion_metric = _temporal_metrics(checkpoint_video, final_video)
+            temporal_metrics = _temporal_metrics(checkpoint_video, final_video)
             spatial_metric = _spatial_metric(checkpoint_video, final_video)
+            semantic_metric_raw = (
+                semantic_evaluator.score_video(prompt, checkpoint_video)
+                if semantic_evaluator is not None
+                else float("nan")
+            )
             row = {
                 "prompt_id": prompt_id,
                 "category": category,
@@ -472,11 +719,13 @@ def main() -> None:
                 "step_latency_ms": float(record["step_latency_ms"]),
                 "cumulative_dit_ms": float(record["cumulative_dit_ms"]),
                 "latent_bytes": int(np.prod(record["latent_shape"]) * 4),
-                "temporal_metric_1": temporal_metric_1,
-                "temporal_metric_2": temporal_metric_2,
-                "motion_metric": motion_metric,
+                **temporal_metrics,
                 "spatial_metric": spatial_metric,
-                "semantic_metric": float("nan"),
+                "semantic_metric_raw": semantic_metric_raw,
+                "final_semantic_metric_raw": final_semantic_metric_raw,
+                "semantic_metric": _safe_relative(semantic_metric_raw, final_semantic_metric_raw)
+                if not math.isnan(semantic_metric_raw) and not math.isnan(final_semantic_metric_raw)
+                else float("nan"),
                 "timestep": record["timestep"],
                 "free_gpu_bytes": record["free_gpu_bytes"],
                 "peak_reserved_bytes": record["peak_reserved_bytes"],
@@ -492,12 +741,29 @@ def main() -> None:
         convergence_row = {
             "prompt_id": prompt_id,
             "category": category,
+            "first_capture_step": int(prompt_rows[0]["step"]) if prompt_rows else None,
+            "first_capture_timestep": float(prompt_rows[0]["timestep"]) if prompt_rows else None,
             "temporal_90_step": _convergence_step(prompt_rows, "temporal_composite", 0.90),
             "temporal_95_step": _convergence_step(prompt_rows, "temporal_composite", 0.95),
             "temporal_99_step": _convergence_step(prompt_rows, "temporal_composite", 0.99),
+            "temporal_shape_90_step": _convergence_step(prompt_rows, "temporal_shape_composite", 0.90),
+            "temporal_shape_95_step": _convergence_step(prompt_rows, "temporal_shape_composite", 0.95),
+            "temporal_shape_99_step": _convergence_step(prompt_rows, "temporal_shape_composite", 0.99),
+            "temporal_dynamic_90_step": _convergence_step(prompt_rows, "temporal_dynamic_composite", 0.90),
+            "temporal_dynamic_95_step": _convergence_step(prompt_rows, "temporal_dynamic_composite", 0.95),
+            "temporal_dynamic_99_step": _convergence_step(prompt_rows, "temporal_dynamic_composite", 0.99),
             "spatial_90_step": _convergence_step(prompt_rows, "spatial_metric", 0.90),
             "spatial_95_step": _convergence_step(prompt_rows, "spatial_metric", 0.95),
             "spatial_99_step": _convergence_step(prompt_rows, "spatial_metric", 0.99),
+            "semantic_90_step": _convergence_step(prompt_rows, "semantic_metric", 0.90)
+            if any(not math.isnan(float(row["semantic_metric"])) for row in prompt_rows)
+            else float("nan"),
+            "semantic_95_step": _convergence_step(prompt_rows, "semantic_metric", 0.95)
+            if any(not math.isnan(float(row["semantic_metric"])) for row in prompt_rows)
+            else float("nan"),
+            "semantic_99_step": _convergence_step(prompt_rows, "semantic_metric", 0.99)
+            if any(not math.isnan(float(row["semantic_metric"])) for row in prompt_rows)
+            else float("nan"),
         }
         if convergence_row["temporal_95_step"] is not None and convergence_row["spatial_95_step"] is not None:
             gap_steps = int(convergence_row["spatial_95_step"]) - int(convergence_row["temporal_95_step"])
@@ -506,6 +772,13 @@ def main() -> None:
         else:
             convergence_row["convergence_gap_steps"] = None
             convergence_row["convergence_gap_fraction"] = float("nan")
+        if convergence_row["temporal_dynamic_95_step"] is not None and convergence_row["spatial_95_step"] is not None:
+            gap_steps = int(convergence_row["spatial_95_step"]) - int(convergence_row["temporal_dynamic_95_step"])
+            convergence_row["dynamic_convergence_gap_steps"] = gap_steps
+            convergence_row["dynamic_convergence_gap_fraction"] = gap_steps / max(args.num_inference_steps, 1)
+        else:
+            convergence_row["dynamic_convergence_gap_steps"] = None
+            convergence_row["dynamic_convergence_gap_fraction"] = float("nan")
         convergence_rows.append(convergence_row)
 
         print(
@@ -524,7 +797,20 @@ def main() -> None:
         "temporal_metric_1",
         "temporal_metric_2",
         "motion_metric",
+        "motion_energy_mean_raw",
+        "final_motion_energy_mean_raw",
+        "motion_energy_ratio",
+        "flow_magnitude_mean_raw",
+        "final_flow_magnitude_mean_raw",
+        "flow_magnitude_cosine",
+        "flow_magnitude_ratio",
+        "flow_direction_cosine",
+        "flicker_similarity",
+        "temporal_shape_composite",
+        "temporal_dynamic_composite",
         "spatial_metric",
+        "semantic_metric_raw",
+        "final_semantic_metric_raw",
         "semantic_metric",
         "temporal_composite",
         "timestep",
@@ -538,14 +824,27 @@ def main() -> None:
     convergence_fields = [
         "prompt_id",
         "category",
+        "first_capture_step",
+        "first_capture_timestep",
         "temporal_90_step",
         "temporal_95_step",
         "temporal_99_step",
+        "temporal_shape_90_step",
+        "temporal_shape_95_step",
+        "temporal_shape_99_step",
+        "temporal_dynamic_90_step",
+        "temporal_dynamic_95_step",
+        "temporal_dynamic_99_step",
         "spatial_90_step",
         "spatial_95_step",
         "spatial_99_step",
+        "semantic_90_step",
+        "semantic_95_step",
+        "semantic_99_step",
         "convergence_gap_steps",
         "convergence_gap_fraction",
+        "dynamic_convergence_gap_steps",
+        "dynamic_convergence_gap_fraction",
     ]
 
     _write_csv(output_dir / "trajectory_metrics.csv", trajectory_rows, trajectory_fields)
