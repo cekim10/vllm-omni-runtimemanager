@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import time
 from pathlib import Path
@@ -24,6 +25,60 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
+DEFAULT_PROMPT_SET: list[dict[str, str]] = [
+    {
+        "prompt_id": "preflight_000",
+        "motion_category": "static_low_motion",
+        "prompt": "A ceramic teacup on a windowsill at sunrise, dust motes drifting in the light.",
+    },
+    {
+        "prompt_id": "preflight_001",
+        "motion_category": "static_low_motion",
+        "prompt": "A mountain lake at dawn with faint mist slowly moving above the water.",
+    },
+    {
+        "prompt_id": "preflight_002",
+        "motion_category": "camera_motion",
+        "prompt": "A slow cinematic pan across a bookstore aisle with warm lighting and stacked books.",
+    },
+    {
+        "prompt_id": "preflight_003",
+        "motion_category": "camera_motion",
+        "prompt": "A gentle zoom toward a lighthouse on a rocky coast as waves roll in.",
+    },
+    {
+        "prompt_id": "preflight_004",
+        "motion_category": "single_object_motion",
+        "prompt": "A red fox trotting across a snowy field, leaving a clean trail behind.",
+    },
+    {
+        "prompt_id": "preflight_005",
+        "motion_category": "single_object_motion",
+        "prompt": "A ballerina spinning on a rehearsal stage under a single spotlight.",
+    },
+    {
+        "prompt_id": "preflight_006",
+        "motion_category": "multi_object_motion",
+        "prompt": "Several cyclists crossing a city intersection while pedestrians move along the sidewalks.",
+    },
+    {
+        "prompt_id": "preflight_007",
+        "motion_category": "fast_complex_motion",
+        "prompt": "A surfer carving through a breaking wave with spray flying in every direction.",
+    },
+    {
+        "prompt_id": "preflight_008",
+        "motion_category": "fast_complex_motion",
+        "prompt": "A street dance performance with multiple dancers moving quickly under neon lights.",
+    },
+    {
+        "prompt_id": "preflight_009",
+        "motion_category": "scene_change_occlusion",
+        "prompt": "A yellow taxi passes behind a row of street trees and briefly disappears from view.",
+    },
+]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Preflight temporal-dimension kill test on the native Wan2.2 T2V path."
@@ -35,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt-set",
-        default="prompt_set.json",
+        default="experiments/temporal_dimension_prompt_set.json",
         help="JSON file with prompt_id, prompt, and motion_category.",
     )
     parser.add_argument(
@@ -66,7 +121,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def _read_prompt_set(path: Path, limit: int) -> list[dict[str, Any]]:
-    prompts = json.loads(path.read_text())
+    candidate_paths = [path]
+    if not path.is_absolute():
+        repo_root = Path(__file__).resolve().parents[1]
+        candidate_paths.append(repo_root / path)
+        candidate_paths.append(repo_root / "experiments" / path.name)
+
+    resolved_path = next((candidate for candidate in candidate_paths if candidate.exists()), None)
+    if resolved_path is None:
+        print(
+            f"[preflight] prompt set {path} not found; "
+            "falling back to the built-in 10-prompt representative set."
+        )
+        prompts = DEFAULT_PROMPT_SET
+    else:
+        prompts = json.loads(resolved_path.read_text())
     if not isinstance(prompts, list):
         raise ValueError(f"Prompt set must be a list: {path}")
     return prompts[:limit]
