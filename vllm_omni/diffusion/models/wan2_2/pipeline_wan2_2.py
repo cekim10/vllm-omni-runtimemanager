@@ -8,8 +8,10 @@ import logging
 import os
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, ClassVar, cast
 
+import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -36,6 +38,7 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3
 from vllm_omni.diffusion.postprocess import interpolate_video_tensor
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
@@ -439,6 +442,192 @@ class Wan22Pipeline(
     def current_timestep(self):
         return self._current_timestep
 
+    def _build_trajectory_probe_state(
+        self,
+        req: OmniDiffusionRequest,
+        timesteps: torch.Tensor,
+    ) -> dict[str, Any] | None:
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        probe_cfg = extra_args.get("trajectory_probe")
+        if not isinstance(probe_cfg, dict):
+            return None
+
+        artifact_dir = probe_cfg.get("artifact_dir")
+        if not artifact_dir:
+            raise ValueError("trajectory_probe.artifact_dir is required.")
+
+        num_steps = len(timesteps)
+        capture_steps_raw = probe_cfg.get("capture_steps")
+        capture_progress_raw = probe_cfg.get("capture_progress")
+        capture_steps: set[int] = set()
+
+        if isinstance(capture_steps_raw, list) and capture_steps_raw:
+            for value in capture_steps_raw:
+                step = int(value)
+                capture_steps.add(min(max(step, 0), num_steps))
+        elif isinstance(capture_progress_raw, list) and capture_progress_raw:
+            for value in capture_progress_raw:
+                progress = float(value)
+                progress = min(max(progress, 0.0), 1.0)
+                capture_steps.add(int(round(progress * num_steps)))
+        else:
+            default_progress = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.65, 0.8, 0.9, 1.0]
+            for progress in default_progress:
+                capture_steps.add(int(round(progress * num_steps)))
+
+        capture_steps.add(0)
+        capture_steps.add(num_steps)
+
+        label = str(probe_cfg.get("request_label") or req.request_id)
+        fps = float(
+            probe_cfg.get("fps")
+            or req.sampling_params.resolved_frame_rate
+            or req.sampling_params.fps
+            or 16.0
+        )
+
+        return {
+            "artifact_dir": Path(str(artifact_dir)),
+            "capture_steps": sorted(capture_steps),
+            "capture_steps_set": set(capture_steps),
+            "records": [],
+            "label": label,
+            "fps": fps,
+            "save_decoded": bool(probe_cfg.get("save_decoded", True)),
+            "save_latents": bool(probe_cfg.get("save_latents", False)),
+            "save_mp4": bool(probe_cfg.get("save_mp4", True)),
+            "sampling_seed": getattr(req.sampling_params, "seed", None),
+            "prompt": req.prompts[0] if req.prompts else None,
+            "num_steps": num_steps,
+        }
+
+    def _capture_trajectory_probe_checkpoint(
+        self,
+        probe_state: dict[str, Any] | None,
+        *,
+        step_index: int,
+        timestep: torch.Tensor | None,
+        latents: torch.Tensor,
+        step_latency_ms: float,
+        cumulative_dit_ms: float,
+    ) -> None:
+        if probe_state is None or step_index not in probe_state["capture_steps_set"]:
+            return
+
+        timestep_value: float | None = None
+        if timestep is not None:
+            timestep_value = float(torch.as_tensor(timestep).detach().float().cpu().reshape(-1)[0].item())
+
+        free_gpu_bytes: int | None = None
+        peak_reserved_bytes: int | None = None
+        peak_allocated_bytes: int | None = None
+        if current_omni_platform.is_available():
+            free_gpu_bytes = int(current_omni_platform.get_free_memory(self.device))
+            peak_reserved_bytes = int(current_omni_platform.max_memory_reserved())
+            peak_allocated_bytes = int(current_omni_platform.max_memory_allocated())
+
+        probe_state["records"].append(
+            {
+                "step_index": int(step_index),
+                "progress": float(step_index / max(probe_state["num_steps"], 1)),
+                "timestep": timestep_value,
+                "latent_shape": list(latents.shape),
+                "latent_dtype": str(latents.dtype),
+                "latent_cpu": latents.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                "step_latency_ms": float(step_latency_ms),
+                "cumulative_dit_ms": float(cumulative_dit_ms),
+                "free_gpu_bytes": free_gpu_bytes,
+                "peak_reserved_bytes": peak_reserved_bytes,
+                "peak_allocated_bytes": peak_allocated_bytes,
+            }
+        )
+
+    def _decode_probe_video_frames(
+        self,
+        latents: torch.Tensor,
+    ) -> np.ndarray:
+        decode_latents = latents.to(device=self.device, dtype=self.vae.dtype)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(decode_latents.device, decode_latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            decode_latents.device, decode_latents.dtype
+        )
+        decode_latents = decode_latents / latents_std + latents_mean
+        decoded = self.vae.decode(decode_latents, return_dict=False)[0]
+        decoded = decoded.detach().clamp(-1.0, 1.0)
+        decoded = ((decoded + 1.0) * 127.5).round().to(torch.uint8)
+        decoded = decoded.permute(0, 2, 3, 4, 1).contiguous()
+        return decoded[0].cpu().numpy()
+
+    def _persist_trajectory_probe(
+        self,
+        probe_state: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        if probe_state is None:
+            return {}
+
+        artifact_dir = probe_state["artifact_dir"]
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        saved_records: list[dict[str, Any]] = []
+
+        for record in probe_state["records"]:
+            step_index = int(record["step_index"])
+            step_prefix = f"{probe_state['label']}_step{step_index:03d}"
+            latent_path = artifact_dir / f"{step_prefix}_latents.pt"
+            frames_path = artifact_dir / f"{step_prefix}_frames.pt"
+            mp4_path = artifact_dir / f"{step_prefix}.mp4"
+
+            if probe_state["save_latents"]:
+                torch.save(record["latent_cpu"], latent_path)
+
+            frames_path_str: str | None = None
+            mp4_path_str: str | None = None
+            if probe_state["save_decoded"]:
+                frames_u8 = self._decode_probe_video_frames(record["latent_cpu"])
+                torch.save(torch.from_numpy(frames_u8), frames_path)
+                frames_path_str = str(frames_path)
+                if probe_state["save_mp4"] and _is_rank_zero():
+                    mp4_bytes = mux_video_audio_bytes(frames_u8, None, fps=probe_state["fps"])
+                    mp4_path.write_bytes(mp4_bytes)
+                    mp4_path_str = str(mp4_path)
+
+            saved_records.append(
+                {
+                    "step_index": step_index,
+                    "progress": record["progress"],
+                    "timestep": record["timestep"],
+                    "latent_shape": record["latent_shape"],
+                    "latent_dtype": record["latent_dtype"],
+                    "step_latency_ms": record["step_latency_ms"],
+                    "cumulative_dit_ms": record["cumulative_dit_ms"],
+                    "free_gpu_bytes": record["free_gpu_bytes"],
+                    "peak_reserved_bytes": record["peak_reserved_bytes"],
+                    "peak_allocated_bytes": record["peak_allocated_bytes"],
+                    "latent_path": str(latent_path) if probe_state["save_latents"] else None,
+                    "frames_path": frames_path_str,
+                    "mp4_path": mp4_path_str,
+                }
+            )
+
+        metadata = {
+            "label": probe_state["label"],
+            "num_steps": probe_state["num_steps"],
+            "fps": probe_state["fps"],
+            "sampling_seed": probe_state["sampling_seed"],
+            "records": saved_records,
+        }
+        metadata_path = artifact_dir / f"{probe_state['label']}_trajectory_probe.json"
+        metadata_path.write_text(json.dumps(metadata, indent=2))
+
+        return {
+            "trajectory_probe_metadata": metadata,
+            "trajectory_probe_metadata_path": str(metadata_path),
+            "trajectory_probe_artifact_dir": str(artifact_dir),
+        }
+
     def diffuse(
         self,
         latents: torch.Tensor,
@@ -452,13 +641,24 @@ class Wan22Pipeline(
         attention_kwargs: dict[str, Any],
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
+        probe_state: dict[str, Any] | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
+        cumulative_dit_ms = 0.0
+        self._capture_trajectory_probe_checkpoint(
+            probe_state,
+            step_index=0,
+            timestep=timesteps[0] if len(timesteps) > 0 else None,
+            latents=latents,
+            step_latency_ms=0.0,
+            cumulative_dit_ms=0.0,
+        )
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
                 set_forward_context_denoise_step_idx(step_idx)
+                step_start = time.perf_counter()
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -534,6 +734,18 @@ class Wan22Pipeline(
                 )
 
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if current_omni_platform.is_available():
+                    current_omni_platform.synchronize()
+                step_latency_ms = (time.perf_counter() - step_start) * 1000.0
+                cumulative_dit_ms += step_latency_ms
+                self._capture_trajectory_probe_checkpoint(
+                    probe_state,
+                    step_index=step_idx + 1,
+                    timestep=t,
+                    latents=latents,
+                    step_latency_ms=step_latency_ms,
+                    cumulative_dit_ms=cumulative_dit_ms,
+                )
                 pbar.update()
 
         return latents
@@ -780,6 +992,9 @@ class Wan22Pipeline(
 
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
+        probe_state = None
+        if not (self.expand_timesteps and latent_condition is not None):
+            probe_state = self._build_trajectory_probe_state(req, timesteps)
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -792,6 +1007,7 @@ class Wan22Pipeline(
             attention_kwargs=attention_kwargs,
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
+            probe_state=probe_state,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -846,8 +1062,11 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
+        custom_output = self._persist_trajectory_probe(probe_state)
         return DiffusionOutput(
-            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+            output=output,
+            custom_output=custom_output,
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     def predict_noise(

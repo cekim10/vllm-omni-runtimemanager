@@ -379,6 +379,44 @@ def _prompt_and_sampling(engine: Any, args: argparse.Namespace, *, prompt: str, 
     return _build_prompt(engine.omni, prompt_args), sampling_params
 
 
+async def _infer_latent_template(engine: Any, args: argparse.Namespace, prompt: str) -> torch.Tensor:
+    """Infer the explicit initial latent shape used by the step-execution path."""
+    state_manager = getattr(engine, "state_manager", None)
+    if state_manager is None:
+        raise RuntimeError("Diffusion state manager is disabled for this engine.")
+
+    probe_seed = int(args.seed) + 999_999
+    prompt_obj, sampling_params = _prompt_and_sampling(engine, args, prompt=prompt, seed=probe_seed)
+    request_id = "branchability-latent-probe"
+    run_task = asyncio.create_task(
+        engine.async_add_req_and_wait_for_response(_make_request(request_id, prompt_obj, sampling_params))
+    )
+    checkpoint_state = await _wait_for_checkpoint(
+        engine,
+        request_id=request_id,
+        target_step=1,
+        poll_interval=args.poll_interval,
+        timeout_s=args.checkpoint_timeout,
+    )
+    engine.abort(request_id)
+    output = await run_task
+    if not output.aborted:
+        raise RuntimeError("Latent probe request did not abort as expected.")
+    latent = state_manager.restore(checkpoint_state)
+    state_manager.release_request(request_id)
+    return latent.detach().to(device="cpu", dtype=torch.float32).clone()
+
+
+def _seeded_initial_latent(latent_template: torch.Tensor, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    return torch.randn(
+        latent_template.shape,
+        generator=generator,
+        dtype=latent_template.dtype,
+        device="cpu",
+    )
+
+
 def _pairwise_image_metrics(images: list[np.ndarray]) -> dict[str, float]:
     if len(images) < 2:
         return {
@@ -430,11 +468,13 @@ async def _run_independent_candidates(
     run_idx: int,
     candidate_count: int,
     artifact_dir: Path,
+    latent_template: torch.Tensor,
 ) -> list[CandidateResult]:
     results: list[CandidateResult] = []
     for candidate_idx in range(candidate_count):
         seed = _candidate_seed(args, prompt_id, run_idx, candidate_idx)
         prompt_obj, sampling_params = _prompt_and_sampling(engine, args, prompt=prompt, seed=seed)
+        sampling_params.latents = _seeded_initial_latent(latent_template, seed)
         request_id = f"independent-p{prompt_id}-r{run_idx}-c{candidate_idx}"
         image, wall_sec = await _run_one_request(engine, _make_request(request_id, prompt_obj, sampling_params))
         image_path = (
@@ -593,6 +633,7 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         original_assign = state_manager.fid_policy.assign
         state_manager.fid_policy.assign = lambda _value_score: Fidelity.LOSSLESS
         try:
+            latent_template = await _infer_latent_template(engine, args, prompts[0])
             for prompt_id, prompt in enumerate(prompts):
                 for run_idx in range(args.runs_per_condition):
                     for candidate_count in args.candidate_counts:
@@ -604,6 +645,7 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                             run_idx=run_idx,
                             candidate_count=candidate_count,
                             artifact_dir=artifact_dir,
+                            latent_template=latent_template,
                         )
                         independent_total_wall = sum(candidate.wall_sec for candidate in independent_candidates)
                         independent_metrics = _condition_metrics(prompt, independent_candidates, metric_suite)
