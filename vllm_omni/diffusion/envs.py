@@ -48,10 +48,14 @@ class PackagesEnvChecker:
         """Check if flash attention is available and compatible."""
         platform = current_omni_platform
 
-        if platform.get_device_count() == 0:
+        try:
+            if platform.get_device_count() == 0:
+                return False
+            return platform.has_flash_attn_package()
+        except Exception:
+            # Package probing should never make diffusion imports fail on hosts
+            # without a usable CUDA stack. Treat probe failures as unavailable.
             return False
-
-        return platform.has_flash_attn_package()
 
     def get_packages_info(self) -> dict:
         """Get the packages info dictionary."""
