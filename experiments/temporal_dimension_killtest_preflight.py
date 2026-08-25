@@ -507,6 +507,25 @@ class SemanticMetricEvaluator:
         self._ensure_loaded()
         return self._disabled_reason
 
+    def _extract_feature_tensor(self, output: Any, *, fallback_attr: str) -> torch.Tensor:
+        if isinstance(output, torch.Tensor):
+            return output
+        if hasattr(output, "text_embeds") and output.text_embeds is not None:
+            return output.text_embeds
+        if hasattr(output, "image_embeds") and output.image_embeds is not None:
+            return output.image_embeds
+        if hasattr(output, "pooler_output") and output.pooler_output is not None:
+            return output.pooler_output
+        if hasattr(output, fallback_attr):
+            value = getattr(output, fallback_attr)
+            if isinstance(value, torch.Tensor):
+                return value
+        if isinstance(output, (tuple, list)) and output:
+            head = output[0]
+            if isinstance(head, torch.Tensor):
+                return head
+        raise TypeError(f"Unsupported semantic feature output type: {type(output)!r}")
+
     @torch.inference_mode()
     def score_video(self, prompt: str, video: np.ndarray) -> float:
         self._ensure_loaded()
@@ -520,17 +539,25 @@ class SemanticMetricEvaluator:
             return float("nan")
         pil_frames = [Image.fromarray(frame.astype(np.uint8), mode="RGB") for frame in sampled_frames]
 
-        text_inputs = self._processor(text=[prompt], return_tensors="pt", padding=True)
-        image_inputs = self._processor(images=pil_frames, return_tensors="pt")
-        text_inputs = {key: value.to(self.device) for key, value in text_inputs.items()}
-        image_inputs = {key: value.to(self.device) for key, value in image_inputs.items()}
+        try:
+            text_inputs = self._processor(text=[prompt], return_tensors="pt", padding=True)
+            image_inputs = self._processor(images=pil_frames, return_tensors="pt")
+            text_inputs = {key: value.to(self.device) for key, value in text_inputs.items()}
+            image_inputs = {key: value.to(self.device) for key, value in image_inputs.items()}
 
-        text_features = self._model.get_text_features(**text_inputs)
-        image_features = self._model.get_image_features(**image_inputs)
-        text_features = F.normalize(text_features, dim=-1)
-        image_features = F.normalize(image_features, dim=-1)
-        sims = image_features @ text_features.T
-        return float(sims.mean().item())
+            text_output = self._model.get_text_features(**text_inputs)
+            image_output = self._model.get_image_features(**image_inputs)
+            text_features = self._extract_feature_tensor(text_output, fallback_attr="last_hidden_state")
+            image_features = self._extract_feature_tensor(image_output, fallback_attr="last_hidden_state")
+            text_features = F.normalize(text_features, dim=-1)
+            image_features = F.normalize(image_features, dim=-1)
+            sims = image_features @ text_features.T
+            return float(sims.mean().item())
+        except Exception as exc:
+            self._disabled_reason = f"semantic scoring failed: {exc}"
+            self._model = None
+            self._processor = None
+            return float("nan")
 
 
 def _judgment(convergence_rows: list[dict[str, Any]]) -> str:
