@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import copy
 import csv
 import json
@@ -104,9 +103,7 @@ def _preflight_helpers() -> Any:
 
 
 def _wait_for_checkpoint_helper() -> Any:
-    from tools.diffusion_state_recovery_smoke import _wait_for_checkpoint
-
-    return _wait_for_checkpoint
+    raise RuntimeError("video_recovery_frontier no longer uses the stepwise checkpoint helper.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,6 +188,12 @@ def _unwrap_video_outputs(outputs: Any) -> np.ndarray:
 
     output = OmniRequestOutput.unwrap_result(outputs)
     return _preflight_helpers()._normalize_frames(output)
+
+
+def _unwrap_omni_output(outputs: Any) -> Any:
+    from vllm_omni.outputs import OmniRequestOutput
+
+    return OmniRequestOutput.unwrap_result(outputs)
 
 
 def _video_metrics(lhs: np.ndarray, rhs: np.ndarray) -> dict[str, Any]:
@@ -460,6 +463,7 @@ def _make_omni(args: argparse.Namespace, disk_path: Path) -> Omni:
     from vllm_omni.diffusion.data import DiffusionParallelConfig
     from vllm_omni.entrypoints.omni import Omni
 
+    del disk_path
     return Omni(
         model=args.model,
         boundary_ratio=args.boundary_ratio,
@@ -470,44 +474,84 @@ def _make_omni(args: argparse.Namespace, disk_path: Path) -> Omni:
         parallel_config=DiffusionParallelConfig(),
         init_timeout=args.init_timeout,
         stage_init_timeout=args.stage_init_timeout,
-        step_execution=True,
-        enable_diffusion_state_manager=True,
-        diffusion_state_manager_gpu_budget_bytes=0,
-        diffusion_state_manager_cpu_budget_bytes=0,
-        diffusion_state_manager_theta_h=0.0,
-        diffusion_state_manager_theta_w=0.0,
-        diffusion_state_manager_disk_path=str(disk_path),
     )
 
 
-async def _run_baseline_video(
-    engine: Any,
-    prompt: dict[str, Any],
-    sampling_params: OmniDiffusionSamplingParams,
+def _build_probe_sampling_params(
+    args: argparse.Namespace,
+    *,
+    seed: int,
     artifact_dir: Path,
-) -> tuple[np.ndarray, Path, float]:
-    request = _make_request("baseline-frontier", prompt, sampling_params)
+    request_label: str,
+    checkpoint_steps: list[int],
+) -> Any:
+    sampling = _make_sampling_params(args, seed)
+    sampling.extra_args = {
+        "trajectory_probe": {
+            "artifact_dir": str(artifact_dir),
+            "request_label": request_label,
+            "capture_steps": checkpoint_steps,
+            "fps": args.fps,
+            "save_decoded": False,
+            "save_latents": True,
+            "save_mp4": False,
+        },
+        "flow_shift": args.flow_shift,
+    }
+    return sampling
+
+
+def _build_resume_sampling_params(
+    args: argparse.Namespace,
+    *,
+    seed: int,
+    checkpoint_step: int,
+    latents: torch.Tensor,
+) -> Any:
+    sampling = _make_sampling_params(args, seed)
+    sampling.latents = latents.detach().cpu().clone()
+    sampling.step_index = checkpoint_step
+    sampling.extra_args = {
+        "flow_shift": args.flow_shift,
+    }
+    return sampling
+
+
+def _load_probe_records_by_step(probe_meta: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    records_by_step: dict[int, dict[str, Any]] = {}
+    for record in probe_meta.get("records", []):
+        records_by_step[int(record["step_index"])] = record
+    return records_by_step
+
+
+def _run_baseline_video(
+    omni: Any,
+    prompt: dict[str, Any],
+    sampling_params: Any,
+    artifact_dir: Path,
+    request_label: str,
+) -> tuple[np.ndarray, Path, float, dict[str, Any]]:
     start = time.perf_counter()
-    outputs = await engine.step(request)
+    outputs = omni.generate(prompt, sampling_params)
     latency_ms = (time.perf_counter() - start) * 1000.0
-    video = _unwrap_video_outputs(outputs)
+    output = _unwrap_omni_output(outputs)
+    video = _preflight_helpers()._normalize_frames(output)
     output_path = artifact_dir / "baseline.mp4"
-    _save_video(output_path, video, fps=float(sampling_params.fps or 16.0))
-    state_manager = getattr(engine, "state_manager", None)
-    if state_manager is not None:
-        state_manager.release_request(request.request_id)
-    return video, output_path, latency_ms
+    _preflight_helpers()._save_video(output_path, video, fps=float(sampling_params.fps or 16.0))
+    probe_meta_path = output.custom_output.get("trajectory_probe_metadata_path")
+    if not probe_meta_path:
+        raise ValueError(f"Missing trajectory probe metadata for {request_label}.")
+    probe_meta = json.loads(Path(probe_meta_path).read_text())
+    return video, output_path, latency_ms, probe_meta
 
 
-async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
+def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     disk_path = args.disk_path or (output_dir / "checkpoints")
     disk_path.mkdir(parents=True, exist_ok=True)
 
     preflight = _preflight_helpers()
-    wait_for_checkpoint = _wait_for_checkpoint_helper()
-
     prompt_entries = preflight._read_prompt_set(Path(args.prompt_set), args.num_prompts)
     semantic_evaluator = None if args.disable_semantic_metric else preflight.SemanticMetricEvaluator(
         model_name=args.semantic_model,
@@ -518,69 +562,60 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
     omni = _make_omni(args, disk_path)
     rows: list[dict[str, Any]] = []
     try:
-        stage_clients = getattr(omni.engine, "stage_clients", [])
-        diffusion_clients = [client for client in stage_clients if getattr(client, "stage_type", None) == "diffusion"]
-        if len(diffusion_clients) != 1 or getattr(diffusion_clients[0], "_engine", None) is None:
-            raise RuntimeError("Expected a single inline diffusion stage for frontier experiment.")
-        engine = diffusion_clients[0]._engine
-        state_manager = getattr(engine, "state_manager", None)
-        if state_manager is None:
-            raise RuntimeError("Diffusion state manager is disabled; cannot capture frontier checkpoints.")
-
         for prompt_idx, prompt_entry in enumerate(prompt_entries):
             prompt_id = str(prompt_entry["prompt_id"])
             category = str(prompt_entry["motion_category"])
             prompt_text = str(prompt_entry["prompt"])
             prompt = {"prompt": prompt_text}
             seed = args.seed + prompt_idx
+            request_label = f"{prompt_id}_seed{seed}"
             artifact_dir = output_dir / "artifacts" / f"{prompt_id}_seed{seed}"
             artifact_dir.mkdir(parents=True, exist_ok=True)
 
-            sampling_params = _make_sampling_params(args, seed)
-            baseline_video, baseline_path, baseline_latency_ms = await _run_baseline_video(
-                engine,
+            sampling_params = _build_probe_sampling_params(
+                args,
+                seed=seed,
+                artifact_dir=artifact_dir,
+                request_label=request_label,
+                checkpoint_steps=args.checkpoint_steps,
+            )
+            baseline_video, baseline_path, baseline_latency_ms, probe_meta = _run_baseline_video(
+                omni,
                 prompt,
                 sampling_params,
                 artifact_dir,
+                request_label,
             )
             final_semantic_metric_raw = (
                 semantic_evaluator.score_video(prompt_text, baseline_video)
                 if semantic_evaluator is not None
                 else float("nan")
             )
+            probe_records_by_step = _load_probe_records_by_step(probe_meta)
 
             for checkpoint_step in args.checkpoint_steps:
-                request_id = f"frontier-{prompt_id}-step{checkpoint_step}"
-                request = _make_request(request_id, prompt, sampling_params)
-                run_task = asyncio.create_task(engine.async_add_req_and_wait_for_response(request))
-                checkpoint_state = await wait_for_checkpoint(
-                    engine,
-                    request_id=request_id,
-                    target_step=checkpoint_step,
-                    poll_interval=args.poll_interval,
-                    timeout_s=args.checkpoint_timeout,
-                )
-                exact_latent = state_manager.restore(checkpoint_state).detach().cpu().clone()
-                checkpoint_size_bytes = int(checkpoint_state.size_bytes)
-                checkpoint_value_score = float(checkpoint_state.value_score)
+                checkpoint_record = probe_records_by_step.get(int(checkpoint_step))
+                if checkpoint_record is None:
+                    raise ValueError(f"Missing trajectory probe record for step {checkpoint_step} in {request_label}.")
+                latent_path = checkpoint_record.get("latent_path")
+                if not latent_path:
+                    raise ValueError(f"Missing latent_path for step {checkpoint_step} in {request_label}.")
+                exact_latent = torch.load(latent_path, map_location="cpu")
+                checkpoint_size_bytes = _full_bytes(exact_latent)
+                checkpoint_value_score = float("nan")
                 full_state_bytes = _full_bytes(exact_latent)
-
-                engine.abort(request_id)
-                aborted_output = await run_task
-                if not aborted_output.aborted:
-                    raise RuntimeError(f"Expected aborted output for {request_id}, got {aborted_output!r}")
-                state_manager.release_request(request_id)
 
                 for variant in args.variants:
                     perturb = _apply_variant(exact_latent, variant)
-                    variant_sampling = _make_sampling_params(args, seed)
-                    variant_sampling.latents = perturb.restored_latent.detach().cpu().clone()
-                    variant_sampling.step_index = int(checkpoint_state.step_idx)
-                    variant_request_id = f"{request_id}-{variant}"
-                    variant_request = _make_request(variant_request_id, prompt, variant_sampling)
+                    variant_sampling = _build_resume_sampling_params(
+                        args,
+                        seed=seed,
+                        checkpoint_step=int(checkpoint_step),
+                        latents=perturb.restored_latent,
+                    )
 
                     resume_start = time.perf_counter()
-                    variant_outputs = await engine.step(variant_request)
+                    variant_outputs = omni.generate(prompt, variant_sampling)
                     resume_latency_ms = (time.perf_counter() - resume_start) * 1000.0
                     resumed_video = _unwrap_video_outputs(variant_outputs)
                     artifact_path = artifact_dir / f"step{checkpoint_step:02d}_{variant}.mp4"
@@ -600,7 +635,7 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         "category": category,
                         "prompt": prompt_text,
                         "seed": seed,
-                        "checkpoint_step": int(checkpoint_state.step_idx),
+                        "checkpoint_step": int(checkpoint_step),
                         "total_steps": int(args.num_inference_steps),
                         "variant": variant,
                         "retained_bytes": int(perturb.retained_bytes),
@@ -639,7 +674,6 @@ async def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         f"semantic={row['semantic_metric']:.4f}",
                         flush=True,
                     )
-                    state_manager.release_request(variant_request_id)
 
             baseline_meta = {
                 "prompt_id": prompt_id,
@@ -680,7 +714,7 @@ def main() -> None:
             f"--checkpoint-steps must all be in [0, {args.num_inference_steps - 1}] "
             f"but got {args.checkpoint_steps}"
         )
-    summary = asyncio.run(run_experiment(args))
+    summary = run_experiment(args)
     print(json.dumps(summary, indent=2))
 
 

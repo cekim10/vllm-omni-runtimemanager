@@ -886,6 +886,16 @@ class Wan22Pipeline(
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
         timesteps = self.scheduler.timesteps
+        resume_step_index = int(req.sampling_params.step_index or 0)
+        if resume_step_index < 0 or resume_step_index >= num_steps:
+            raise ValueError(f"Resume step_index must be in [0, {num_steps - 1}], got {resume_step_index}.")
+        if resume_step_index > 0 and req.sampling_params.latents is None:
+            raise ValueError("Resuming Wan generation requires sampling.latents to be populated.")
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(resume_step_index)
+        if resume_step_index > 0:
+            timesteps = timesteps[resume_step_index:]
+
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
         if boundary_ratio is not None:
