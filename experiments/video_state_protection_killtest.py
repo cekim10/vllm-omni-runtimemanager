@@ -1445,6 +1445,8 @@ def _write_report(
     output_path: Path,
     *,
     args: argparse.Namespace,
+    executed_prompt_count: int,
+    executed_seed_count: int,
     prereg: dict[str, Any],
     provenance: PromptProvenance,
     config_checks: dict[str, Any],
@@ -1473,7 +1475,11 @@ def _write_report(
         f"- Resolution: `{args.height}x{args.width}`",
         f"- Frames: `{args.num_frames}`",
         f"- Variants: `{' '.join(args.variants)}`",
-        f"- Seeds: `{args.num_seeds}`",
+        f"- Requested prompts: `{args.num_prompts}`",
+        f"- Executed prompts: `{executed_prompt_count}`",
+        f"- Requested seeds: `{args.num_seeds}`",
+        f"- Executed seeds: `{executed_seed_count}`",
+        f"- Smoke-only mode: `{args.smoke_only}`",
         "",
         "## Verified Prompt Provenance",
         "",
@@ -1734,7 +1740,16 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
         bootstrap_seed=int(args.bootstrap_seed),
     )
     frontier_summary = _aggregate_frontier_summary(frontier_rows, int(args.bootstrap_samples), int(args.bootstrap_seed))
-    judgment, judgment_details = _final_judgment(iso_rows, min_safe_rows, separability_rows, budget_rows)
+    if args.smoke_only:
+        judgment = "SMOKE-PASS"
+        judgment_details = {
+            "executed_prompt_count": prompt_count,
+            "executed_seed_count": seed_count,
+            "frontier_rows": len(frontier_rows),
+            "note": "Smoke run verifies prompt provenance, checkpoint serialization, reconstruction, and resume paths only.",
+        }
+    else:
+        judgment, judgment_details = _final_judgment(iso_rows, min_safe_rows, separability_rows, budget_rows)
 
     _write_csv(output_dir / "frontier_raw.csv", FRONTIER_RAW_FIELDS, frontier_rows)
     _write_csv(output_dir / "checkpoint_sizes.csv", CHECKPOINT_SIZE_FIELDS, checkpoint_rows)
@@ -1757,6 +1772,9 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
         "frontier_summary": frontier_summary,
         "judgment": judgment,
         "judgment_details": judgment_details,
+        "smoke_only": bool(args.smoke_only),
+        "executed_prompt_count": int(prompt_count),
+        "executed_seed_count": int(seed_count),
         "figure_paths": figure_paths,
         "artifact_paths": {
             "frontier_raw_csv": str(output_dir / "frontier_raw.csv"),
@@ -1772,6 +1790,8 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
     _write_report(
         output_dir / "video_state_protection_killtest.md",
         args=args,
+        executed_prompt_count=prompt_count,
+        executed_seed_count=seed_count,
         prereg=prereg,
         provenance=provenance,
         config_checks=config_checks,
