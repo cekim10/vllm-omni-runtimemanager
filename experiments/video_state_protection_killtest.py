@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import random
 import statistics
 import sys
@@ -238,6 +239,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-prompts", type=int, default=12)
     parser.add_argument("--num-seeds", type=int, default=5)
     parser.add_argument("--seed-base", type=int, default=1234)
+    parser.add_argument("--prompt-start", type=int, default=0, help="Inclusive prompt index to execute.")
+    parser.add_argument("--prompt-end", type=int, help="Exclusive prompt index to execute; defaults to --num-prompts.")
+    parser.add_argument("--seed-start", type=int, default=0, help="Inclusive seed index to execute.")
+    parser.add_argument("--seed-end", type=int, help="Exclusive seed index to execute; defaults to --num-seeds.")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num-frames", type=int, default=33)
@@ -267,6 +272,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-model", default="openai/clip-vit-base-patch32")
     parser.add_argument("--semantic-frame-count", type=int, default=4)
     parser.add_argument("--semantic-device", default="cpu")
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Split prompt/seed sessions deterministically across this many workers.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based worker index used with --num-shards.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip complete prompt/seed sessions already present in frontier_raw.csv.",
+    )
+    parser.add_argument(
+        "--screening-stage",
+        action="store_true",
+        help="Apply the preregistered 12-prompt x 2-seed hard-kill screening rule.",
+    )
+    parser.add_argument(
+        "--merge-shard-dirs",
+        nargs="+",
+        help="Merge completed shard output directories and run analysis without loading the model.",
+    )
     return parser.parse_args()
 
 
@@ -356,8 +388,60 @@ def _verify_requested_configuration(args: argparse.Namespace, provenance: Prompt
 
 
 def _write_preregistered_config(output_dir: Path, args: argparse.Namespace, provenance: PromptProvenance) -> dict[str, Any]:
+    path = output_dir / "preregistered_config.json"
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        existing_provenance = existing.get("prompt_provenance", {})
+        if existing_provenance.get("sha256") != provenance.sha256:
+            raise ValueError(f"Existing preregistration uses a different prompt set: {path}")
+        existing_config = existing.get("experiment_config", {})
+        immutable_fields = (
+            "model",
+            "seed_base",
+            "height",
+            "width",
+            "num_frames",
+            "num_inference_steps",
+            "checkpoint_steps",
+            "guidance_scale",
+            "fps",
+            "flow_shift",
+            "boundary_ratio",
+            "enable_cpu_offload",
+            "enable_layerwise_offload",
+            "enforce_eager",
+            "variants",
+            "quality_targets",
+            "iso_storage_tolerance",
+            "semantic_model",
+            "semantic_frame_count",
+            "semantic_device",
+            "disable_semantic_metric",
+            "num_shards",
+            "shard_index",
+        )
+        changed = [
+            field
+            for field in immutable_fields
+            if field in existing_config and existing_config[field] != getattr(args, field)
+        ]
+        if changed:
+            raise ValueError(f"Resume configuration differs from preregistration for fields: {changed}")
+        return existing
+
     prereg = {
         "stopping_rule": {
+            "screening_num_prompts": 12,
+            "screening_num_seeds": 2,
+            "screening_stop_only_if_all_conditions_hold": {
+                "single_representation_safe_cell_fraction_gte": 0.90,
+                "progress_only_representation_accuracy_gte": 0.90,
+                "max_abs_iso_storage_quality_delta_lt": 0.05,
+            },
+            "screening_continuation_rule": (
+                "If any screening stop condition is false, execute all primary cells at 5 seeds. "
+                "Do not select cells based on favorable screening results."
+            ),
             "primary_num_prompts": 12,
             "primary_num_seeds": 5,
             "extension_num_seeds": 15,
@@ -381,8 +465,10 @@ def _write_preregistered_config(output_dir: Path, args: argparse.Namespace, prov
             "prompt_ids": provenance.prompt_ids,
         },
         "experiment_config": vars(args),
+        "execution_environment": {
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        },
     }
-    path = output_dir / "preregistered_config.json"
     path.write_text(json.dumps(prereg, indent=2), encoding="utf-8")
     return prereg
 
@@ -720,7 +806,38 @@ def _run_single_baseline(
         raise ValueError(f"Probe label mismatch: expected {request_label}, got {probe_meta.get('label')}")
     final_path = artifact_dir / f"{request_label}_baseline.mp4"
     preflight._save_video(final_path, video, fps=args.fps)
+    frames_path = artifact_dir / f"{request_label}_baseline.npy"
+    frames_tmp_path = frames_path.with_suffix(".npy.tmp")
+    with frames_tmp_path.open("wb") as handle:
+        np.save(handle, video, allow_pickle=False)
+    frames_tmp_path.replace(frames_path)
     return video, probe_meta, latency_ms, _mean_abs_frame_diff(video)
+
+
+def _load_cached_baseline(
+    args: argparse.Namespace,
+    prompt_entry: dict[str, Any],
+    seed: int,
+    artifact_dir: Path,
+) -> tuple[np.ndarray, dict[str, Any], float, float] | None:
+    request_label = f"{prompt_entry['prompt_id']}_seed{seed}"
+    frames_path = artifact_dir / f"{request_label}_baseline.npy"
+    probe_meta_path = artifact_dir / f"{request_label}_trajectory_probe.json"
+    if not frames_path.exists() or not probe_meta_path.exists():
+        return None
+    try:
+        video = np.load(frames_path, allow_pickle=False)
+        probe_meta = json.loads(probe_meta_path.read_text(encoding="utf-8"))
+        records = _load_probe_records_by_step(probe_meta)
+        if probe_meta.get("label") != request_label:
+            return None
+        for checkpoint_step in args.checkpoint_steps:
+            record = records.get(int(checkpoint_step))
+            if record is None or not record.get("latent_path") or not Path(record["latent_path"]).exists():
+                return None
+        return video, probe_meta, 0.0, _mean_abs_frame_diff(video)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def _compute_vs_full(rows: list[dict[str, Any]]) -> None:
@@ -1299,6 +1416,106 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) ->
         writer.writerows(rows)
 
 
+def _write_csv_atomic(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    _write_csv(temp_path, fieldnames, rows)
+    temp_path.replace(path)
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _row_key(row: dict[str, Any]) -> tuple[str, int, int, str]:
+    return (
+        str(row["prompt_id"]),
+        int(row["seed"]),
+        int(row["checkpoint_step"]),
+        str(row["variant"]),
+    )
+
+
+def _validate_existing_frontier_rows(
+    rows: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    provenance: PromptProvenance,
+) -> list[dict[str, Any]]:
+    valid_prompt_ids = set(provenance.prompt_ids)
+    valid_steps = {int(step) for step in args.checkpoint_steps}
+    valid_variants = set(args.variants)
+    unique: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for row in rows:
+        if row.get("prompt_set_sha256") != provenance.sha256 or row.get("model") != args.model:
+            raise ValueError("Existing frontier_raw.csv was produced by a different prompt set or model")
+        key = _row_key(row)
+        prompt_id, _, step, variant = key
+        if prompt_id not in valid_prompt_ids or step not in valid_steps or variant not in valid_variants:
+            continue
+        artifact_path = Path(str(row.get("artifact_path", "")))
+        serialized_dir = Path(str(row.get("serialized_artifact_dir", "")))
+        payload_path = serialized_dir / f"{variant}.payload.bin"
+        metadata_path = serialized_dir / f"{variant}.metadata.json"
+        try:
+            valid_numeric_fields = (
+                int(row["total_checkpoint_bytes"]) > 0
+                and float(row["resume_latency_ms"]) > 0.0
+                and math.isfinite(float(row["spatial_metric_abs"]))
+                and math.isfinite(float(row["temporal_dynamic_composite_abs"]))
+            )
+        except (KeyError, TypeError, ValueError):
+            valid_numeric_fields = False
+        if (
+            not artifact_path.is_file()
+            or artifact_path.stat().st_size <= 0
+            or not payload_path.is_file()
+            or not metadata_path.is_file()
+            or not valid_numeric_fields
+        ):
+            continue
+        if key in unique:
+            raise ValueError(f"Duplicate frontier row in resume data: {key}")
+        unique[key] = row
+    return list(unique.values())
+
+
+def _session_belongs_to_shard(prompt_idx: int, seed_index: int, num_shards: int, shard_index: int) -> bool:
+    # Assignment remains stable when Stage A grows from 2 to 5 seeds and stays
+    # balanced across prompt/seed combinations.
+    return (prompt_idx + seed_index) % num_shards == shard_index
+
+
+def _expected_session_keys(
+    provenance: PromptProvenance,
+    *,
+    seed_count: int,
+    seed_base: int,
+) -> set[tuple[str, int]]:
+    return {
+        (str(prompt_entry["prompt_id"]), seed_base + prompt_idx * 1000 + seed_index)
+        for prompt_idx, prompt_entry in enumerate(provenance.entries)
+        for seed_index in range(seed_count)
+    }
+
+
+def _completed_session_keys(
+    rows: list[dict[str, Any]],
+    *,
+    checkpoint_steps: list[int],
+    variants: list[str],
+) -> set[tuple[str, int]]:
+    expected_cells = {(int(step), variant) for step in checkpoint_steps for variant in variants}
+    cells_by_session: dict[tuple[str, int], set[tuple[int, str]]] = defaultdict(set)
+    for row in rows:
+        cells_by_session[(str(row["prompt_id"]), int(row["seed"]))].add(
+            (int(row["checkpoint_step"]), str(row["variant"]))
+        )
+    return {session for session, cells in cells_by_session.items() if cells == expected_cells}
+
+
 def _maybe_make_figures(output_dir: Path, frontier_rows: list[dict[str, Any]], min_safe_rows: list[dict[str, Any]], budget_rows: list[dict[str, Any]]) -> list[str]:
     try:
         import matplotlib.pyplot as plt
@@ -1441,6 +1658,74 @@ def _final_judgment(
     return "NO-GO", details
 
 
+def _screening_judgment(
+    frontier_rows: list[dict[str, Any]],
+    iso_rows: list[dict[str, Any]],
+    min_safe_rows: list[dict[str, Any]],
+    separability_rows: list[dict[str, Any]],
+    *,
+    bootstrap_samples: int,
+    bootstrap_seed: int,
+) -> tuple[str, dict[str, Any]]:
+    target_rows = [row for row in min_safe_rows if math.isclose(float(row["quality_target"]), 0.95)]
+    total_cells = len({(str(row["prompt_id"]), int(row["checkpoint_step"])) for row in target_rows})
+    safe_cells_by_representation: Counter[str] = Counter()
+    grouped = _group_rows(frontier_rows, "prompt_id", "checkpoint_step", "variant")
+    for (_, _, variant), rows in grouped.items():
+        if variant == "full":
+            continue
+        metric_lows = [
+            _metric_stats(
+                [float(row[field]) for row in rows],
+                samples=bootstrap_samples,
+                seed=bootstrap_seed + field_idx,
+            )["ci_low"]
+            for field_idx, field in enumerate(("spatial_vs_full", "temporal_dynamic_vs_full", "semantic_vs_full"))
+        ]
+        if all(value >= 0.95 for value in metric_lows):
+            safe_cells_by_representation[str(variant)] += 1
+    most_common_representation = "none"
+    most_common_fraction = 0.0
+    if safe_cells_by_representation and total_cells:
+        most_common_representation, count = safe_cells_by_representation.most_common(1)[0]
+        most_common_fraction = count / total_cells
+
+    progress_rows = [
+        row
+        for row in separability_rows
+        if row["policy"] == "progress_only" and math.isclose(float(row["quality_target"]), 0.95)
+    ]
+    progress_accuracy = (
+        float(progress_rows[0]["representation_accuracy"]) if progress_rows else 0.0
+    )
+    iso_quality_deltas = []
+    for row in iso_rows:
+        if int(row["num_rows"]) <= 0:
+            continue
+        iso_quality_deltas.extend(
+            abs(float(row[field]))
+            for field in ("dynamic_delta_mean", "spatial_delta_mean", "semantic_delta_mean")
+            if math.isfinite(float(row[field]))
+        )
+    max_abs_iso_quality_delta = max(iso_quality_deltas, default=0.0)
+
+    stop_conditions = {
+        "single_representation_safe_fraction_gte_0_90": most_common_fraction >= 0.90,
+        "progress_only_accuracy_gte_0_90": progress_accuracy >= 0.90,
+        "max_abs_iso_storage_quality_delta_lt_0_05": max_abs_iso_quality_delta < 0.05,
+    }
+    details = {
+        "most_common_safe_representation": most_common_representation,
+        "most_common_safe_representation_fraction": most_common_fraction,
+        "progress_only_representation_accuracy": progress_accuracy,
+        "max_abs_iso_storage_quality_delta": max_abs_iso_quality_delta,
+        "stop_conditions": stop_conditions,
+    }
+    if all(stop_conditions.values()):
+        return "SCREENING NO-GO", details
+    return "CONTINUE TO 5 SEEDS", details
+
+
 def _write_report(
     output_path: Path,
     *,
@@ -1477,8 +1762,11 @@ def _write_report(
         f"- Variants: `{' '.join(args.variants)}`",
         f"- Requested prompts: `{args.num_prompts}`",
         f"- Executed prompts: `{executed_prompt_count}`",
+        f"- Prompt execution range: `[{args.prompt_start}, {args.prompt_end if args.prompt_end is not None else args.num_prompts})`",
         f"- Requested seeds: `{args.num_seeds}`",
         f"- Executed seeds: `{executed_seed_count}`",
+        f"- Seed execution range: `[{args.seed_start}, {args.seed_end if args.seed_end is not None else args.num_seeds})`",
+        f"- CUDA_VISIBLE_DEVICES: `{os.environ.get('CUDA_VISIBLE_DEVICES')}`",
         f"- Smoke-only mode: `{args.smoke_only}`",
         "",
         "## Verified Prompt Provenance",
@@ -1489,6 +1777,9 @@ def _write_report(
         "",
         "## Preregistered Stopping Rule",
         "",
+        f"- Screening seeds: `{prereg['stopping_rule']['screening_num_seeds']}`",
+        f"- Screening hard-stop conditions: `{json.dumps(prereg['stopping_rule']['screening_stop_only_if_all_conditions_hold'], sort_keys=True)}`",
+        f"- Screening continuation: {prereg['stopping_rule']['screening_continuation_rule']}",
         f"- Primary seeds: `{prereg['stopping_rule']['primary_num_seeds']}`",
         f"- Extension seeds: `{prereg['stopping_rule']['extension_num_seeds']}`",
         f"- Iso-storage CI rule: {prereg['stopping_rule']['iso_storage_resolution_rule']}",
@@ -1562,6 +1853,146 @@ def _write_report(
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _analyze_and_write_results(
+    *,
+    args: argparse.Namespace,
+    output_dir: Path,
+    provenance: PromptProvenance,
+    config_checks: dict[str, Any],
+    prereg: dict[str, Any],
+    frontier_rows: list[dict[str, Any]],
+    mode: str,
+) -> dict[str, Any]:
+    _compute_vs_full(frontier_rows)
+    frontier_rows.sort(key=_row_key)
+    checkpoint_rows = _build_checkpoint_size_rows(frontier_rows)
+    iso_rows = _build_iso_storage_rows(
+        frontier_rows,
+        tolerance=float(args.iso_storage_tolerance),
+        bootstrap_samples=int(args.bootstrap_samples),
+        bootstrap_seed=int(args.bootstrap_seed),
+    )
+    min_safe_rows = _build_minimum_safe_rows(
+        frontier_rows,
+        targets=[float(target) for target in args.quality_targets],
+        bootstrap_samples=int(args.bootstrap_samples),
+        bootstrap_seed=int(args.bootstrap_seed),
+    )
+    oracle_sessions = _oracle_session_table(frontier_rows, [float(target) for target in args.quality_targets])
+    policy_fit = _fit_simple_policies(oracle_sessions, complexity_bins=int(args.complexity_bins))
+    separability_rows = _evaluate_simple_policies(
+        oracle_sessions, policy_fit, [float(target) for target in args.quality_targets]
+    )
+    interaction_rows = _interaction_crossings(min_safe_rows)
+    budget_rows = _budget_simulation(
+        oracle_sessions,
+        separability_rows,
+        policy_fit,
+        budget_session_counts=[int(x) for x in args.budget_session_counts],
+        budget_fractions=[float(x) for x in args.budget_fractions],
+        budget_trials=int(args.budget_trials),
+        bootstrap_seed=int(args.bootstrap_seed),
+    )
+    frontier_summary = _aggregate_frontier_summary(
+        frontier_rows, int(args.bootstrap_samples), int(args.bootstrap_seed)
+    )
+
+    session_keys = {(str(row["prompt_id"]), int(row["seed"])) for row in frontier_rows}
+    executed_prompt_count = len({prompt_id for prompt_id, _ in session_keys})
+    executed_seed_count = len({int(row["seed_index"]) for row in frontier_rows})
+    if mode == "smoke":
+        judgment = "SMOKE-PASS"
+        judgment_details = {
+            "completed_sessions": len(session_keys),
+            "frontier_rows": len(frontier_rows),
+            "note": "Smoke run verifies prompt provenance, checkpoint serialization, reconstruction, and resume paths only.",
+        }
+    elif mode == "shard":
+        judgment = "SHARD-COMPLETE"
+        judgment_details = {
+            "shard_index": int(args.shard_index),
+            "num_shards": int(args.num_shards),
+            "completed_sessions": len(session_keys),
+            "note": "Merge every shard before interpreting screening or GO/NO-GO results.",
+        }
+    elif mode == "partial":
+        judgment = "RANGE-COMPLETE"
+        judgment_details = {
+            "completed_sessions": len(session_keys),
+            "note": "Run the remaining prompt/seed ranges in the same output directory before interpreting results.",
+        }
+    elif mode == "screening":
+        judgment, judgment_details = _screening_judgment(
+            frontier_rows,
+            iso_rows,
+            min_safe_rows,
+            separability_rows,
+            bootstrap_samples=int(args.bootstrap_samples),
+            bootstrap_seed=int(args.bootstrap_seed),
+        )
+    else:
+        judgment, judgment_details = _final_judgment(iso_rows, min_safe_rows, separability_rows, budget_rows)
+
+    _write_csv_atomic(output_dir / "frontier_raw.csv", FRONTIER_RAW_FIELDS, frontier_rows)
+    _write_csv(output_dir / "checkpoint_sizes.csv", CHECKPOINT_SIZE_FIELDS, checkpoint_rows)
+    _write_csv(output_dir / "iso_storage_frontier.csv", ISO_STORAGE_FIELDS, iso_rows)
+    _write_csv(output_dir / "minimum_safe_representation.csv", MIN_SAFE_FIELDS, min_safe_rows)
+    _write_csv(output_dir / "separability_analysis.csv", SEPARABILITY_FIELDS, separability_rows)
+    _write_csv(output_dir / "interaction_crossings.csv", INTERACTION_FIELDS, interaction_rows)
+    _write_csv(output_dir / "budget_simulation.csv", BUDGET_FIELDS, budget_rows)
+
+    figure_paths = _maybe_make_figures(output_dir, frontier_rows, min_safe_rows, budget_rows)
+    summary = {
+        "prompt_provenance": {
+            "resolved_path": str(provenance.resolved_path),
+            "sha256": provenance.sha256,
+            "prompt_ids": provenance.prompt_ids,
+            "categories": provenance.categories,
+        },
+        "config_checks": config_checks,
+        "preregistered_config_path": str(output_dir / "preregistered_config.json"),
+        "frontier_summary": frontier_summary,
+        "judgment": judgment,
+        "judgment_details": judgment_details,
+        "execution_mode": mode,
+        "smoke_only": bool(args.smoke_only),
+        "executed_prompt_count": executed_prompt_count,
+        "executed_seed_count": executed_seed_count,
+        "completed_sessions": len(session_keys),
+        "figure_paths": figure_paths,
+        "artifact_paths": {
+            "frontier_raw_csv": str(output_dir / "frontier_raw.csv"),
+            "checkpoint_sizes_csv": str(output_dir / "checkpoint_sizes.csv"),
+            "iso_storage_frontier_csv": str(output_dir / "iso_storage_frontier.csv"),
+            "minimum_safe_representation_csv": str(output_dir / "minimum_safe_representation.csv"),
+            "separability_analysis_csv": str(output_dir / "separability_analysis.csv"),
+            "interaction_crossings_csv": str(output_dir / "interaction_crossings.csv"),
+            "budget_simulation_csv": str(output_dir / "budget_simulation.csv"),
+        },
+    }
+    (output_dir / "frontier_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _write_report(
+        output_dir / "video_state_protection_killtest.md",
+        args=args,
+        executed_prompt_count=executed_prompt_count,
+        executed_seed_count=executed_seed_count,
+        prereg=prereg,
+        provenance=provenance,
+        config_checks=config_checks,
+        frontier_rows=frontier_rows,
+        checkpoint_rows=checkpoint_rows,
+        iso_rows=iso_rows,
+        min_safe_rows=min_safe_rows,
+        separability_rows=separability_rows,
+        interaction_rows=interaction_rows,
+        budget_rows=budget_rows,
+        judgment=judgment,
+        judgment_details=judgment_details,
+        figure_paths=figure_paths,
+    )
+    return summary
+
+
 def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1570,9 +2001,25 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
 
     prompt_count = 1 if args.smoke_only else args.num_prompts
     seed_count = 1 if args.smoke_only else args.num_seeds
+    prompt_start = 0 if args.smoke_only else int(args.prompt_start)
+    prompt_end = 1 if args.smoke_only else int(args.prompt_end if args.prompt_end is not None else prompt_count)
+    seed_start = 0 if args.smoke_only else int(args.seed_start)
+    seed_end = 1 if args.smoke_only else int(args.seed_end if args.seed_end is not None else seed_count)
     provenance = _strict_prompt_provenance(args.prompt_set, prompt_count)
     config_checks = _verify_requested_configuration(args, provenance)
     prereg = _write_preregistered_config(output_dir, args, provenance)
+
+    raw_csv_path = output_dir / "frontier_raw.csv"
+    if raw_csv_path.exists() and not args.resume:
+        raise FileExistsError(f"{raw_csv_path} already exists; pass --resume or use a new output directory")
+    frontier_rows = _validate_existing_frontier_rows(
+        _read_csv_rows(raw_csv_path) if args.resume else [],
+        args=args,
+        provenance=provenance,
+    )
+    frontier_rows.sort(key=_row_key)
+    if args.resume:
+        _write_csv_atomic(raw_csv_path, FRONTIER_RAW_FIELDS, frontier_rows)
 
     omni = _make_omni(args)
     semantic_evaluator = None if args.disable_semantic_metric else preflight.SemanticMetricEvaluator(
@@ -1581,24 +2028,41 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
         frame_count=args.semantic_frame_count,
     )
 
-    frontier_rows: list[dict[str, Any]] = []
     try:
         for prompt_idx, prompt_entry in enumerate(provenance.entries):
+            if prompt_idx < prompt_start or prompt_idx >= prompt_end:
+                continue
             for seed_index in range(seed_count):
+                if seed_index < seed_start or seed_index >= seed_end:
+                    continue
+                if not _session_belongs_to_shard(
+                    prompt_idx, seed_index, int(args.num_shards), int(args.shard_index)
+                ):
+                    continue
                 seed = args.seed_base + prompt_idx * 1000 + seed_index
                 prompt_id = str(prompt_entry["prompt_id"])
                 category = str(prompt_entry["motion_category"])
                 prompt_text = str(prompt_entry["prompt"])
+                expected_session_cells = {
+                    (prompt_id, seed, int(step), variant)
+                    for step in args.checkpoint_steps
+                    for variant in args.variants
+                }
+                existing_keys = {_row_key(row) for row in frontier_rows}
+                if expected_session_cells <= existing_keys:
+                    print(f"[killtest] skip complete prompt_id={prompt_id} seed={seed}", flush=True)
+                    continue
+
                 artifact_dir = frontier_artifact_dir / f"{prompt_id}_seed{seed}"
                 artifact_dir.mkdir(parents=True, exist_ok=True)
-                baseline_video, probe_meta, baseline_latency_ms, complexity_score = _run_single_baseline(
-                    omni, args, prompt_entry, seed, seed_index, artifact_dir
-                )
-                final_semantic_abs = (
-                    semantic_evaluator.score_video(prompt_text, baseline_video)
-                    if semantic_evaluator is not None
-                    else float("nan")
-                )
+                cached_baseline = _load_cached_baseline(args, prompt_entry, seed, artifact_dir) if args.resume else None
+                if cached_baseline is None:
+                    baseline_video, probe_meta, _, complexity_score = _run_single_baseline(
+                        omni, args, prompt_entry, seed, seed_index, artifact_dir
+                    )
+                else:
+                    baseline_video, probe_meta, _, complexity_score = cached_baseline
+                    print(f"[killtest] reuse trajectory prompt_id={prompt_id} seed={seed}", flush=True)
                 probe_records = _load_probe_records_by_step(probe_meta)
 
                 for checkpoint_step in args.checkpoint_steps:
@@ -1612,19 +2076,26 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
                     checkpoint_cpu_copy_ms = float(checkpoint_record.get("latent_cpu_copy_ms") or 0.0)
                     checkpoint_save_ms = float(checkpoint_record.get("latent_save_ms") or 0.0)
                     checkpoint_protection_ms = checkpoint_cpu_copy_ms + checkpoint_save_ms
-                    full_total_bytes = None
-                    encoded_variants: dict[str, SerializedRepresentation] = {}
-                    for variant in args.variants:
+                    full_key = (prompt_id, seed, int(checkpoint_step), "full")
+                    full_row = next((row for row in frontier_rows if _row_key(row) == full_key), None)
+                    full_total_bytes = int(full_row["total_checkpoint_bytes"]) if full_row is not None else None
+
+                    ordered_variants = sorted(args.variants, key=lambda variant: variant != "full")
+                    for variant in ordered_variants:
+                        row_key = (prompt_id, seed, int(checkpoint_step), variant)
+                        if row_key in {_row_key(row) for row in frontier_rows}:
+                            print(
+                                f"[killtest] skip complete prompt_id={prompt_id} seed={seed} "
+                                f"step={checkpoint_step} variant={variant}",
+                                flush=True,
+                            )
+                            continue
                         serialized_dir = artifact_dir / f"serialized_step{int(checkpoint_step):03d}" / variant
                         encoded = _encode_representation(exact_latent, variant, serialized_dir)
-                        encoded_variants[variant] = encoded
                         if variant == "full":
                             full_total_bytes = encoded.total_checkpoint_bytes
-                    if full_total_bytes is None:
-                        raise ValueError("full representation is required to compute compression ratios")
-
-                    for variant in args.variants:
-                        encoded = encoded_variants[variant]
+                        if full_total_bytes is None:
+                            raise ValueError("full representation must complete before compressed variants")
                         variant_sampling = _build_resume_sampling_params(
                             args,
                             seed=seed,
@@ -1704,116 +2175,155 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
                                 "variant_metadata_json": json.dumps(encoded.metadata, sort_keys=True),
                             }
                         )
+                        _compute_vs_full(frontier_rows)
+                        frontier_rows.sort(key=_row_key)
+                        _write_csv_atomic(raw_csv_path, FRONTIER_RAW_FIELDS, frontier_rows)
                         print(
                             f"[killtest] prompt_id={prompt_id} seed={seed} step={checkpoint_step} variant={variant} "
                             f"bytes={encoded.total_checkpoint_bytes} dynamic_abs={temporal['temporal_dynamic_composite']:.4f}",
                             flush=True,
                         )
+                completed_keys = {_row_key(row) for row in frontier_rows}
+                if not expected_session_cells <= completed_keys:
+                    raise RuntimeError(f"Session did not complete all cells: prompt_id={prompt_id} seed={seed}")
+                done_path = artifact_dir / "DONE.json"
+                done_tmp_path = done_path.with_suffix(".json.tmp")
+                done_tmp_path.write_text(
+                    json.dumps(
+                        {
+                            "prompt_id": prompt_id,
+                            "seed": seed,
+                            "checkpoint_steps": list(args.checkpoint_steps),
+                            "variants": list(args.variants),
+                            "frontier_rows": len(expected_session_cells),
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                done_tmp_path.replace(done_path)
     finally:
         omni.close()
 
-    _compute_vs_full(frontier_rows)
-    checkpoint_rows = _build_checkpoint_size_rows(frontier_rows)
-    iso_rows = _build_iso_storage_rows(
-        frontier_rows,
-        tolerance=float(args.iso_storage_tolerance),
-        bootstrap_samples=int(args.bootstrap_samples),
-        bootstrap_seed=int(args.bootstrap_seed),
-    )
-    min_safe_rows = _build_minimum_safe_rows(
-        frontier_rows,
-        targets=[float(target) for target in args.quality_targets],
-        bootstrap_samples=int(args.bootstrap_samples),
-        bootstrap_seed=int(args.bootstrap_seed),
-    )
-    oracle_sessions = _oracle_session_table(frontier_rows, [float(target) for target in args.quality_targets])
-    policy_fit = _fit_simple_policies(oracle_sessions, complexity_bins=int(args.complexity_bins))
-    separability_rows = _evaluate_simple_policies(oracle_sessions, policy_fit, [float(target) for target in args.quality_targets])
-    interaction_rows = _interaction_crossings(min_safe_rows)
-    budget_rows = _budget_simulation(
-        oracle_sessions,
-        separability_rows,
-        policy_fit,
-        budget_session_counts=[int(x) for x in args.budget_session_counts],
-        budget_fractions=[float(x) for x in args.budget_fractions],
-        budget_trials=int(args.budget_trials),
-        bootstrap_seed=int(args.bootstrap_seed),
-    )
-    frontier_summary = _aggregate_frontier_summary(frontier_rows, int(args.bootstrap_samples), int(args.bootstrap_seed))
-    if args.smoke_only:
-        judgment = "SMOKE-PASS"
-        judgment_details = {
-            "executed_prompt_count": prompt_count,
-            "executed_seed_count": seed_count,
-            "frontier_rows": len(frontier_rows),
-            "note": "Smoke run verifies prompt provenance, checkpoint serialization, reconstruction, and resume paths only.",
-        }
-    else:
-        judgment, judgment_details = _final_judgment(iso_rows, min_safe_rows, separability_rows, budget_rows)
-
-    _write_csv(output_dir / "frontier_raw.csv", FRONTIER_RAW_FIELDS, frontier_rows)
-    _write_csv(output_dir / "checkpoint_sizes.csv", CHECKPOINT_SIZE_FIELDS, checkpoint_rows)
-    _write_csv(output_dir / "iso_storage_frontier.csv", ISO_STORAGE_FIELDS, iso_rows)
-    _write_csv(output_dir / "minimum_safe_representation.csv", MIN_SAFE_FIELDS, min_safe_rows)
-    _write_csv(output_dir / "separability_analysis.csv", SEPARABILITY_FIELDS, separability_rows)
-    _write_csv(output_dir / "interaction_crossings.csv", INTERACTION_FIELDS, interaction_rows)
-    _write_csv(output_dir / "budget_simulation.csv", BUDGET_FIELDS, budget_rows)
-
-    figure_paths = _maybe_make_figures(output_dir, frontier_rows, min_safe_rows, budget_rows)
-    summary = {
-        "prompt_provenance": {
-            "resolved_path": str(provenance.resolved_path),
-            "sha256": provenance.sha256,
-            "prompt_ids": provenance.prompt_ids,
-            "categories": provenance.categories,
-        },
-        "config_checks": config_checks,
-        "preregistered_config_path": str(output_dir / "preregistered_config.json"),
-        "frontier_summary": frontier_summary,
-        "judgment": judgment,
-        "judgment_details": judgment_details,
-        "smoke_only": bool(args.smoke_only),
-        "executed_prompt_count": int(prompt_count),
-        "executed_seed_count": int(seed_count),
-        "figure_paths": figure_paths,
-        "artifact_paths": {
-            "frontier_raw_csv": str(output_dir / "frontier_raw.csv"),
-            "checkpoint_sizes_csv": str(output_dir / "checkpoint_sizes.csv"),
-            "iso_storage_frontier_csv": str(output_dir / "iso_storage_frontier.csv"),
-            "minimum_safe_representation_csv": str(output_dir / "minimum_safe_representation.csv"),
-            "separability_analysis_csv": str(output_dir / "separability_analysis.csv"),
-            "interaction_crossings_csv": str(output_dir / "interaction_crossings.csv"),
-            "budget_simulation_csv": str(output_dir / "budget_simulation.csv"),
-        },
+    assigned_sessions = {
+        (str(prompt_entry["prompt_id"]), args.seed_base + prompt_idx * 1000 + seed_index)
+        for prompt_idx, prompt_entry in enumerate(provenance.entries)
+        if prompt_start <= prompt_idx < prompt_end
+        for seed_index in range(seed_start, seed_end)
+        if _session_belongs_to_shard(prompt_idx, seed_index, int(args.num_shards), int(args.shard_index))
     }
-    (output_dir / "frontier_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    _write_report(
-        output_dir / "video_state_protection_killtest.md",
+    completed_sessions = _completed_session_keys(
+        frontier_rows,
+        checkpoint_steps=[int(step) for step in args.checkpoint_steps],
+        variants=list(args.variants),
+    )
+    missing_sessions = sorted(assigned_sessions - completed_sessions)
+    if missing_sessions:
+        raise RuntimeError(f"Shard finished with incomplete sessions: {missing_sessions}")
+
+    global_expected_sessions = _expected_session_keys(
+        provenance,
+        seed_count=seed_count,
+        seed_base=int(args.seed_base),
+    )
+    global_complete = global_expected_sessions <= completed_sessions
+    if args.smoke_only:
+        mode = "smoke"
+    elif not global_complete:
+        mode = "shard" if int(args.num_shards) > 1 else "partial"
+    elif int(args.num_shards) > 1:
+        mode = "shard"
+    elif args.screening_stage:
+        mode = "screening"
+    else:
+        mode = "full"
+    return _analyze_and_write_results(
         args=args,
-        executed_prompt_count=prompt_count,
-        executed_seed_count=seed_count,
-        prereg=prereg,
+        output_dir=output_dir,
         provenance=provenance,
         config_checks=config_checks,
+        prereg=prereg,
         frontier_rows=frontier_rows,
-        checkpoint_rows=checkpoint_rows,
-        iso_rows=iso_rows,
-        min_safe_rows=min_safe_rows,
-        separability_rows=separability_rows,
-        interaction_rows=interaction_rows,
-        budget_rows=budget_rows,
-        judgment=judgment,
-        judgment_details=judgment_details,
-        figure_paths=figure_paths,
+        mode=mode,
     )
-    return summary
+
+
+def merge_shards(args: argparse.Namespace) -> dict[str, Any]:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    provenance = _strict_prompt_provenance(args.prompt_set, int(args.num_prompts))
+    config_checks = _verify_requested_configuration(args, provenance)
+    prereg = _write_preregistered_config(output_dir, args, provenance)
+
+    merged_by_key: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for shard_dir_str in args.merge_shard_dirs:
+        shard_dir = Path(shard_dir_str)
+        shard_csv = shard_dir / "frontier_raw.csv"
+        if not shard_csv.exists():
+            raise FileNotFoundError(f"Missing shard result: {shard_csv}")
+        rows = _validate_existing_frontier_rows(
+            _read_csv_rows(shard_csv),
+            args=args,
+            provenance=provenance,
+        )
+        for row in rows:
+            key = _row_key(row)
+            if key in merged_by_key:
+                raise ValueError(f"Shard outputs overlap at {key}")
+            merged_by_key[key] = row
+
+    frontier_rows = list(merged_by_key.values())
+    expected_sessions = _expected_session_keys(
+        provenance,
+        seed_count=int(args.num_seeds),
+        seed_base=int(args.seed_base),
+    )
+    completed_sessions = _completed_session_keys(
+        frontier_rows,
+        checkpoint_steps=[int(step) for step in args.checkpoint_steps],
+        variants=list(args.variants),
+    )
+    missing_sessions = sorted(expected_sessions - completed_sessions)
+    extra_sessions = sorted(completed_sessions - expected_sessions)
+    expected_rows = len(expected_sessions) * len(args.checkpoint_steps) * len(args.variants)
+    if missing_sessions or extra_sessions or len(frontier_rows) != expected_rows:
+        raise ValueError(
+            "Shard merge is incomplete: "
+            f"expected_rows={expected_rows}, actual_rows={len(frontier_rows)}, "
+            f"missing_sessions={missing_sessions}, extra_sessions={extra_sessions}"
+        )
+
+    mode = "screening" if args.screening_stage else "full"
+    return _analyze_and_write_results(
+        args=args,
+        output_dir=output_dir,
+        provenance=provenance,
+        config_checks=config_checks,
+        prereg=prereg,
+        frontier_rows=frontier_rows,
+        mode=mode,
+    )
 
 
 def main() -> None:
     args = parse_args()
     if any(step < 0 or step >= args.num_inference_steps for step in args.checkpoint_steps):
         raise ValueError(f"checkpoint step out of range for {args.num_inference_steps}: {args.checkpoint_steps}")
-    summary = run_killtest(args)
+    if args.num_shards <= 0:
+        raise ValueError("--num-shards must be positive")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard-index < num-shards")
+    prompt_end = args.prompt_end if args.prompt_end is not None else args.num_prompts
+    seed_end = args.seed_end if args.seed_end is not None else args.num_seeds
+    if not (0 <= args.prompt_start < prompt_end <= args.num_prompts):
+        raise ValueError("prompt range must satisfy 0 <= prompt-start < prompt-end <= num-prompts")
+    if not (0 <= args.seed_start < seed_end <= args.num_seeds):
+        raise ValueError("seed range must satisfy 0 <= seed-start < seed-end <= num-seeds")
+    if args.screening_stage and args.num_seeds != 2:
+        raise ValueError("--screening-stage requires --num-seeds 2")
+    if args.merge_shard_dirs and (args.resume or args.smoke_only or args.num_shards != 1 or args.shard_index != 0):
+        raise ValueError("--merge-shard-dirs cannot be combined with run, resume, smoke, or shard options")
+    summary = merge_shards(args) if args.merge_shard_dirs else run_killtest(args)
     print(json.dumps(summary, indent=2))
 
 
