@@ -7,6 +7,7 @@ import copy
 import csv
 import json
 import math
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,11 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 DEFAULT_VARIANTS = [
