@@ -526,6 +526,10 @@ class Wan22Pipeline(
             peak_reserved_bytes = int(current_omni_platform.max_memory_reserved())
             peak_allocated_bytes = int(current_omni_platform.max_memory_allocated())
 
+        copy_start = time.perf_counter()
+        latent_cpu = latents.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        latent_cpu_copy_ms = (time.perf_counter() - copy_start) * 1000.0
+
         probe_state["records"].append(
             {
                 "step_index": int(step_index),
@@ -533,7 +537,9 @@ class Wan22Pipeline(
                 "timestep": timestep_value,
                 "latent_shape": list(latents.shape),
                 "latent_dtype": str(latents.dtype),
-                "latent_cpu": latents.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                "latent_cpu": latent_cpu,
+                "latent_cpu_bytes": int(latent_cpu.nelement() * latent_cpu.element_size()),
+                "latent_cpu_copy_ms": float(latent_cpu_copy_ms),
                 "step_latency_ms": float(step_latency_ms),
                 "cumulative_dit_ms": float(cumulative_dit_ms),
                 "free_gpu_bytes": free_gpu_bytes,
@@ -580,8 +586,11 @@ class Wan22Pipeline(
             frames_path = artifact_dir / f"{step_prefix}_frames.pt"
             mp4_path = artifact_dir / f"{step_prefix}.mp4"
 
+            latent_save_ms: float | None = None
             if probe_state["save_latents"]:
+                save_start = time.perf_counter()
                 torch.save(record["latent_cpu"], latent_path)
+                latent_save_ms = (time.perf_counter() - save_start) * 1000.0
 
             frames_path_str: str | None = None
             mp4_path_str: str | None = None
@@ -603,6 +612,9 @@ class Wan22Pipeline(
                     "latent_dtype": record["latent_dtype"],
                     "step_latency_ms": record["step_latency_ms"],
                     "cumulative_dit_ms": record["cumulative_dit_ms"],
+                    "latent_cpu_bytes": record["latent_cpu_bytes"],
+                    "latent_cpu_copy_ms": record["latent_cpu_copy_ms"],
+                    "latent_save_ms": latent_save_ms,
                     "free_gpu_bytes": record["free_gpu_bytes"],
                     "peak_reserved_bytes": record["peak_reserved_bytes"],
                     "peak_allocated_bytes": record["peak_allocated_bytes"],

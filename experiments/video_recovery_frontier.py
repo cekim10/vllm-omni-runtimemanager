@@ -51,7 +51,13 @@ CSV_FIELDS = [
     "retained_ratio",
     "checkpoint_size_bytes",
     "checkpoint_value_score",
+    "checkpoint_cpu_copy_ms",
+    "checkpoint_save_ms",
+    "checkpoint_protection_ms",
+    "checkpoint_load_ms",
+    "variant_prepare_ms",
     "resume_latency_ms",
+    "recovery_total_ms",
     "exact_equal",
     "video_mse",
     "max_abs_diff",
@@ -79,7 +85,11 @@ SUMMARY_FIELDS = [
     "variant",
     "num_rows",
     "mean_retained_ratio",
+    "mean_checkpoint_protection_ms",
+    "mean_checkpoint_load_ms",
+    "mean_variant_prepare_ms",
     "mean_resume_latency_ms",
+    "mean_recovery_total_ms",
     "mean_spatial_metric",
     "mean_temporal_shape_composite",
     "mean_temporal_dynamic_composite",
@@ -113,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="Wan-AI/Wan2.2-T2V-A14B-Diffusers")
     parser.add_argument(
         "--prompt-set",
-        default="experiments/temporal_dimension_prompt_set.json",
+        default="experiments/video_recovery_prompt_set.json",
         help="Prompt JSON with prompt_id, prompt, motion_category.",
     )
     parser.add_argument("--output-dir", default="results/video_recovery_frontier")
@@ -386,7 +396,13 @@ def _aggregate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "variant": variant,
                 "num_rows": len(group_rows),
                 "mean_retained_ratio": float(np.mean([float(row["retained_ratio"]) for row in group_rows])),
+                "mean_checkpoint_protection_ms": float(
+                    np.mean([float(row["checkpoint_protection_ms"]) for row in group_rows])
+                ),
+                "mean_checkpoint_load_ms": float(np.mean([float(row["checkpoint_load_ms"]) for row in group_rows])),
+                "mean_variant_prepare_ms": float(np.mean([float(row["variant_prepare_ms"]) for row in group_rows])),
                 "mean_resume_latency_ms": float(np.mean([float(row["resume_latency_ms"]) for row in group_rows])),
+                "mean_recovery_total_ms": float(np.mean([float(row["recovery_total_ms"]) for row in group_rows])),
                 "mean_spatial_metric": float(np.mean([float(row["spatial_metric"]) for row in group_rows])),
                 "mean_temporal_shape_composite": float(
                     np.mean([float(row["temporal_shape_composite"]) for row in group_rows])
@@ -446,6 +462,8 @@ def _write_report(
             f", spatial=`{float(row['mean_spatial_metric']):.4f}`"
             f", semantic=`{float(row['mean_semantic_metric']):.4f}`"
             f", retained=`{float(row['mean_retained_ratio']):.4f}`"
+            f", protect_ms=`{float(row['mean_checkpoint_protection_ms']):.1f}`"
+            f", recover_ms=`{float(row['mean_recovery_total_ms']):.1f}`"
         )
     lines.extend(["", "## Best Semantic Retention", ""])
     for row in best_semantic:
@@ -454,6 +472,8 @@ def _write_report(
             f" semantic=`{float(row['mean_semantic_metric']):.4f}`"
             f", dynamic=`{float(row['mean_temporal_dynamic_composite']):.4f}`"
             f", retained=`{float(row['mean_retained_ratio']):.4f}`"
+            f", protect_ms=`{float(row['mean_checkpoint_protection_ms']):.1f}`"
+            f", recover_ms=`{float(row['mean_recovery_total_ms']):.1f}`"
         )
     lines.extend(["", f"Rows collected: `{len(rows)}`", ""])
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -600,13 +620,20 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 latent_path = checkpoint_record.get("latent_path")
                 if not latent_path:
                     raise ValueError(f"Missing latent_path for step {checkpoint_step} in {request_label}.")
+                checkpoint_load_start = time.perf_counter()
                 exact_latent = torch.load(latent_path, map_location="cpu")
+                checkpoint_load_ms = (time.perf_counter() - checkpoint_load_start) * 1000.0
                 checkpoint_size_bytes = _full_bytes(exact_latent)
                 checkpoint_value_score = float("nan")
                 full_state_bytes = _full_bytes(exact_latent)
+                checkpoint_cpu_copy_ms = float(checkpoint_record.get("latent_cpu_copy_ms") or 0.0)
+                checkpoint_save_ms = float(checkpoint_record.get("latent_save_ms") or 0.0)
+                checkpoint_protection_ms = checkpoint_cpu_copy_ms + checkpoint_save_ms
 
                 for variant in args.variants:
+                    variant_prepare_start = time.perf_counter()
                     perturb = _apply_variant(exact_latent, variant)
+                    variant_prepare_ms = (time.perf_counter() - variant_prepare_start) * 1000.0
                     variant_sampling = _build_resume_sampling_params(
                         args,
                         seed=seed,
@@ -617,6 +644,7 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                     resume_start = time.perf_counter()
                     variant_outputs = omni.generate(prompt, variant_sampling)
                     resume_latency_ms = (time.perf_counter() - resume_start) * 1000.0
+                    recovery_total_ms = checkpoint_load_ms + variant_prepare_ms + resume_latency_ms
                     resumed_video = _unwrap_video_outputs(variant_outputs)
                     artifact_path = artifact_dir / f"step{checkpoint_step:02d}_{variant}.mp4"
                     preflight._save_video(artifact_path, resumed_video, fps=args.fps)
@@ -642,7 +670,13 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                         "retained_ratio": float(perturb.retained_bytes / max(full_state_bytes, 1)),
                         "checkpoint_size_bytes": checkpoint_size_bytes,
                         "checkpoint_value_score": checkpoint_value_score,
+                        "checkpoint_cpu_copy_ms": checkpoint_cpu_copy_ms,
+                        "checkpoint_save_ms": checkpoint_save_ms,
+                        "checkpoint_protection_ms": checkpoint_protection_ms,
+                        "checkpoint_load_ms": checkpoint_load_ms,
+                        "variant_prepare_ms": variant_prepare_ms,
                         "resume_latency_ms": resume_latency_ms,
+                        "recovery_total_ms": recovery_total_ms,
                         "exact_equal": video_metrics["exact_equal"],
                         "video_mse": video_metrics["video_mse"],
                         "max_abs_diff": video_metrics["max_abs_diff"],
@@ -669,6 +703,8 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                     print(
                         f"[frontier] prompt_id={prompt_id} step={checkpoint_step} variant={variant} "
                         f"retained_ratio={row['retained_ratio']:.4f} "
+                        f"protect_ms={row['checkpoint_protection_ms']:.1f} "
+                        f"recover_ms={row['recovery_total_ms']:.1f} "
                         f"dynamic={row['temporal_dynamic_composite']:.4f} "
                         f"spatial={row['spatial_metric']:.4f} "
                         f"semantic={row['semantic_metric']:.4f}",
