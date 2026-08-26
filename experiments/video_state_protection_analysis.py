@@ -768,8 +768,15 @@ def _resolve_threshold_noise_decision(
         ordering_stable = all(
             str(row.get("ordering_stable", "")).lower() == "true" for row in rows
         )
-        has_stable_failure = any(_float(row, probability_field) == 0.0 for row in rows)
-        cheaper_resolved = cheaper_resolved and ordering_stable and has_stable_failure
+        probabilities = [_float(row, probability_field) for row in rows]
+        threshold_stable = all(probability in {0.0, 1.0} for probability in probabilities)
+        has_stable_failure = any(probability == 0.0 for probability in probabilities)
+        cheaper_resolved = (
+            cheaper_resolved
+            and ordering_stable
+            and threshold_stable
+            and has_stable_failure
+        )
     resolved = selected_stable and cheaper_resolved
     return {
         "decision_above_noise_floor": resolved,

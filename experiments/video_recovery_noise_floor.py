@@ -340,7 +340,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "noise_floor_rule": "abs(full-compressed mean) > 2 * max(full std, compressed std)",
         "threshold_decision_rule": (
             "selected high-fidelity tier passes every metric in 5/5 paired repeats and every "
-            "cheaper high-fidelity tier rejected by n=5 fails at least one metric in 5/5 repeats"
+            "cheaper high-fidelity tier has binary threshold probabilities for every metric "
+            "and fails at least one metric in 5/5 paired repeats"
         ),
         "quality_thresholds": [0.95, 0.975, 0.99],
         "visual_sanity_variants": ["baseline", "full", "fp16", "int8", "spatial_down2"],

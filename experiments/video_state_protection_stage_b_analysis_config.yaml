@@ -30,6 +30,7 @@
     "repeated_resumes_per_cell": 5,
     "above_noise_multiplier": 2.0,
     "minimum_stable_repeat_pass_fraction": 1.0,
+    "cheaper_tier_resolution_rule": "all_metric_threshold_probabilities_are_binary_and_at_least_one_metric_fails_5_of_5",
     "quality_thresholds": [0.95, 0.975, 0.99]
   },
   "simple_policies": {
