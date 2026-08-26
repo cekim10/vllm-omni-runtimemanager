@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 
+from experiments import video_denoising_error_correction_killtest as killtest
 from experiments.video_denoising_error_correction_killtest import (
     ERROR_FAMILIES,
     build_perturbations,
@@ -88,3 +90,24 @@ def test_smoke_gate_rejects_equal_behavior_and_accepts_type_dependence() -> None
 
     assert rejected["passing_cells"] == 0
     assert accepted["passing_cells"] == 1
+
+
+def test_quality_metrics_accept_numpy_video_arrays(monkeypatch: pytest.MonkeyPatch) -> None:
+    temporal = {
+        "temporal_shape_composite": 1.0,
+        "temporal_dynamic_composite": 1.0,
+        "motion_energy_ratio": 1.0,
+        "flow_magnitude_cosine": 1.0,
+        "flow_magnitude_ratio": 1.0,
+        "flow_direction_cosine": 1.0,
+        "flicker_similarity": 1.0,
+    }
+    monkeypatch.setattr(killtest.preflight, "_temporal_metrics", lambda video, baseline: temporal)
+    monkeypatch.setattr(killtest.preflight, "_spatial_metric", lambda video, baseline: 1.0)
+    baseline = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    video = np.ones_like(baseline) * 2
+
+    metrics = killtest._quality_metrics(video, baseline, "prompt", None, float("nan"))
+
+    assert metrics["video_mse_vs_uninterrupted"] == pytest.approx(4.0)
+    assert metrics["video_max_abs_diff_vs_uninterrupted"] == pytest.approx(2.0)

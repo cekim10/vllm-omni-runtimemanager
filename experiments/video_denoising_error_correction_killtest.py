@@ -682,7 +682,7 @@ def _quality_metrics(
     )
     delta = video.astype(np.float32) - baseline.astype(np.float32)
     return {
-        "video_mse_vs_uninterrupted": float(np.mean(delta.square())),
+        "video_mse_vs_uninterrupted": float(np.mean(np.square(delta))),
         "video_max_abs_diff_vs_uninterrupted": float(np.max(np.abs(delta))),
         "spatial_quality": preflight._spatial_metric(video, baseline),
         "temporal_shape_quality": temporal["temporal_shape_composite"],
