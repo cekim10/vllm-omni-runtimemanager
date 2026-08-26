@@ -100,6 +100,8 @@ FRONTIER_RAW_FIELDS = [
     "semantic_vs_full",
     "artifact_path",
     "serialized_artifact_dir",
+    "serialized_payload_sha256",
+    "serialized_metadata_sha256",
     "variant_metadata_json",
 ]
 
@@ -145,7 +147,8 @@ ISO_STORAGE_FIELDS = [
     "semantic_delta_mean",
     "semantic_delta_ci_low",
     "semantic_delta_ci_high",
-    "resolved_at_n5",
+    "resolved_at_seed_count",
+    "resolution_seed_count",
     "needs_extension_to_15",
 ]
 
@@ -644,6 +647,67 @@ def _extract_array(meta_component: dict[str, Any], payload: bytes) -> np.ndarray
     return array.reshape(shape).copy()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _decode_serialized_representation(
+    meta: dict[str, Any], payload: bytes, variant: str
+) -> torch.Tensor:
+    if meta.get("variant") != variant:
+        raise ValueError(f"Serialized variant mismatch: expected {variant}, got {meta.get('variant')}")
+    components = meta.get("components")
+    if not isinstance(components, list) or not components:
+        raise ValueError("Serialized metadata has no components")
+    expected_offset = 0
+    for component in components:
+        offset = int(component["offset"])
+        nbytes = int(component["nbytes"])
+        if offset != expected_offset or nbytes <= 0 or offset + nbytes > len(payload):
+            raise ValueError("Serialized component layout is invalid")
+        _extract_array(component, payload)
+        expected_offset += nbytes
+    if expected_offset != len(payload):
+        raise ValueError("Serialized payload has unaccounted bytes")
+
+    if variant in {"full", "fp16"}:
+        restored = torch.from_numpy(_extract_array(components[0], payload)).to(torch.float32)
+    elif variant == "int8":
+        q = _extract_array(components[0], payload).astype(np.float32)
+        scale = float(_extract_array(components[1], payload).reshape(-1)[0])
+        restored = torch.from_numpy(q * scale).to(torch.float32)
+    elif variant in {"spatial_down2", "temporal_down2"}:
+        loaded = torch.from_numpy(_extract_array(components[0], payload)).to(torch.float32)
+        restored = F.interpolate(
+            loaded,
+            size=tuple(int(value) for value in meta["original_shape"][2:]),
+            mode="trilinear",
+            align_corners=False,
+        ).to(torch.float32)
+    elif variant == "low_rank_25":
+        u_arr = torch.from_numpy(_extract_array(components[0], payload)).to(torch.float32)
+        s_arr = torch.from_numpy(_extract_array(components[1], payload)).to(torch.float32)
+        vh_arr = torch.from_numpy(_extract_array(components[2], payload)).to(torch.float32)
+        restored = ((u_arr * s_arr.unsqueeze(0)) @ vh_arr).reshape(
+            tuple(int(value) for value in meta["original_shape"])
+        )
+    else:
+        raise ValueError(f"Unsupported variant: {variant}")
+    if not torch.isfinite(restored).all():
+        raise ValueError("Decoded latent contains non-finite values")
+    return restored.to(torch.float32).contiguous()
+
+
+def _serialized_restored_shape(meta: dict[str, Any], variant: str) -> tuple[int, ...]:
+    if variant in {"full", "fp16", "int8"}:
+        return tuple(int(value) for value in meta["components"][0]["shape"])
+    return tuple(int(value) for value in meta["original_shape"])
+
+
 def _full_bytes(tensor: torch.Tensor) -> int:
     return int(tensor.nelement() * tensor.element_size())
 
@@ -831,13 +895,56 @@ def _load_cached_baseline(
         records = _load_probe_records_by_step(probe_meta)
         if probe_meta.get("label") != request_label:
             return None
+        if video.ndim != 4 or video.shape[0] != int(args.num_frames):
+            return None
+        if not np.isfinite(video).all():
+            return None
         for checkpoint_step in args.checkpoint_steps:
             record = records.get(int(checkpoint_step))
             if record is None or not record.get("latent_path") or not Path(record["latent_path"]).exists():
                 return None
+            latent = torch.load(record["latent_path"], map_location="cpu")
+            if not isinstance(latent, torch.Tensor) or latent.ndim != 5 or not torch.isfinite(latent).all():
+                return None
         return video, probe_meta, 0.0, _mean_abs_frame_diff(video)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError):
         return None
+
+
+def _validate_session_sources(
+    args: argparse.Namespace,
+    provenance: PromptProvenance,
+    rows: list[dict[str, Any]],
+    artifact_root: Path,
+) -> set[tuple[str, int]]:
+    entries = {str(entry["prompt_id"]): entry for entry in provenance.entries}
+    rows_by_session = _group_rows(rows, "prompt_id", "seed")
+    valid = set()
+    for prompt_id, seed_value in sorted(rows_by_session):
+        seed = int(seed_value)
+        artifact_dir = artifact_root / f"{prompt_id}_seed{seed}"
+        cached = _load_cached_baseline(args, entries[prompt_id], seed, artifact_dir)
+        if cached is None:
+            continue
+        _, probe_meta, _, _ = cached
+        records = _load_probe_records_by_step(probe_meta)
+        source_shapes = {
+            step: tuple(torch.load(records[step]["latent_path"], map_location="cpu").shape)
+            for step in {int(row["checkpoint_step"]) for row in rows_by_session[(prompt_id, seed_value)]}
+        }
+        try:
+            shapes_match = all(
+                _serialized_restored_shape(
+                    json.loads(row["variant_metadata_json"]), str(row["variant"])
+                )
+                == source_shapes[int(row["checkpoint_step"])]
+                for row in rows_by_session[(prompt_id, seed_value)]
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            shapes_match = False
+        if shapes_match:
+            valid.add((prompt_id, seed))
+    return valid
 
 
 def _compute_vs_full(rows: list[dict[str, Any]]) -> None:
@@ -910,6 +1017,13 @@ def _build_iso_storage_rows(
     bootstrap_samples: int,
     bootstrap_seed: int,
 ) -> list[dict[str, Any]]:
+    seed_counts = {
+        prompt_id: len({int(row["seed_index"]) for row in rows if row["prompt_id"] == prompt_id})
+        for prompt_id in {row["prompt_id"] for row in rows}
+    }
+    if len(set(seed_counts.values())) != 1:
+        raise ValueError(f"Inconsistent seed counts across prompts: {seed_counts}")
+    resolution_seed_count = next(iter(seed_counts.values()), 0)
     by_key = _group_rows(rows, "prompt_id", "seed", "checkpoint_step", "variant")
     output_rows = []
     for step in sorted({int(row["checkpoint_step"]) for row in rows}):
@@ -960,7 +1074,8 @@ def _build_iso_storage_rows(
                         "semantic_delta_mean": float("nan"),
                         "semantic_delta_ci_low": float("nan"),
                         "semantic_delta_ci_high": float("nan"),
-                        "resolved_at_n5": False,
+                        "resolved_at_seed_count": False,
+                        "resolution_seed_count": resolution_seed_count,
                         "needs_extension_to_15": False,
                     }
                 )
@@ -990,7 +1105,8 @@ def _build_iso_storage_rows(
                     "semantic_delta_mean": float(np.mean(deltas_semantic)),
                     "semantic_delta_ci_low": semlow,
                     "semantic_delta_ci_high": semhigh,
-                    "resolved_at_n5": resolved,
+                    "resolved_at_seed_count": resolved,
+                    "resolution_seed_count": resolution_seed_count,
                     "needs_extension_to_15": not resolved,
                 }
             )
@@ -1447,12 +1563,13 @@ def _validate_existing_frontier_rows(
     valid_prompt_ids = set(provenance.prompt_ids)
     valid_steps = {int(step) for step in args.checkpoint_steps}
     valid_variants = set(args.variants)
+    prompt_indexes = {prompt_id: index for index, prompt_id in enumerate(provenance.prompt_ids)}
     unique: dict[tuple[str, int, int, str], dict[str, Any]] = {}
     for row in rows:
         if row.get("prompt_set_sha256") != provenance.sha256 or row.get("model") != args.model:
             raise ValueError("Existing frontier_raw.csv was produced by a different prompt set or model")
         key = _row_key(row)
-        prompt_id, _, step, variant = key
+        prompt_id, seed, step, variant = key
         if prompt_id not in valid_prompt_ids or step not in valid_steps or variant not in valid_variants:
             continue
         artifact_path = Path(str(row.get("artifact_path", "")))
@@ -1460,13 +1577,48 @@ def _validate_existing_frontier_rows(
         payload_path = serialized_dir / f"{variant}.payload.bin"
         metadata_path = serialized_dir / f"{variant}.metadata.json"
         try:
+            seed_index = int(row["seed_index"])
+            expected_seed = int(args.seed_base) + prompt_indexes[prompt_id] * 1000 + seed_index
+            payload_size = payload_path.stat().st_size
+            metadata_size = metadata_path.stat().st_size
             valid_numeric_fields = (
-                int(row["total_checkpoint_bytes"]) > 0
+                seed == expected_seed
+                and seed_index >= 0
+                and int(row["total_steps"]) == int(args.num_inference_steps)
+                and math.isclose(
+                    float(row["progress_fraction"]), step / int(args.num_inference_steps)
+                )
+                and int(row["encoded_payload_bytes"]) == payload_size
+                and int(row["metadata_bytes"]) == metadata_size
+                and int(row["total_checkpoint_bytes"]) == payload_size + metadata_size
+                and int(row["total_checkpoint_bytes"]) > 0
                 and float(row["resume_latency_ms"]) > 0.0
                 and math.isfinite(float(row["spatial_metric_abs"]))
                 and math.isfinite(float(row["temporal_dynamic_composite_abs"]))
+                and math.isfinite(float(row["semantic_metric_abs"]))
+                and math.isfinite(float(row["spatial_vs_full"]))
+                and math.isfinite(float(row["temporal_dynamic_vs_full"]))
+                and math.isfinite(float(row["semantic_vs_full"]))
             )
-        except (KeyError, TypeError, ValueError):
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            recorded_metadata = json.loads(row["variant_metadata_json"])
+            if metadata != recorded_metadata:
+                valid_numeric_fields = False
+            payload = payload_path.read_bytes()
+            restored = _decode_serialized_representation(metadata, payload, variant)
+            if _full_bytes(restored) != int(row["raw_latent_bytes"]):
+                valid_numeric_fields = False
+            payload_hash = _sha256_file(payload_path)
+            metadata_hash = _sha256_file(metadata_path)
+            recorded_payload_hash = str(row.get("serialized_payload_sha256", ""))
+            recorded_metadata_hash = str(row.get("serialized_metadata_sha256", ""))
+            if recorded_payload_hash and recorded_payload_hash != payload_hash:
+                valid_numeric_fields = False
+            if recorded_metadata_hash and recorded_metadata_hash != metadata_hash:
+                valid_numeric_fields = False
+            row["serialized_payload_sha256"] = payload_hash
+            row["serialized_metadata_sha256"] = metadata_hash
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError, RuntimeError):
             valid_numeric_fields = False
         if (
             not artifact_path.is_file()
@@ -1806,7 +1958,7 @@ def _write_report(
             f" mismatch=`{float(row['mean_relative_byte_mismatch']):.4f}`"
             f", dynamic_delta=`{float(row['dynamic_delta_mean']):.4f}`"
             f", CI=[`{float(row['dynamic_delta_ci_low']):.4f}`, `{float(row['dynamic_delta_ci_high']):.4f}`]"
-            f", resolved=`{row['resolved_at_n5']}`"
+            f", resolved=`{row['resolved_at_seed_count']}` at seeds=`{row['resolution_seed_count']}`"
         )
     lines.extend(["", "## Minimum Safe Representation", ""])
     sample_rows = [row for row in min_safe_rows if float(row["quality_target"]) == 0.95][:12]
@@ -1931,7 +2083,22 @@ def _analyze_and_write_results(
             bootstrap_seed=int(args.bootstrap_seed),
         )
     else:
-        judgment, judgment_details = _final_judgment(iso_rows, min_safe_rows, separability_rows, budget_rows)
+        judgment = "ANALYSIS-PENDING"
+        judgment_details = {
+            "completed_sessions": len(session_keys),
+            "note": (
+                "The embedded legacy analysis is descriptive only. Run the preregistered fixed-state "
+                "noise-floor experiment and experiments/video_state_protection_analysis.py before "
+                "issuing STRONG GO, CONDITIONAL GO, or NO-GO."
+            ),
+            "invalidated_legacy_outputs": [
+                "iso_storage_frontier.csv confidence intervals",
+                "minimum_safe_representation.csv n=5 resolution labels",
+                "separability_analysis.csv",
+                "interaction_crossings.csv",
+                "budget_simulation.csv",
+            ],
+        }
 
     _write_csv_atomic(output_dir / "frontier_raw.csv", FRONTIER_RAW_FIELDS, frontier_rows)
     _write_csv(output_dir / "checkpoint_sizes.csv", CHECKPOINT_SIZE_FIELDS, checkpoint_rows)
@@ -1954,6 +2121,9 @@ def _analyze_and_write_results(
         "frontier_summary": frontier_summary,
         "judgment": judgment,
         "judgment_details": judgment_details,
+        "analysis_validity": (
+            "screening_only" if mode == "screening" else "descriptive_legacy_not_for_final_claims"
+        ),
         "execution_mode": mode,
         "smoke_only": bool(args.smoke_only),
         "executed_prompt_count": executed_prompt_count,
@@ -2017,6 +2187,22 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
         args=args,
         provenance=provenance,
     )
+    represented_sources = {(str(row["prompt_id"]), int(row["seed"])) for row in frontier_rows}
+    valid_represented_sources = _validate_session_sources(
+        args, provenance, frontier_rows, frontier_artifact_dir
+    )
+    invalid_represented_sources = represented_sources - valid_represented_sources
+    if invalid_represented_sources:
+        frontier_rows = [
+            row
+            for row in frontier_rows
+            if (str(row["prompt_id"]), int(row["seed"])) not in invalid_represented_sources
+        ]
+        print(
+            f"[killtest] invalidated {len(invalid_represented_sources)} resumed session(s) "
+            "with missing/corrupt source trajectory artifacts",
+            flush=True,
+        )
     frontier_rows.sort(key=_row_key)
     if args.resume:
         _write_csv_atomic(raw_csv_path, FRONTIER_RAW_FIELDS, frontier_rows)
@@ -2172,6 +2358,12 @@ def run_killtest(args: argparse.Namespace) -> dict[str, Any]:
                                 "semantic_vs_full": float("nan"),
                                 "artifact_path": str(artifact_path),
                                 "serialized_artifact_dir": str(encoded.artifact_dir),
+                                "serialized_payload_sha256": _sha256_file(
+                                    encoded.artifact_dir / f"{variant}.payload.bin"
+                                ),
+                                "serialized_metadata_sha256": _sha256_file(
+                                    encoded.artifact_dir / f"{variant}.metadata.json"
+                                ),
                                 "variant_metadata_json": json.dumps(encoded.metadata, sort_keys=True),
                             }
                         )

@@ -1,0 +1,75 @@
+{
+  "status": "preregistered_before_stage_b_n5_analysis",
+  "raw_frontier": {
+    "prompts": 12,
+    "seeds_per_prompt": 5,
+    "checkpoint_steps": [10, 20, 30],
+    "representations": ["full", "fp16", "int8", "spatial_down2", "temporal_down2", "low_rank_25"],
+    "expected_rows": 1080
+  },
+  "statistical_units": {
+    "within_prompt": "seed",
+    "aggregate_population": "prompt",
+    "aggregate_ci": "percentile_bootstrap_over_prompt_level_effects",
+    "bootstrap_samples": 5000,
+    "bootstrap_seed": 7
+  },
+  "iso_storage": {
+    "maximum_relative_byte_mismatch": 0.05,
+    "resolved_ci_rule": "95pct_prompt_bootstrap_ci_excludes_zero"
+  },
+  "minimum_safe_representation": {
+    "quality_targets": [0.95, 0.975, 0.99],
+    "safe_rule": "lower_within_prompt_seed_bootstrap_95pct_ci_meets_all_three_metrics",
+    "selection": "minimum_actual_serialized_checkpoint_bytes"
+  },
+  "noise_floor": {
+    "prompt_ids": ["recovery_000", "recovery_004", "recovery_006"],
+    "checkpoint_steps": [10, 20, 30],
+    "representations": ["full", "fp16", "int8"],
+    "repeated_resumes_per_cell": 5,
+    "above_noise_multiplier": 2.0,
+    "minimum_stable_repeat_pass_fraction": 1.0,
+    "quality_thresholds": [0.95, 0.975, 0.99]
+  },
+  "simple_policies": {
+    "separability_evaluation": "leave_one_prompt_out",
+    "budget_evaluation": "one_global_model_per_target_fit_on_all_measured_prompts",
+    "budget_policy_status": "privileged_oracle_feature_upper_bound_not_deployable",
+    "privileged_feature": "content_complexity_computed_from_final_baseline_video",
+    "content_complexity_bins": 3,
+    "maximum_training_quality_violation_rate": 0.05,
+    "simple_separable_form": "monotonic_progress_rank_plus_content_bin_offset"
+  },
+  "interaction_crossing": {
+    "minimum_noise_resolved_steps_for_pair": 2,
+    "seed_confidence_method": "independent_two_way_seed_bootstrap"
+  },
+  "budget_simulation": {
+    "session_counts": [3, 8, 20],
+    "budget_fractions_of_all_full": [0.25, 0.5, 0.75],
+    "trials": 200,
+    "random_seed": 7,
+    "mixtures": ["target_0.95", "target_0.975", "target_0.99", "mixed_targets"],
+    "policies": ["full", "uniform_int8", "progress_only", "content_only", "simple_separable", "joint_oracle"]
+  },
+  "judgment": {
+    "strong_iso_minimum_resolved_cells": 3,
+    "strong_iso_minimum_absolute_dynamic_delta": 0.10,
+    "heterogeneity_minimum_progress_change_fraction": 0.25,
+    "heterogeneity_minimum_representations_in_content_cell": 2,
+    "noise_minimum_measured_99pct_decisions": 6,
+    "noise_minimum_stable_99pct_decision_fraction": 0.75,
+    "noise_minimum_stable_99pct_representations": 2,
+    "effect_not_confined_to_99pct_minimum_mean_relative_oracle_gap": 0.10,
+    "strong_gap_minimum_relative_improvement": 0.15,
+    "strong_gap_minimum_budget_levels": 2,
+    "strong_gap_minimum_mixtures": 2,
+    "strong_gap_minimum_session_counts": 2,
+    "conditional_gap_minimum_relative_improvement": 0.05,
+    "conditional_gap_minimum_budget_levels": 1,
+    "conditional_gap_minimum_mixtures": 2,
+    "conditional_gap_minimum_session_counts": 2,
+    "runtime_design_forbidden_unless": "STRONG GO"
+  }
+}
