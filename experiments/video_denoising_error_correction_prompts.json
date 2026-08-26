@@ -1,0 +1,17 @@
+[
+  {
+    "prompt_id": "correction_000",
+    "motion_category": "stable_camera_human_motion",
+    "prompt": "A person walks steadily along a tree-lined sidewalk while the camera remains fixed, with clear full-body motion and natural daylight."
+  },
+  {
+    "prompt_id": "correction_001",
+    "motion_category": "camera_motion",
+    "prompt": "A slow cinematic camera pan follows a red bicycle moving past storefronts on a city street."
+  },
+  {
+    "prompt_id": "correction_002",
+    "motion_category": "fast_complex_motion",
+    "prompt": "Two street dancers perform fast crossing spins under bright plaza lights while loose clothing moves dynamically."
+  }
+]

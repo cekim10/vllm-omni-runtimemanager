@@ -1,0 +1,90 @@
+from __future__ import annotations
+
+import pytest
+import torch
+
+from experiments.video_denoising_error_correction_killtest import (
+    ERROR_FAMILIES,
+    build_perturbations,
+    contraction_statistics,
+    latent_error,
+    smoke_gate,
+)
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
+
+
+def _latent() -> torch.Tensor:
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    return torch.randn((1, 4, 9, 12, 16), generator=generator)
+
+
+def test_perturbations_are_iso_error_matched() -> None:
+    latent = _latent()
+    perturbations = build_perturbations(latent, random_seed=11, matching_tolerance=0.05)
+
+    assert len(perturbations) == 8
+    assert {item.family for item in perturbations} == set(ERROR_FAMILIES)
+    for strength in ("small", "medium"):
+        selected = [item for item in perturbations if item.strength == strength]
+        target = selected[0].target_normalized_l2
+        target_mse = selected[0].target_mse
+        assert all(item.relative_mismatch <= 0.05 for item in selected)
+        assert all(item.actual_normalized_l2 == pytest.approx(target, rel=0.05) for item in selected)
+        assert all(item.actual_mse == pytest.approx(target_mse, rel=0.05) for item in selected)
+    small = next(item for item in perturbations if item.family == "quantization" and item.strength == "small")
+    medium = next(item for item in perturbations if item.family == "quantization" and item.strength == "medium")
+    assert small.quantization_bits == 8
+    assert medium.quantization_bits == 4
+    assert medium.actual_normalized_l2 > small.actual_normalized_l2
+
+
+def test_latent_error_reports_normalized_l2_and_cosine() -> None:
+    reference = torch.ones((1, 1, 2, 2, 2))
+    candidate = reference + 0.25
+
+    metrics = latent_error(reference, candidate)
+
+    assert metrics["mse"] == pytest.approx(0.25**2)
+    assert metrics["normalized_l2"] == pytest.approx(0.25)
+    assert metrics["cosine_similarity"] == pytest.approx(1.0)
+
+
+def test_contraction_statistics_requires_persistent_half_life() -> None:
+    monotonic = contraction_statistics([1.0, 0.8, 0.49, 0.3])
+    unstable = contraction_statistics([1.0, 0.4, 0.8, 0.3])
+
+    assert monotonic["contraction_fraction"] == pytest.approx(0.7)
+    assert monotonic["first_half_step"] == 2
+    assert monotonic["persistent_half_life_steps"] == 2
+    assert monotonic["correctability_class"] == "highly_correctable"
+    assert unstable["first_half_step"] == 1
+    assert unstable["persistent_half_life_steps"] is None
+
+
+def test_smoke_gate_rejects_equal_behavior_and_accepts_type_dependence() -> None:
+    def rows(quant_contraction: float, structural_contraction: float, quant_dynamic: float, structural_dynamic: float):
+        output = []
+        for family in ERROR_FAMILIES:
+            structured = family in {"spatial_lowpass", "temporal_lowpass"}
+            output.append(
+                {
+                    "prompt_id": "correction_000",
+                    "checkpoint_step": 20,
+                    "error_strength": "small",
+                    "error_family": family,
+                    "relative_error_mismatch": 0.01,
+                    "relative_mse_mismatch": 0.01,
+                    "contraction_fraction": structural_contraction if structured else quant_contraction,
+                    "temporal_dynamic_quality_vs_exact_resume": (
+                        structural_dynamic if structured else quant_dynamic
+                    ),
+                }
+            )
+        return output
+
+    rejected = smoke_gate(rows(0.20, 0.20, 0.90, 0.90), 0.05)
+    accepted = smoke_gate(rows(0.65, 0.20, 0.98, 0.80), 0.05)
+
+    assert rejected["passing_cells"] == 0
+    assert accepted["passing_cells"] == 1
