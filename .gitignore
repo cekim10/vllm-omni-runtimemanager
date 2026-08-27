@@ -239,6 +239,7 @@ data/
 datasets/
 *.csv
 *.json
+!experiments/video_propagation_aware_checkpoint_prompts.json
 !experiments/video_denoising_error_correction_prompts.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
