@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from experiments import video_denoising_error_correction_killtest as killtest
+from experiments.video_exact_resume_repeat_control import classify_control
 from experiments.video_denoising_error_correction_killtest import (
     ERROR_FAMILIES,
     build_perturbations,
@@ -111,3 +112,23 @@ def test_quality_metrics_accept_numpy_video_arrays(monkeypatch: pytest.MonkeyPat
 
     assert metrics["video_mse_vs_uninterrupted"] == pytest.approx(4.0)
     assert metrics["video_max_abs_diff_vs_uninterrupted"] == pytest.approx(2.0)
+
+
+def test_exact_repeat_control_distinguishes_resume_mismatch_from_noise_floor() -> None:
+    stable = classify_control(
+        [1e-7, 2e-7, 1.5e-7],
+        small_initial_error=0.01,
+        medium_initial_error=0.20,
+        uninterrupted_resume_error=0.12,
+    )
+    noisy = classify_control(
+        [0.10, 0.12, 0.11],
+        small_initial_error=0.01,
+        medium_initial_error=0.20,
+        uninterrupted_resume_error=0.12,
+    )
+
+    assert stable["diagnosis"] == "RESUME-PATH MISMATCH"
+    assert stable["small_error_materially_confounded"] is False
+    assert noisy["diagnosis"] == "SMALL-ERROR NOISE FLOOR DOMINATES"
+    assert noisy["small_error_noise_floor_dominates"] is True
