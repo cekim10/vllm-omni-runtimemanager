@@ -11,7 +11,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 
 def _latent() -> torch.Tensor:
-    return torch.linspace(-2.0, 2.0, 1 * 8 * 3 * 4 * 4).reshape(1, 8, 3, 4, 4)
+    return torch.linspace(-2.0, 2.0, 1 * 8 * 5 * 4 * 4).reshape(1, 8, 5, 4, 4)
 
 
 @pytest.mark.parametrize("bits", [2, 4, 8])
@@ -143,3 +143,5 @@ def test_probe_directions_cover_required_families() -> None:
     directions = killtest.build_probe_directions(_latent(), [4, 8])
     families = {item[0] for item in directions}
     assert families == {"channel", "tile", "temporal_frequency", "spatial_frequency"}
+    assert sum(item[0] == "temporal_frequency" for item in directions) == 3
+    assert sum(item[0] == "spatial_frequency" for item in directions) == 3
