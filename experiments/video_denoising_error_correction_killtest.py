@@ -106,6 +106,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=16.0)
     parser.add_argument("--flow-shift", type=float, default=12.0)
     parser.add_argument("--boundary-ratio", type=float, default=0.875)
+    parser.add_argument("--sample-solver", choices=("unipc", "euler"), default="unipc")
+    parser.add_argument(
+        "--require-exact-resume",
+        action="store_true",
+        help="Abort before perturbation runs if uninterrupted and resumed trajectories differ.",
+    )
+    parser.add_argument("--exact-resume-tolerance", type=float, default=1e-6)
     parser.add_argument("--enable-cpu-offload", action="store_true")
     parser.add_argument("--enable-layerwise-offload", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -467,6 +474,7 @@ def _probe_sampling(
         remaining = args.num_inference_steps - checkpoint_step
         sampling.extra_args = {
             "flow_shift": args.flow_shift,
+            "sample_solver": args.sample_solver,
             "trajectory_probe": {
                 "artifact_dir": str(artifact_dir),
                 "request_label": label,
@@ -477,7 +485,24 @@ def _probe_sampling(
                 "save_mp4": False,
             },
         }
+    sampling.extra_args = dict(sampling.extra_args or {})
+    sampling.extra_args["sample_solver"] = args.sample_solver
     return sampling
+
+
+def _require_exact_resume(
+    trajectory_rows: list[dict[str, Any]],
+    quality: dict[str, float],
+    tolerance: float,
+) -> None:
+    max_latent_error = max(float(row["normalized_l2"]) for row in trajectory_rows)
+    video_mse = float(quality["video_mse_vs_uninterrupted"])
+    if max_latent_error > tolerance or video_mse > tolerance:
+        raise RuntimeError(
+            "Exact-resume validation failed before perturbation runs: "
+            f"max trajectory normalized L2={max_latent_error:.6g}, "
+            f"video MSE={video_mse:.6g}, tolerance={tolerance:.6g}."
+        )
 
 
 def _run_with_probe(
@@ -949,6 +974,9 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
         "fps": args.fps,
         "flow_shift": args.flow_shift,
         "boundary_ratio": args.boundary_ratio,
+        "sample_solver": args.sample_solver,
+        "require_exact_resume": args.require_exact_resume,
+        "exact_resume_tolerance": args.exact_resume_tolerance,
         "enable_cpu_offload": args.enable_cpu_offload,
         "enable_layerwise_offload": args.enable_layerwise_offload,
         "semantic_metric": {
@@ -1030,6 +1058,12 @@ def run_experiment(args: argparse.Namespace) -> dict[str, Any]:
                 exact_trajectory = _reference_trajectory_rows(
                     entry, seed, checkpoint_step, baseline_meta, exact_meta
                 )
+                if args.require_exact_resume:
+                    _require_exact_resume(
+                        exact_trajectory,
+                        exact_quality,
+                        args.exact_resume_tolerance,
+                    )
                 reference_trajectory_rows.extend(exact_trajectory)
                 reference_validation.append(
                     {

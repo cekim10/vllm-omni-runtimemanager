@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import argparse
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -112,6 +115,47 @@ def test_quality_metrics_accept_numpy_video_arrays(monkeypatch: pytest.MonkeyPat
 
     assert metrics["video_mse_vs_uninterrupted"] == pytest.approx(4.0)
     assert metrics["video_max_abs_diff_vs_uninterrupted"] == pytest.approx(2.0)
+
+
+def test_probe_sampling_propagates_euler_solver(monkeypatch: pytest.MonkeyPatch) -> None:
+    sampling = SimpleNamespace(extra_args={"flow_shift": 12.0})
+    monkeypatch.setattr(
+        killtest.protection,
+        "_build_probe_sampling_params",
+        lambda *args, **kwargs: sampling,
+    )
+    args = argparse.Namespace(
+        num_inference_steps=40,
+        fps=16.0,
+        flow_shift=12.0,
+        sample_solver="euler",
+    )
+
+    result = killtest._probe_sampling(
+        args,
+        seed=1234,
+        latents=None,
+        checkpoint_step=0,
+        artifact_dir=killtest.Path("/tmp/probe"),
+        label="euler-probe",
+    )
+
+    assert result.extra_args["sample_solver"] == "euler"
+
+
+def test_require_exact_resume_rejects_trajectory_mismatch() -> None:
+    with pytest.raises(RuntimeError, match="Exact-resume validation failed"):
+        killtest._require_exact_resume(
+            [{"normalized_l2": 0.0}, {"normalized_l2": 0.1}],
+            {"video_mse_vs_uninterrupted": 0.0},
+            tolerance=1e-6,
+        )
+
+    killtest._require_exact_resume(
+        [{"normalized_l2": 0.0}],
+        {"video_mse_vs_uninterrupted": 0.0},
+        tolerance=1e-6,
+    )
 
 
 def test_exact_repeat_control_distinguishes_resume_mismatch_from_noise_floor() -> None:
