@@ -239,6 +239,11 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("Checkpoint steps must remain [10, 20, 30]")
     if config["generation"]["num_inference_steps"] != 40:
         raise ValueError("Discovery is frozen to 40 Euler steps")
+    if (
+        config["corruption"].get("spatial_contiguous_definition")
+        != "compact_center_region_plus_deterministic_axis_fringe_v1"
+    ):
+        raise ValueError("Spatial contiguous geometry definition changed")
     expected_generation = {
         "height": 480,
         "width": 832,
@@ -333,11 +338,15 @@ def tensor_invariants(clean: np.ndarray, candidate: np.ndarray, *, require_diffe
     }
 
 
-def _rectangle_for_cells(height: int, width: int, cells: int) -> tuple[int, int]:
-    candidates = [(h, cells // h) for h in range(1, height + 1) if cells % h == 0 and cells // h <= width]
-    if not candidates:
-        raise ValueError(f"Cannot represent {cells} spatial cells as one rectangle in {height}x{width}")
-    return min(candidates, key=lambda item: abs(item[0] / item[1] - height / width))
+def _compact_spatial_order(height: int, width: int) -> np.ndarray:
+    """Order spatial cells from the center out with deterministic ties."""
+    rows, columns = np.indices((height, width), dtype=np.float64)
+    row_center = (height - 1) / 2
+    column_center = (width - 1) / 2
+    # Normalize each axis so the selected prefix is compact in image space
+    # rather than being biased toward the longer latent dimension.
+    distance = ((rows - row_center) / max(height, 1)) ** 2 + ((columns - column_center) / max(width, 1)) ** 2
+    return np.lexsort((columns.reshape(-1), rows.reshape(-1), distance.reshape(-1)))
 
 
 def build_missing_mask(
@@ -378,10 +387,17 @@ def build_missing_mask(
         mask[:, :channel_slices, :, :, :] = True
     elif geometry == "spatial_contiguous":
         denominator = batch * channels * temporal
-        if target_elements % denominator:
-            raise ValueError("Spatial loss cannot form a full-axis rectangle at requested cardinality")
-        rect_h, rect_w = _rectangle_for_cells(height, width, target_elements // denominator)
-        mask[..., :rect_h, :rect_w] = True
+        full_cells, fringe_elements = divmod(target_elements, denominator)
+        spatial_order = _compact_spatial_order(height, width)
+        if full_cells >= spatial_order.size:
+            raise ValueError("Spatial loss must retain at least one spatial cell")
+        per_axis = mask.reshape(denominator, height * width)
+        per_axis[:, spatial_order[:full_cells]] = True
+        if fringe_elements:
+            # Exact iso-byte cardinality is impossible using only complete
+            # B/C/T prisms when target_elements is not divisible by B*C*T.
+            # Put the unavoidable remainder on the next compact boundary cell.
+            per_axis[:fringe_elements, spatial_order[full_cells]] = True
     elif geometry == "block_interleaved":
         canonical = coordinates.transpose(0, 2, 3, 4, 1).reshape(-1)
         if size % block_elements or target_elements % block_elements:
@@ -719,6 +735,9 @@ def prepare_condition(
                 if name == "block_interleaved"
                 else None
             ),
+            "spatial_mapping": (
+                config["corruption"]["spatial_contiguous_definition"] if name == "spatial_contiguous" else None
+            ),
         }
         prepared = _save_candidate(clean, restored, spec, directory, metadata)
         prepared.artifact_paths.append(str(mask_path))
@@ -809,8 +828,27 @@ def run_cpu_corruption_gates() -> dict[str, Any]:
     if np.flatnonzero(channel.any(axis=(0, 2, 3, 4))).tolist() != [0]:
         raise AssertionError("Channel mask is not exactly one complete C slice")
     spatial = masks["spatial_contiguous"]
-    if not spatial[..., :2, :2].all() or spatial[..., 2:, :].any() or spatial[..., :, 2:].any():
-        raise AssertionError("Spatial mask does not select the intended 2x2 rectangle")
+    if not spatial[..., 1:3, 1:3].all() or int(spatial.sum()) != target:
+        raise AssertionError("Spatial mask does not select the intended compact center region")
+    real_shape = (1, 16, 9, 60, 104)
+    real_target = 1 * 16 * 2 * 60 * 104
+    real_spatial = build_missing_mask(
+        real_shape,
+        "spatial_contiguous",
+        target_elements=real_target,
+        seed=41,
+        temporal_slices=2,
+        channel_slices=4,
+        block_elements=16,
+    )
+    counts_by_spatial_cell = real_spatial.reshape(1 * 16 * 9, 60 * 104).sum(axis=0)
+    full_cells, fringe_elements = divmod(real_target, 1 * 16 * 9)
+    if (
+        int(real_spatial.sum()) != real_target
+        or int(np.count_nonzero(counts_by_spatial_cell == 1 * 16 * 9)) != full_cells
+        or int(np.count_nonzero(counts_by_spatial_cell == fringe_elements)) != 1
+    ):
+        raise AssertionError("Real Wan latent spatial mask failed exact compact-plus-fringe cardinality")
     if np.array_equal(masks["block_interleaved"], masks["random_missing"]):
         raise AssertionError("Deterministic block and random layouts unexpectedly coincide")
     if not np.array_equal(
@@ -855,6 +893,9 @@ def run_cpu_corruption_gates() -> dict[str, Any]:
         "shape": list(clean.shape),
         "mask_cardinality": {name: int(mask.sum()) for name, mask in masks.items()},
         "mask_sha256": {name: array_sha256(mask) for name, mask in masks.items()},
+        "real_shape_spatial_cardinality": int(real_spatial.sum()),
+        "real_shape_spatial_full_cells": full_cells,
+        "real_shape_spatial_fringe_elements": fringe_elements,
         "quantization_changed": {
             "fp16": int(np.count_nonzero(fp16 != clean)),
             "int8": int(np.count_nonzero(int8 != clean)),

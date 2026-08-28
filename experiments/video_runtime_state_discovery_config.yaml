@@ -1,5 +1,5 @@
 {
-  "experiment_version": "video-runtime-state-discovery-v1",
+  "experiment_version": "video-runtime-state-discovery-v2",
   "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
   "model_revision": null,
   "prompt_set": "experiments/video_recovery_prompt_set.json",
@@ -42,6 +42,7 @@
     "temporal_missing_slices": 2,
     "channel_missing_slices": 4,
     "block_elements": 16,
+    "spatial_contiguous_definition": "compact_center_region_plus_deterministic_axis_fringe_v1",
     "int8_levels": 127,
     "int4_levels": 7,
     "low_rank_ratio": 0.24305555555555555,

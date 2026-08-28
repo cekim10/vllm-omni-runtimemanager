@@ -48,9 +48,11 @@ def test_semantic_axis_masks_and_cardinality() -> None:
     temporal = _mask("temporal_contiguous")
     channel = _mask("channel_contiguous")
     assert int(spatial.sum()) == int(temporal.sum()) == int(channel.sum()) == 64
-    assert spatial[..., :2, :2].all()
-    assert not spatial[..., 2:, :].any()
-    assert not spatial[..., :, 2:].any()
+    assert spatial[..., 1:3, 1:3].all()
+    assert not spatial[..., :1, :].any()
+    assert not spatial[..., 3:, :].any()
+    assert not spatial[..., :, :1].any()
+    assert not spatial[..., :, 3:].any()
     assert np.flatnonzero(temporal.any(axis=(0, 1, 3, 4))).tolist() == [0]
     assert temporal[:, :, 0].all() and not temporal[:, :, 1:].any()
     assert np.flatnonzero(channel.any(axis=(0, 2, 3, 4))).tolist() == [0]
@@ -65,6 +67,26 @@ def test_block_interleaving_is_distributed_and_exact() -> None:
     assert len(affected_t) > 1
     assert len(affected_h) > 1
     assert not np.array_equal(mask, _mask("spatial_contiguous"))
+
+
+def test_spatial_mask_matches_real_wan_cardinality_with_one_boundary_fringe() -> None:
+    shape = (1, 16, 9, 60, 104)
+    target = 1 * 16 * 2 * 60 * 104
+    mask = build_missing_mask(
+        shape,
+        "spatial_contiguous",
+        target_elements=target,
+        seed=7,
+        temporal_slices=2,
+        channel_slices=4,
+        block_elements=16,
+    )
+    per_spatial_cell = mask.reshape(1 * 16 * 9, 60 * 104).sum(axis=0)
+    full_cells, fringe_elements = divmod(target, 1 * 16 * 9)
+    assert int(mask.sum()) == target
+    assert np.count_nonzero(per_spatial_cell == 1 * 16 * 9) == full_cells
+    assert np.count_nonzero(per_spatial_cell == fringe_elements) == 1
+    assert np.count_nonzero(per_spatial_cell) == full_cells + 1
 
 
 def test_random_mask_is_deterministic_and_rng_independent() -> None:
