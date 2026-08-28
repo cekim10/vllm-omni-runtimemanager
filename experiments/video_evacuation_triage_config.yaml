@@ -1,0 +1,52 @@
+{
+  "status": "preregistered_before_evacuation_triage_killtest",
+  "input_frontier": "results/video_state_protection_killtest_gpu0/run/frontier_raw.csv",
+  "reference_shape": {"height": 480, "width": 832, "frames": 33},
+  "shape_catalog": [
+    {"name": "480p_short", "height": 480, "width": 832, "frames": 33},
+    {"name": "480p_long", "height": 480, "width": 832, "frames": 81},
+    {"name": "720p_medium", "height": 720, "width": 1280, "frames": 81},
+    {"name": "720p_long", "height": 720, "width": 1280, "frames": 161}
+  ],
+  "session_counts": [8, 32, 128, 512],
+  "deadlines_sec": [5, 30, 120],
+  "realistic_deadlines_sec": [30, 120],
+  "bandwidth_gbps": [1, 10, 25],
+  "realistic_bandwidth_gbps": [10, 25],
+  "quality_targets": [0.95, 0.975, 0.99],
+  "primary_quality_target": 0.95,
+  "trials": 200,
+  "random_seed": 7,
+  "fixed_remote_write_latency_ms": 2.0,
+  "base_denoising_step_ms": 5800.0,
+  "quality_rule": "all five measured seeds meet spatial, temporal_dynamic, and semantic relative-to-full target",
+  "cost_model": {
+    "latent_channels": 16,
+    "spatial_compression": 8,
+    "temporal_compression": 4,
+    "scaling": "measured reference-shape D2H, encode, payload bytes scaled linearly by latent elements",
+    "transfer": "payload_bytes * 8 / bandwidth",
+    "warning": "Non-reference shapes are model-based extrapolations, not measured costs."
+  },
+  "policies": [
+    "full_fifo",
+    "uniform_int8_fifo",
+    "uniform_int8_progress",
+    "uniform_int8_value_density",
+    "minimum_safe_fifo",
+    "minimum_safe_value_density",
+    "fractional_oracle_upper_bound"
+  ],
+  "judgment": {
+    "strong_gap_minimum_relative_saved_work": 0.15,
+    "conditional_gap_minimum_relative_saved_work": 0.05,
+    "minimum_realistic_cells_with_strong_gap": 4,
+    "minimum_distinct_realistic_deadlines_with_strong_gap": 2,
+    "minimum_distinct_session_counts_with_strong_gap": 2,
+    "trivial_all_saved_fraction": 0.95,
+    "no_go_if_realistic_primary_cells_trivial_fraction_gte": 0.90,
+    "primary_comparison": "minimum_safe_value_density_vs_fractional_oracle_upper_bound",
+    "note": "The fractional oracle overstates achievable integral benefit. A small gap is a valid NO-GO; a large gap requires an exact follow-up."
+  }
+}
+
