@@ -1,0 +1,72 @@
+{
+  "experiment_version": "video-runtime-state-discovery-v1",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "prompt_set": "experiments/video_recovery_prompt_set.json",
+  "prompt_ids": [
+    "recovery_000", "recovery_002", "recovery_003", "recovery_004",
+    "recovery_005", "recovery_006", "recovery_008", "recovery_009",
+    "recovery_010", "recovery_011", "recovery_012", "recovery_013"
+  ],
+  "generation_seeds": {
+    "recovery_000": 1234,
+    "recovery_002": 3234,
+    "recovery_003": 4234,
+    "recovery_004": 5234,
+    "recovery_005": 6234,
+    "recovery_006": 7234,
+    "recovery_008": 9234,
+    "recovery_009": 10234,
+    "recovery_010": 11234,
+    "recovery_011": 12234,
+    "recovery_012": 13234,
+    "recovery_013": 14234
+  },
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875,
+    "checkpoint_steps": [10, 20, 30]
+  },
+  "corruption": {
+    "temporal_missing_slices": 2,
+    "channel_missing_slices": 4,
+    "block_elements": 16,
+    "int8_levels": 127,
+    "int4_levels": 7,
+    "low_rank_ratio": 0.24305555555555555,
+    "iso_error_relative_tolerance": 0.01,
+    "iso_storage_relative_tolerance": 0.02,
+    "staleness_relative_tolerance": 0.05
+  },
+  "discovery_flags": {
+    "ordering_reversal_quality_delta": 0.05,
+    "error_equivalence_quality_delta": 0.10,
+    "storage_equivalence_quality_delta": 0.10,
+    "staleness_quality_delta": 0.10
+  },
+  "conditions": [
+    "full_direct", "full_disk",
+    "fp16", "int8", "int4_like",
+    "spatial_down2", "temporal_down2", "low_rank_25",
+    "spatial_contiguous", "temporal_contiguous", "channel_contiguous",
+    "block_interleaved", "random_missing",
+    "gaussian_matched_int8", "gaussian_matched_random_missing",
+    "stale_1", "stale_2"
+  ],
+  "smoke_conditions": [
+    "full_direct", "full_disk", "fp16", "int8", "spatial_down2",
+    "random_missing", "temporal_contiguous", "block_interleaved",
+    "gaussian_matched_int8", "stale_1"
+  ]
+}

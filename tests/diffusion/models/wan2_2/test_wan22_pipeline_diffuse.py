@@ -153,3 +153,32 @@ def test_diffuse_runs_prediction_and_scheduler_for_each_timestep() -> None:
         (3.0, 3, 28.0, False),
     ]
     assert torch.equal(result, torch.full_like(latents, 10.0))
+
+
+def test_trajectory_probe_records_resolved_scheduler_identity(tmp_path) -> None:
+    pipeline = _make_pipeline()
+    req = SimpleNamespace(
+        request_id="probe-request",
+        prompts=["prompt"],
+        sampling_params=SimpleNamespace(
+            extra_args={
+                "trajectory_probe": {
+                    "artifact_dir": str(tmp_path),
+                    "capture_steps": [0, 2],
+                    "save_decoded": False,
+                    "save_latents": False,
+                    "save_mp4": False,
+                }
+            },
+            resolved_frame_rate=None,
+            fps=16.0,
+            seed=1234,
+        ),
+    )
+
+    state = pipeline._build_trajectory_probe_state(req, torch.tensor([9, 5]))
+
+    assert state is not None
+    assert state["sample_solver"] == "unipc"
+    assert state["scheduler_class"].endswith("._StubScheduler")
+    assert state["flow_shift"] == 5.0

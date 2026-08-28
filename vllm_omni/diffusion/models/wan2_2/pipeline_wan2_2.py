@@ -499,6 +499,9 @@ class Wan22Pipeline(
             "sampling_seed": getattr(req.sampling_params, "seed", None),
             "prompt": req.prompts[0] if req.prompts else None,
             "num_steps": num_steps,
+            "sample_solver": self._sample_solver,
+            "scheduler_class": f"{self.scheduler.__class__.__module__}.{self.scheduler.__class__.__name__}",
+            "flow_shift": self._flow_shift,
         }
 
     def _capture_trajectory_probe_checkpoint(
@@ -629,6 +632,9 @@ class Wan22Pipeline(
             "num_steps": probe_state["num_steps"],
             "fps": probe_state["fps"],
             "sampling_seed": probe_state["sampling_seed"],
+            "sample_solver": probe_state["sample_solver"],
+            "scheduler_class": probe_state["scheduler_class"],
+            "flow_shift": probe_state["flow_shift"],
             "records": saved_records,
         }
         metadata_path = artifact_dir / f"{probe_state['label']}_trajectory_probe.json"
