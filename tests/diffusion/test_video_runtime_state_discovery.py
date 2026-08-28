@@ -167,6 +167,7 @@ def test_raw_schema_rejects_off_by_one() -> None:
             "final_video_mse": 0.3,
             "spatial_quality": 0.9,
             "temporal_quality": 0.8,
+            "semantic_quality": 0.7,
         }
     )
     validate_raw_schema(row)
