@@ -8,6 +8,7 @@ import pytest
 from experiments.video_runtime_state_discovery import (
     CONDITION_SPECS,
     EXPECTED_SCHEDULER,
+    IDENTITY_ALLOWED_CONDITIONS,
     RAW_FIELDS,
     analyze_discovery,
     array_sha256,
@@ -125,6 +126,11 @@ def test_quantization_round_trip_uses_declared_grids() -> None:
     assert np.array_equal(int8, q8.astype(np.float32) * scale8)
     assert np.array_equal(int4, q4.astype(np.float32) * scale4)
     assert latent_error(clean, int8)["mse"] < latent_error(clean, int4)["mse"]
+
+
+def test_only_fp16_and_exact_controls_allow_identity_round_trip() -> None:
+    assert IDENTITY_ALLOWED_CONDITIONS == {"full_direct", "full_disk", "fp16"}
+    assert {"int8", "int4_like", "spatial_down2", "random_missing", "stale_1"}.isdisjoint(IDENTITY_ALLOWED_CONDITIONS)
 
 
 def test_serialized_byte_accounting_round_trip(tmp_path) -> None:

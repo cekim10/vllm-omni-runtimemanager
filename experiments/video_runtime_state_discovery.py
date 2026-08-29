@@ -152,6 +152,11 @@ CONDITION_SPECS = {
     "stale_2": ConditionSpec("stale_2", "staleness", "staleness", "state_k_minus_2_schedule_k"),
 }
 
+# Wan's BF16-valued latent may already lie exactly on the FP16 grid. An
+# identity FP16 round trip is a valid measured outcome, not an implementation
+# failure. All lossy/corruption conditions still must alter the clean state.
+IDENTITY_ALLOWED_CONDITIONS = frozenset({"full_direct", "full_disk", "fp16"})
+
 
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
@@ -1393,7 +1398,7 @@ def run_resume_condition(
             checkpoint_step=checkpoint_step,
             directory=cell_dir / "corruption",
         )
-        require_difference = condition_name not in {"full_direct", "full_disk"}
+        require_difference = condition_name not in IDENTITY_ALLOWED_CONDITIONS
         initial = tensor_invariants(clean, prepared.restored, require_difference=require_difference)
         metadata = {**prepared.artifact_metadata, "artifact_paths": prepared.artifact_paths, "invariants": initial}
     except Exception as error:
@@ -1671,7 +1676,9 @@ def run_preflight(
             )
             serialized_bytes.setdefault(int(step), {})[name] = prepared.total_bytes
             invariant = tensor_invariants(
-                states[step], prepared.restored, require_difference=name not in {"full_direct", "full_disk"}
+                states[step],
+                prepared.restored,
+                require_difference=name not in IDENTITY_ALLOWED_CONDITIONS,
             )
             if name.startswith("gaussian_matched_"):
                 iso_error_mismatches.append(float(prepared.artifact_metadata["relative_mismatch"]))
