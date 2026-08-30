@@ -93,6 +93,7 @@ def test_forward_delegates_denoising_to_diffuse(monkeypatch) -> None:
             num_outputs_per_prompt=1,
             max_sequence_length=32,
             latents=None,
+            step_index=None,
             extra_args={},
         ),
     )
@@ -184,7 +185,12 @@ def test_trajectory_probe_records_resolved_scheduler_identity(tmp_path) -> None:
     assert state["flow_shift"] == 5.0
 
 
-def test_trajectory_probe_preserves_runtime_dtype_accounting() -> None:
+def test_trajectory_probe_preserves_runtime_dtype_accounting(monkeypatch) -> None:
+    from vllm_omni.diffusion.models.wan2_2 import pipeline_wan2_2 as pipeline_module
+
+    # The stub pipeline lives on CPU, so the probe's GPU-memory branch would call
+    # get_free_memory(cpu) on a CUDA host. This test asserts dtype/byte accounting only.
+    monkeypatch.setattr(pipeline_module.current_omni_platform, "is_available", lambda: False)
     pipeline = _make_pipeline()
     probe_state = {
         "capture_steps_set": {1},
