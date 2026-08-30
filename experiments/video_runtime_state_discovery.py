@@ -2204,6 +2204,39 @@ def evaluate_metric_controls(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce preflight-gate evidence into JSON-encodable values.
+
+    Gate evidence is assembled from sets, Paths and numpy scalars but is only
+    serialized after the entire GPU preflight has finished. A TypeError at that
+    point discards every generation, so evidence is normalized at construction
+    time instead of being trusted to be encodable.
+    """
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (set, frozenset)):
+        try:
+            ordered = sorted(value)
+        except TypeError:
+            ordered = sorted(value, key=repr)
+        return [_json_safe(item) for item in ordered]
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    return value
+
+
 def gate_record(
     name: str,
     passed: bool | None,
@@ -2221,7 +2254,7 @@ def gate_record(
         "name": name,
         "status": status,
         "required": required,
-        "measured_evidence": evidence,
+        "measured_evidence": _json_safe(evidence),
         "artifact_paths": [str(path) for path in artifacts],
         "expected_invariant": expected,
     }
@@ -2457,8 +2490,12 @@ def run_preflight(
             cpu["passed"] and cardinality_pass,
             {
                 "cpu": cpu,
-                "real_iso_missing_cardinality": expected_missing,
-                "real_iso_missing_conditions": expected_iso_missing_names,
+                "real_iso_missing_cardinality": {
+                    step: sorted(values) for step, values in expected_missing.items()
+                },
+                "real_iso_missing_conditions": {
+                    step: sorted(values) for step, values in expected_iso_missing_names.items()
+                },
                 "expected_cardinality": int(real_shape_expected),
                 "excluded_descriptive_conditions": ["channel_contiguous"],
             },

@@ -32,6 +32,7 @@ from experiments.video_runtime_state_discovery import (
     evaluate_metric_controls,
     expected_matrix_keys,
     expected_smoke_keys,
+    _json_safe,
     gate_record,
     gaussian_matched_mse,
     gaussian_matched_runtime_mse,
@@ -637,6 +638,75 @@ def test_by_step_summary_is_explicit_and_input_order_independent() -> None:
     assert observed == expected
     assert json.loads(observed[0]["checkpoint_steps"]) == [10, 20, 30]
     assert json.loads(observed[0]["frame_ssim_by_step"]) == [0.91, 0.92, 0.93]
+
+
+def test_gate_evidence_is_json_serializable_after_gpu_preflight() -> None:
+    """Gate evidence is written only after the whole GPU preflight has run.
+
+    A TypeError at that point discards every generation, so evidence containing
+    sets/Paths/numpy values must be normalized when the gate is constructed.
+    """
+    evidence = {
+        10: {199_680},
+        20: {"random_missing", "temporal_contiguous"},
+        "path": Path("/tmp/mask.npy"),
+        "numpy_scalar": np.int64(7),
+        "numpy_array": np.arange(3),
+        "nested": [{"inner": frozenset({3, 1, 2})}],
+        "non_finite": float("inf"),
+    }
+    gate = gate_record("evidence", True, evidence, [Path("/tmp/a.csv")], "serializable")
+    encoded = json.dumps(gate, allow_nan=False, sort_keys=True)
+    decoded = json.loads(encoded)["measured_evidence"]
+    assert decoded["10"] == [199_680]
+    assert decoded["20"] == ["random_missing", "temporal_contiguous"]
+    assert decoded["path"] == "/tmp/mask.npy"
+    assert decoded["numpy_scalar"] == 7
+    assert decoded["numpy_array"] == [0, 1, 2]
+    assert decoded["nested"] == [{"inner": [1, 2, 3]}]
+    assert decoded["non_finite"] == "inf"
+
+
+def test_g7_cardinality_evidence_shape_is_serializable() -> None:
+    """Regression: G7 evidence previously carried dict[int, set] and killed a completed preflight."""
+    expected_missing = {step: {199_680} for step in (10, 20, 30)}
+    expected_names = {step: set(ISO_MISSING_CONDITIONS) for step in (10, 20, 30)}
+    gate = gate_record(
+        "G7 corruption cardinality",
+        True,
+        {
+            "real_iso_missing_cardinality": {s: sorted(v) for s, v in expected_missing.items()},
+            "real_iso_missing_conditions": {s: sorted(v) for s, v in expected_names.items()},
+            "expected_cardinality": 199_680,
+            "excluded_descriptive_conditions": ["channel_contiguous"],
+        },
+        [],
+        "equal cardinality within the preregistered iso-missing family",
+    )
+    evidence = json.loads(json.dumps(gate, allow_nan=False))["measured_evidence"]
+    assert evidence["real_iso_missing_cardinality"]["10"] == [199_680]
+    assert evidence["real_iso_missing_conditions"]["30"] == sorted(ISO_MISSING_CONDITIONS)
+    assert "channel_contiguous" not in evidence["real_iso_missing_conditions"]["10"]
+
+    # The raw dict[int, set] form that previously reached json.dumps must also survive.
+    raw_gate = gate_record(
+        "G7 corruption cardinality",
+        True,
+        {
+            "real_iso_missing_cardinality": expected_missing,
+            "real_iso_missing_conditions": expected_names,
+        },
+        [],
+        "equal cardinality within the preregistered iso-missing family",
+    )
+    raw = json.loads(json.dumps(raw_gate, allow_nan=False))["measured_evidence"]
+    assert raw["real_iso_missing_cardinality"]["20"] == [199_680]
+    assert raw["real_iso_missing_conditions"]["20"] == sorted(ISO_MISSING_CONDITIONS)
+
+
+def test_json_safe_leaves_plain_values_untouched() -> None:
+    plain = {"a": 1, "b": 2.5, "c": "s", "d": True, "e": None, "f": [1, {"g": 2}]}
+    assert _json_safe(plain) == plain
 
 
 def test_preflight_gate_schema_has_no_unmeasured_required_pass() -> None:
