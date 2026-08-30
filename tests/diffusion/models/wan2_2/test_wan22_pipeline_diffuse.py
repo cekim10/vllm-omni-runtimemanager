@@ -182,3 +182,30 @@ def test_trajectory_probe_records_resolved_scheduler_identity(tmp_path) -> None:
     assert state["sample_solver"] == "unipc"
     assert state["scheduler_class"].endswith("._StubScheduler")
     assert state["flow_shift"] == 5.0
+
+
+def test_trajectory_probe_preserves_runtime_dtype_accounting() -> None:
+    pipeline = _make_pipeline()
+    probe_state = {
+        "capture_steps_set": {1},
+        "num_steps": 2,
+        "records": [],
+    }
+    latent = torch.zeros((1, 4, 1, 2, 2), dtype=torch.bfloat16)
+
+    pipeline._capture_trajectory_probe_checkpoint(
+        probe_state,
+        step_index=1,
+        timestep=torch.tensor(5),
+        latents=latent,
+        step_latency_ms=1.0,
+        cumulative_dit_ms=1.0,
+    )
+
+    record = probe_state["records"][0]
+    assert record["runtime_dtype"] == "torch.bfloat16"
+    assert record["runtime_element_size_bytes"] == 2
+    assert record["runtime_numel"] == latent.numel()
+    assert record["runtime_payload_bytes"] == latent.numel() * 2
+    assert record["probe_dtype"] == "torch.float32"
+    assert record["probe_payload_bytes"] == latent.numel() * 4

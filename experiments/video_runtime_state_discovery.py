@@ -32,11 +32,35 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 EXPECTED_SCHEDULER = "WanEulerScheduler"
+EXPECTED_RUNTIME_DTYPE = "torch.bfloat16"
 SEMANTIC_AXES = ("batch", "channel", "temporal", "height", "width")
+DESIGNED_ISO_ERROR_PAIRS = (
+    ("int8", "gaussian_matched_int8"),
+    ("random_missing", "gaussian_matched_random_missing"),
+)
+ISO_MISSING_CONDITIONS = (
+    "spatial_contiguous",
+    "temporal_contiguous",
+    "block_interleaved",
+    "random_missing",
+)
+PRIMARY_ISO_STORAGE_CONDITIONS = (
+    "int8",
+    "spatial_width_down2_bf16",
+    "low_rank_byte_matched_bf16",
+)
+PROVENANCE_FILES = (
+    "experiments/video_runtime_state_discovery.py",
+    "experiments/video_runtime_state_discovery_config.yaml",
+    "experiments/video_recovery_prompt_set.json",
+    "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
+    "vllm_omni/diffusion/models/wan2_2/scheduling_wan_euler.py",
+)
 RAW_FIELDS = (
     "status",
     "experiment_version",
     "config_hash",
+    "provenance_hash",
     "model",
     "scheduler",
     "prompt_id",
@@ -51,23 +75,33 @@ RAW_FIELDS = (
     "corruption_name",
     "comparison_family",
     "comparison_basis",
+    "comparison_role",
     "clean_latent_hash",
     "corrupted_latent_hash",
-    "source_dtype",
+    "runtime_dtype",
+    "runtime_element_size_bytes",
+    "runtime_numel",
+    "runtime_full_bytes",
+    "probe_dtype",
+    "probe_payload_bytes",
     "encoded_dtype",
     "encoded_shapes",
     "logical_bits_per_value",
     "theoretical_payload_bytes",
-    "full_bytes",
-    "payload_bytes",
+    "serialized_payload_bytes",
     "metadata_bytes",
-    "total_bytes",
-    "byte_ratio",
-    "missing_bytes",
-    "retained_bytes",
+    "serialized_candidate_bytes",
+    "candidate_ratio_vs_runtime_state",
+    "serialized_candidate_deployment_meaningful",
+    "total_elements",
+    "missing_elements",
+    "retained_elements",
+    "missing_fraction",
+    "retained_fraction",
     "changed_elements",
     "changed_fraction",
-    "initial_mse",
+    "initial_mse_probe_dtype",
+    "initial_mse_runtime_dtype",
     "initial_normalized_l2",
     "initial_max_abs",
     "initial_cosine",
@@ -76,15 +110,27 @@ RAW_FIELDS = (
     "final_latent_mse",
     "final_latent_normalized_l2",
     "final_latent_max_abs",
-    "final_video_mse",
-    "spatial_quality",
-    "temporal_quality",
-    "semantic_quality",
+    "video_mse",
+    "video_psnr",
+    "frame_ssim_mean",
+    "normalized_pixel_agreement",
+    "temporal_delta_mse",
+    "temporal_delta_agreement",
+    "prompt_clip_score",
+    "checkpoint_scheduler_timestep",
+    "current_expert",
+    "remaining_high_noise_steps",
+    "remaining_low_noise_steps",
+    "crosses_expert_boundary_after_resume",
     "content_motion_proxy",
     "content_spatial_gradient_proxy",
     "content_temporal_gradient_proxy",
     "latent_temporal_change_proxy",
     "exact_baseline_valid",
+    "recovered_video_path",
+    "recovered_final_latent_path",
+    "clean_reference_video_path",
+    "clean_reference_final_latent_path",
     "condition_metadata_json",
     "result_path",
 )
@@ -114,8 +160,8 @@ class PreparedCondition:
     payload_bytes: int
     metadata_bytes: int
     total_bytes: int
-    missing_bytes: int
-    retained_bytes: int
+    missing_elements: int
+    retained_elements: int
     artifact_metadata: dict[str, Any]
     artifact_paths: list[str]
 
@@ -123,12 +169,16 @@ class PreparedCondition:
 CONDITION_SPECS = {
     "full_direct": ConditionSpec("full_direct", "baseline", "baseline", "direct_memory"),
     "full_disk": ConditionSpec("full_disk", "baseline", "baseline", "disk_identity"),
-    "fp16": ConditionSpec("fp16", "precision", "descriptive", "actual_serialized_bytes"),
-    "int8": ConditionSpec("int8", "precision", "iso_storage_25pct", "actual_serialized_bytes"),
+    "fp16": ConditionSpec("fp16", "precision", "descriptive", "dtype_conversion_control"),
+    "int8": ConditionSpec("int8", "precision", "iso_storage_runtime", "actual_serialized_bytes"),
     "int4_like": ConditionSpec("int4_like", "precision", "descriptive", "unpacked_actual_bytes"),
-    "spatial_down2": ConditionSpec("spatial_down2", "structural", "iso_storage_25pct", "actual_serialized_bytes"),
+    "spatial_width_down2_bf16": ConditionSpec(
+        "spatial_width_down2_bf16", "structural", "iso_storage_runtime", "actual_serialized_bytes"
+    ),
     "temporal_down2": ConditionSpec("temporal_down2", "structural", "descriptive", "actual_serialized_bytes"),
-    "low_rank_25": ConditionSpec("low_rank_25", "structural", "iso_storage_25pct", "actual_serialized_bytes"),
+    "low_rank_byte_matched_bf16": ConditionSpec(
+        "low_rank_byte_matched_bf16", "structural", "iso_storage_runtime", "actual_serialized_bytes"
+    ),
     "spatial_contiguous": ConditionSpec(
         "spatial_contiguous", "missing_geometry", "iso_missing_2of9", "equal_missing_elements"
     ),
@@ -158,6 +208,20 @@ CONDITION_SPECS = {
 IDENTITY_ALLOWED_CONDITIONS = frozenset({"full_direct", "full_disk", "fp16"})
 
 
+def comparison_role(name: str) -> str:
+    if name in {"full_direct", "full_disk"}:
+        return "exact_baseline"
+    if name == "fp16":
+        return "dtype_conversion_control"
+    if CONDITION_SPECS[name].family == "missing_geometry":
+        return "controlled_loss_geometry"
+    if CONDITION_SPECS[name].family == "gaussian":
+        return "iso_error_control"
+    if CONDITION_SPECS[name].family == "staleness":
+        return "staleness_control"
+    return "checkpoint_representation_candidate"
+
+
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
 
@@ -176,6 +240,60 @@ def sha256_file(path: Path) -> str:
 
 def array_sha256(array: np.ndarray) -> str:
     return sha256_bytes(np.ascontiguousarray(array).tobytes(order="C"))
+
+
+def build_code_provenance() -> dict[str, Any]:
+    paths = [REPO_ROOT / value for value in PROVENANCE_FILES]
+    missing = [str(path) for path in paths if not path.exists()]
+    if missing:
+        raise RuntimeError(f"Provenance inputs missing: {missing}")
+    try:
+        git_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        git_status = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        relevant_status = subprocess.check_output(
+            ["git", "status", "--porcelain", "--", *PROVENANCE_FILES],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("Git provenance is required for discovery runs") from error
+    file_hashes = {relative: sha256_file(REPO_ROOT / relative) for relative in PROVENANCE_FILES}
+    dirty = bool(git_status)
+    relevant_diff = subprocess.check_output(
+        ["git", "diff", "--binary", "HEAD", "--", *PROVENANCE_FILES],
+        cwd=REPO_ROOT,
+        stderr=subprocess.DEVNULL,
+    )
+    document = {
+        "git_commit": git_commit,
+        "git_dirty": dirty,
+        "experiment_script_sha256": file_hashes["experiments/video_runtime_state_discovery.py"],
+        "config_sha256": file_hashes["experiments/video_runtime_state_discovery_config.yaml"],
+        "pipeline_wan2_2_sha256": file_hashes["vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py"],
+        "scheduler_sha256": file_hashes["vllm_omni/diffusion/models/wan2_2/scheduling_wan_euler.py"],
+        "prompt_set_sha256": file_hashes["experiments/video_recovery_prompt_set.json"],
+        "relevant_diff_sha256": sha256_bytes(relevant_diff) if dirty else None,
+        "relevant_file_sha256": file_hashes,
+        "git_status": git_status.splitlines() if dirty else [],
+        "relevant_git_status": relevant_status.splitlines() if relevant_status else [],
+    }
+    document["provenance_hash"] = sha256_bytes(canonical_json(document))
+    return document
+
+
+def assert_provenance_matches(document: dict[str, Any], expected: dict[str, Any]) -> None:
+    if document.get("provenance_hash") != expected["provenance_hash"]:
+        raise RuntimeError(
+            "Code/config provenance mismatch; use a new namespace and rerun CPU/preflight gates"
+        )
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -216,15 +334,33 @@ def validate_raw_schema(row: dict[str, Any]) -> None:
     if int(row["resume_index"]) != int(row["checkpoint_step"]):
         raise ValueError("Raw row has off-by-one resume semantics")
     for key in (
-        "initial_mse",
+        "initial_mse_probe_dtype",
+        "initial_mse_runtime_dtype",
         "final_latent_mse",
-        "final_video_mse",
-        "spatial_quality",
-        "temporal_quality",
-        "semantic_quality",
+        "video_mse",
+        "frame_ssim_mean",
     ):
         if not math.isfinite(float(row[key])):
             raise ValueError(f"Raw row has non-finite {key}")
+    if row["runtime_dtype"] != EXPECTED_RUNTIME_DTYPE or int(row["runtime_element_size_bytes"]) != 2:
+        raise ValueError("Raw row does not describe the required Wan BF16 runtime state")
+    if int(row["runtime_full_bytes"]) != int(row["runtime_numel"]) * 2:
+        raise ValueError("Authoritative runtime byte accounting is inconsistent")
+    if row["corruption_name"] == "fp16":
+        if row["comparison_role"] != "dtype_conversion_control":
+            raise ValueError("FP16 must be labeled as a dtype-conversion control")
+        ratio = float(row["candidate_ratio_vs_runtime_state"])
+        if not 0.95 <= ratio <= 1.10:
+            raise ValueError("FP16 cannot be reported as half-size compression relative to BF16")
+    if row["comparison_family"] == "iso_storage_runtime":
+        if row["corruption_name"] not in PRIMARY_ISO_STORAGE_CONDITIONS:
+            raise ValueError("Unregistered or legacy representation entered primary iso-storage analysis")
+        expected_dtype = "int8" if row["corruption_name"] == "int8" else "bfloat16"
+        if row["encoded_dtype"] != expected_dtype:
+            raise ValueError(
+                f"Primary iso-storage representation {row['corruption_name']} uses "
+                f"{row['encoded_dtype']}, expected {expected_dtype}"
+            )
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -267,6 +403,9 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError("The full preregistered condition matrix may not be reduced or duplicated")
     if not set(config["smoke_conditions"]).issubset(config["conditions"]):
         raise ValueError("Smoke conditions must be a subset of the frozen discovery matrix")
+    configured_pairs = tuple(tuple(pair) for pair in config["analysis"]["designed_iso_error_pairs"])
+    if configured_pairs != DESIGNED_ISO_ERROR_PAIRS:
+        raise ValueError("The preregistered primary iso-error pairs changed")
     return config
 
 
@@ -317,6 +456,143 @@ def latent_error(clean: np.ndarray, candidate: np.ndarray) -> dict[str, float | 
         "changed_elements": int(np.count_nonzero(flat_delta)),
         "changed_fraction": float(np.count_nonzero(flat_delta) / flat_delta.size),
     }
+
+
+def runtime_state_accounting(
+    *, runtime_dtype: str, runtime_element_size_bytes: int, runtime_numel: int, probe: np.ndarray
+) -> dict[str, Any]:
+    if runtime_dtype != EXPECTED_RUNTIME_DTYPE:
+        raise ValueError(f"Expected Wan runtime BF16 state, got {runtime_dtype}")
+    if runtime_element_size_bytes != 2:
+        raise ValueError(f"BF16 must use 2 bytes per element, got {runtime_element_size_bytes}")
+    if runtime_numel != probe.size:
+        raise ValueError(f"Runtime/probe numel mismatch: {runtime_numel} != {probe.size}")
+    return {
+        "runtime_dtype": runtime_dtype,
+        "runtime_element_size_bytes": runtime_element_size_bytes,
+        "runtime_numel": runtime_numel,
+        "runtime_full_bytes": runtime_numel * runtime_element_size_bytes,
+        "probe_dtype": str(probe.dtype),
+        "probe_payload_bytes": probe.nbytes,
+    }
+
+
+def cast_probe_to_runtime(array: np.ndarray, runtime_dtype: str) -> np.ndarray:
+    import torch
+
+    if runtime_dtype != EXPECTED_RUNTIME_DTYPE:
+        raise ValueError(f"Unsupported runtime dtype: {runtime_dtype}")
+    return torch.from_numpy(np.ascontiguousarray(array)).to(torch.bfloat16).float().cpu().numpy()
+
+
+def runtime_dtype_mse(clean: np.ndarray, candidate: np.ndarray, runtime_dtype: str) -> float:
+    runtime_clean = cast_probe_to_runtime(clean, runtime_dtype).astype(np.float64)
+    runtime_candidate = cast_probe_to_runtime(candidate, runtime_dtype).astype(np.float64)
+    return float(np.mean((runtime_candidate - runtime_clean) ** 2))
+
+
+def encode_runtime_bf16(array: np.ndarray) -> np.ndarray:
+    import torch
+
+    tensor = torch.from_numpy(np.ascontiguousarray(array)).to(torch.bfloat16).contiguous()
+    return tensor.view(torch.uint16).cpu().numpy().copy()
+
+
+def decode_runtime_bf16(encoded: np.ndarray) -> np.ndarray:
+    import torch
+
+    if encoded.dtype != np.uint16:
+        raise ValueError(f"Expected uint16 BF16 payload, got {encoded.dtype}")
+    tensor = torch.from_numpy(np.ascontiguousarray(encoded)).view(torch.bfloat16)
+    return tensor.float().cpu().numpy()
+
+
+def primary_iso_storage_byte_plan(shape: tuple[int, ...]) -> dict[str, dict[str, Any]]:
+    """Select structural parameters using only shape and serialized payload bytes."""
+    if len(shape) != 5:
+        raise ValueError(f"Expected [B,C,T,H,W], got {shape}")
+    batch, channels, temporal, height, width = (int(value) for value in shape)
+    if width % 2:
+        raise ValueError("Byte-matched spatial-width reduction requires an even latent width")
+    numel = math.prod(shape)
+    int8_payload = numel + np.dtype(np.float32).itemsize
+    spatial_shape = (batch, channels, temporal, height, width // 2)
+    spatial_payload = math.prod(spatial_shape) * 2
+    matrix_rows = batch * channels * temporal
+    matrix_columns = height * width
+    rank_cost = 2 * (matrix_rows + 1 + matrix_columns)
+    ranks = range(1, min(matrix_rows, matrix_columns) + 1)
+    rank = min(ranks, key=lambda value: (abs(value * rank_cost - int8_payload), value))
+    low_rank_payload = rank * rank_cost
+    return {
+        "int8": {
+            "payload_bytes": int8_payload,
+            "parameters": {"levels": 127},
+        },
+        "spatial_width_down2_bf16": {
+            "payload_bytes": spatial_payload,
+            "parameters": {"encoded_size": [temporal, height, width // 2]},
+        },
+        "low_rank_byte_matched_bf16": {
+            "payload_bytes": low_rank_payload,
+            "parameters": {
+                "matrix_rows": matrix_rows,
+                "matrix_columns": matrix_columns,
+                "rank": rank,
+            },
+        },
+    }
+
+
+def validate_primary_iso_storage_accounting(
+    values: dict[str, dict[str, int]],
+    shape: tuple[int, ...],
+    relative_tolerance: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if set(values) != set(PRIMARY_ISO_STORAGE_CONDITIONS):
+        raise RuntimeError(
+            f"Primary iso-storage conditions are {sorted(values)}, expected "
+            f"{list(PRIMARY_ISO_STORAGE_CONDITIONS)}"
+        )
+    plan = primary_iso_storage_byte_plan(shape)
+    payload_checks = []
+    for condition in PRIMARY_ISO_STORAGE_CONDITIONS:
+        actual_payload = int(values[condition]["payload_bytes"])
+        planned_payload = int(plan[condition]["payload_bytes"])
+        if actual_payload != planned_payload:
+            raise RuntimeError(
+                f"Primary iso-storage payload mismatch for {condition}: "
+                f"{actual_payload} != {planned_payload}"
+            )
+        payload_checks.append(
+            {
+                "condition": condition,
+                "actual_payload_bytes": actual_payload,
+                "planned_payload_bytes": planned_payload,
+                "exact_payload_match": True,
+                "selection_basis": "shape_and_int8_serialized_payload_bytes_only",
+            }
+        )
+    pair_rows = []
+    for left, right in itertools.combinations(PRIMARY_ISO_STORAGE_CONDITIONS, 2):
+        left_bytes = int(values[left]["total_bytes"])
+        right_bytes = int(values[right]["total_bytes"])
+        mismatch = abs(left_bytes - right_bytes) / max(left_bytes, right_bytes)
+        if mismatch > relative_tolerance:
+            raise RuntimeError(
+                f"Primary iso-storage serialized-byte mismatch for {left}/{right}: "
+                f"{mismatch} > {relative_tolerance}"
+            )
+        pair_rows.append(
+            {
+                "condition_a": left,
+                "condition_b": right,
+                "serialized_candidate_bytes_a": left_bytes,
+                "serialized_candidate_bytes_b": right_bytes,
+                "relative_byte_mismatch": mismatch,
+            }
+        )
+    return payload_checks, pair_rows
 
 
 def tensor_invariants(clean: np.ndarray, candidate: np.ndarray, *, require_difference: bool) -> dict[str, Any]:
@@ -455,6 +731,39 @@ def gaussian_matched_mse(clean: np.ndarray, target_mse: float, seed: int) -> tup
     return candidate, matched
 
 
+def gaussian_matched_runtime_mse(
+    clean: np.ndarray,
+    target_runtime_mse: float,
+    seed: int,
+    runtime_dtype: str,
+    *,
+    relative_tolerance: float = 1e-4,
+) -> tuple[np.ndarray, float]:
+    if target_runtime_mse <= 0:
+        raise ValueError("Matched Gaussian requires a positive runtime-dtype target MSE")
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(clean.shape, dtype=np.float32)
+    noise /= np.float32(math.sqrt(float(np.mean(noise.astype(np.float64) ** 2))))
+    scale = math.sqrt(target_runtime_mse)
+    candidate = clean + noise * np.float32(scale)
+    for _ in range(8):
+        realized = runtime_dtype_mse(clean, candidate, runtime_dtype)
+        mismatch = abs(realized - target_runtime_mse) / target_runtime_mse
+        if mismatch <= relative_tolerance:
+            break
+        scale *= math.sqrt(target_runtime_mse / max(realized, 1e-30))
+        candidate = clean + noise * np.float32(scale)
+    realized = runtime_dtype_mse(clean, candidate, runtime_dtype)
+    mismatch = abs(realized - target_runtime_mse) / target_runtime_mse
+    if not math.isfinite(realized) or mismatch > relative_tolerance:
+        raise RuntimeError(
+            "Runtime-dtype Gaussian matching failed to converge: "
+            f"target={target_runtime_mse}, realized={realized}, mismatch={mismatch}, "
+            f"tolerance={relative_tolerance}"
+        )
+    return candidate.astype(np.float32), realized
+
+
 def serialize_components(
     directory: Path,
     name: str,
@@ -538,8 +847,8 @@ def _save_candidate(
         payload_bytes=payload,
         metadata_bytes=meta_bytes,
         total_bytes=payload + meta_bytes,
-        missing_bytes=int(metadata.get("missing_bytes", 0)),
-        retained_bytes=int(metadata.get("retained_bytes", clean.nbytes)),
+        missing_elements=int(metadata.get("missing_elements", 0)),
+        retained_elements=int(metadata.get("retained_elements", clean.size)),
         artifact_metadata=metadata,
         artifact_paths=paths,
     )
@@ -555,12 +864,19 @@ def prepare_condition(
     name: str,
     config: dict[str, Any],
     *,
+    runtime_state: dict[str, Any],
     prompt_id: str,
     generation_seed: int,
     checkpoint_step: int,
     directory: Path,
 ) -> PreparedCondition:
     clean = np.ascontiguousarray(clean.astype(np.float32, copy=False))
+    accounting = runtime_state_accounting(
+        runtime_dtype=str(runtime_state["runtime_dtype"]),
+        runtime_element_size_bytes=int(runtime_state["runtime_element_size_bytes"]),
+        runtime_numel=int(runtime_state["runtime_numel"]),
+        probe=clean,
+    )
     spec = CONDITION_SPECS[name]
     seed = corruption_seed(prompt_id, generation_seed, checkpoint_step, name)
     base_meta = {
@@ -569,31 +885,42 @@ def prepare_condition(
         "checkpoint_step": checkpoint_step,
         "clean_latent_hash": array_sha256(clean),
         "source_shape": list(clean.shape),
-        "source_dtype": str(clean.dtype),
+        **accounting,
         "corruption_seed": seed,
     }
     corruption = config["corruption"]
     if name == "full_direct":
+        runtime_bytes = int(accounting["runtime_full_bytes"])
         return PreparedCondition(
             spec,
             clean.copy(),
             None,
-            str(clean.dtype),
+            "bfloat16",
             [list(clean.shape)],
-            32,
-            clean.nbytes,
-            clean.nbytes,
+            16,
+            runtime_bytes,
+            runtime_bytes,
             0,
-            clean.nbytes,
+            runtime_bytes,
             0,
-            clean.nbytes,
-            {"direct_memory": True},
+            clean.size,
+            {"direct_memory": True, **base_meta},
             [],
         )
     if name == "full_disk":
-        prepared = _save_candidate(clean, clean.copy(), spec, directory, base_meta)
+        encoded = encode_runtime_bf16(clean)
+        prepared = _save_candidate(
+            clean,
+            clean.copy(),
+            spec,
+            directory,
+            {**base_meta, "runtime_encoding": "BF16 bit pattern stored as uint16"},
+            encoded_dtype="bfloat16",
+            logical_bits=16,
+            components=[("latent_bf16_bits", encoded)],
+        )
         metadata, arrays = deserialize_components(Path(prepared.artifact_paths[0]), Path(prepared.artifact_paths[1]))
-        prepared.restored = arrays[0].astype(clean.dtype)
+        prepared.restored = decode_runtime_bf16(arrays[0])
         prepared.artifact_metadata = metadata
         return prepared
     if name in {"fp16", "int8", "int4_like"}:
@@ -638,45 +965,80 @@ def prepare_condition(
         _, arrays = deserialize_components(Path(prepared.artifact_paths[0]), Path(prepared.artifact_paths[1]))
         prepared.restored = np.ascontiguousarray(arrays[0].astype(np.float32) * float(arrays[1][0]))
         return prepared
-    if name in {"spatial_down2", "temporal_down2"}:
+    if name in {"spatial_width_down2_bf16", "temporal_down2"}:
         _, _, temporal, height, width = clean.shape
-        if name == "spatial_down2":
-            down_size = (temporal, height // 2, width // 2)
+        if name == "spatial_width_down2_bf16":
+            byte_plan = primary_iso_storage_byte_plan(tuple(clean.shape))[name]
+            down_size = tuple(byte_plan["parameters"]["encoded_size"])
         else:
             down_size = (math.ceil(temporal / 2), height, width)
-        encoded = _interpolate(clean, down_size)
-        restored = _interpolate(encoded, tuple(clean.shape[2:])).astype(np.float32)
+        encoded_probe = _interpolate(clean, down_size)
+        encoded = encode_runtime_bf16(encoded_probe)
+        restored = _interpolate(decode_runtime_bf16(encoded), tuple(clean.shape[2:])).astype(np.float32)
         prepared = _save_candidate(
             clean,
             restored,
             spec,
             directory,
-            {**base_meta, "encoded_size": list(down_size), "reconstruction": "trilinear_align_corners_false"},
-            components=[("latent_downsampled", encoded)],
-        )
-        _, arrays = deserialize_components(Path(prepared.artifact_paths[0]), Path(prepared.artifact_paths[1]))
-        prepared.restored = np.ascontiguousarray(_interpolate(arrays[0], tuple(clean.shape[2:])).astype(np.float32))
-        return prepared
-    if name == "low_rank_25":
-        batch, channels, temporal, height, width = clean.shape
-        matrix = clean.reshape(batch * channels * temporal, height * width)
-        rank = max(1, round(min(matrix.shape) * float(corruption["low_rank_ratio"])))
-        u, singular, vh = np.linalg.svd(matrix, full_matrices=False)
-        u = u[:, :rank].astype(np.float32)
-        singular = singular[:rank].astype(np.float32)
-        vh = vh[:rank].astype(np.float32)
-        restored = ((u * singular[None, :]) @ vh).reshape(clean.shape).astype(np.float32)
-        prepared = _save_candidate(
-            clean,
-            restored,
-            spec,
-            directory,
-            {**base_meta, "rank": rank, "reconstruction": "truncated_svd"},
-            components=[("u", u), ("s", singular), ("vh", vh)],
+            {
+                **base_meta,
+                "encoded_size": list(down_size),
+                "reconstruction": "trilinear_align_corners_false",
+                "parameter_selection_basis": "shape_and_int8_serialized_payload_bytes_only"
+                if name == "spatial_width_down2_bf16"
+                else "descriptive_temporal_downsampling_control",
+            },
+            encoded_dtype="bfloat16",
+            logical_bits=16,
+            theoretical_payload_bytes=encoded.nbytes,
+            components=[("latent_downsampled_bf16_bits", encoded)],
         )
         _, arrays = deserialize_components(Path(prepared.artifact_paths[0]), Path(prepared.artifact_paths[1]))
         prepared.restored = np.ascontiguousarray(
-            ((arrays[0] * arrays[1][None, :]) @ arrays[2]).reshape(clean.shape).astype(np.float32)
+            _interpolate(decode_runtime_bf16(arrays[0]), tuple(clean.shape[2:])).astype(np.float32)
+        )
+        return prepared
+    if name == "low_rank_byte_matched_bf16":
+        batch, channels, temporal, height, width = clean.shape
+        matrix = clean.reshape(batch * channels * temporal, height * width)
+        byte_plan = primary_iso_storage_byte_plan(tuple(clean.shape))[name]
+        rank = int(byte_plan["parameters"]["rank"])
+        u, singular, vh = np.linalg.svd(matrix, full_matrices=False)
+        u_encoded = encode_runtime_bf16(u[:, :rank].astype(np.float32))
+        singular_encoded = encode_runtime_bf16(singular[:rank].astype(np.float32))
+        vh_encoded = encode_runtime_bf16(vh[:rank].astype(np.float32))
+        u_runtime = decode_runtime_bf16(u_encoded)
+        singular_runtime = decode_runtime_bf16(singular_encoded)
+        vh_runtime = decode_runtime_bf16(vh_encoded)
+        restored = ((u_runtime * singular_runtime[None, :]) @ vh_runtime).reshape(clean.shape).astype(np.float32)
+        prepared = _save_candidate(
+            clean,
+            restored,
+            spec,
+            directory,
+            {
+                **base_meta,
+                "rank": rank,
+                "matrix_rows": int(matrix.shape[0]),
+                "matrix_columns": int(matrix.shape[1]),
+                "reconstruction": "truncated_svd",
+                "parameter_selection_basis": "shape_and_int8_serialized_payload_bytes_only",
+            },
+            encoded_dtype="bfloat16",
+            logical_bits=16,
+            theoretical_payload_bytes=u_encoded.nbytes + singular_encoded.nbytes + vh_encoded.nbytes,
+            components=[
+                ("u_bf16_bits", u_encoded),
+                ("s_bf16_bits", singular_encoded),
+                ("vh_bf16_bits", vh_encoded),
+            ],
+        )
+        _, arrays = deserialize_components(Path(prepared.artifact_paths[0]), Path(prepared.artifact_paths[1]))
+        u_runtime = decode_runtime_bf16(arrays[0])
+        singular_runtime = decode_runtime_bf16(arrays[1])
+        vh_runtime = decode_runtime_bf16(arrays[2])
+        prepared.restored = np.ascontiguousarray(
+            ((u_runtime * singular_runtime[None, :]) @ vh_runtime).reshape(clean.shape).astype(np.float32)
         )
         return prepared
     if name in {
@@ -725,9 +1087,12 @@ def prepare_condition(
             "mask_path": str(mask_path),
             "mask_sha256": array_sha256(mask),
             "target_elements": target,
+            "total_elements": clean.size,
+            "missing_elements": target,
+            "retained_elements": clean.size - target,
             "missing_fraction": float(mask.mean()),
-            "missing_bytes": target * clean.itemsize,
-            "retained_bytes": clean.nbytes - target * clean.itemsize,
+            "retained_fraction": float(1.0 - mask.mean()),
+            "serialized_zero_fill_is_deployment_estimate": False,
             "affected_temporal_indices": affected_temporal,
             "affected_channel_indices": affected_channels,
             "per_temporal_slice_missing_fraction": mask.mean(axis=(0, 1, 3, 4)).tolist(),
@@ -755,14 +1120,22 @@ def prepare_condition(
             clean_states,
             target_name,
             config,
+            runtime_state=runtime_state,
             prompt_id=prompt_id,
             generation_seed=generation_seed,
             checkpoint_step=checkpoint_step,
             directory=target_dir,
         )
-        target_mse = float(latent_error(clean, target.restored)["mse"])
-        restored, realized = gaussian_matched_mse(clean, target_mse, seed)
-        mismatch = abs(realized - target_mse) / target_mse
+        target_mse_probe = float(latent_error(clean, target.restored)["mse"])
+        target_mse_runtime = runtime_dtype_mse(clean, target.restored, accounting["runtime_dtype"])
+        restored, realized_runtime = gaussian_matched_runtime_mse(
+            clean,
+            target_mse_runtime,
+            seed,
+            accounting["runtime_dtype"],
+        )
+        realized_probe = float(latent_error(clean, restored)["mse"])
+        mismatch = abs(realized_runtime - target_mse_runtime) / target_mse_runtime
         if mismatch > float(corruption["iso_error_relative_tolerance"]):
             raise AssertionError(f"Matched Gaussian MSE mismatch {mismatch:.6f} exceeds tolerance")
         return _save_candidate(
@@ -773,9 +1146,11 @@ def prepare_condition(
             {
                 **base_meta,
                 "matched_condition": target_name,
-                "target_initial_mse": target_mse,
-                "realized_initial_mse": realized,
-                "relative_mismatch": mismatch,
+                "target_initial_mse_probe_dtype": target_mse_probe,
+                "realized_initial_mse_probe_dtype": realized_probe,
+                "target_initial_mse_runtime_dtype": target_mse_runtime,
+                "realized_initial_mse_runtime_dtype": realized_runtime,
+                "runtime_relative_mismatch": mismatch,
             },
         )
     if name in {"stale_1", "stale_2"}:
@@ -912,17 +1287,33 @@ def run_cpu_corruption_gates() -> dict[str, Any]:
     }
 
 
-def video_metrics(candidate: np.ndarray, reference: np.ndarray) -> dict[str, float]:
-    """The exact metric formulas that passed the independent audit controls."""
+def video_metrics(candidate: np.ndarray, reference: np.ndarray) -> dict[str, Any]:
+    """Reference-fidelity metrics; no cross-metric aggregate is produced."""
+    from skimage.metrics import structural_similarity
+
+    if candidate.shape != reference.shape or candidate.dtype != np.uint8 or reference.dtype != np.uint8:
+        raise ValueError("Video metrics require shape-matched uint8 videos")
     lhs = candidate.astype(np.float64) / 255.0
     rhs = reference.astype(np.float64) / 255.0
     mse = float(np.mean((lhs - rhs) ** 2))
-    spatial = 1.0 / (1.0 + mse / (float(np.var(rhs)) + 1e-12))
+    psnr: float | str = "inf" if mse == 0 else float(10.0 * math.log10(1.0 / mse))
+    frame_ssim = [
+        float(structural_similarity(left, right, channel_axis=-1, data_range=1.0))
+        for left, right in zip(lhs, rhs, strict=True)
+    ]
+    pixel_agreement = 1.0 / (1.0 + mse / (float(np.var(rhs)) + 1e-12))
     lhs_delta = np.diff(lhs, axis=0)
     rhs_delta = np.diff(rhs, axis=0)
     temporal_mse = float(np.mean((lhs_delta - rhs_delta) ** 2)) if len(lhs) > 1 else 0.0
-    temporal = 1.0 / (1.0 + temporal_mse / (float(np.mean(rhs_delta**2)) + 1e-12))
-    return {"final_video_mse": mse * 255.0**2, "spatial_quality": spatial, "temporal_quality": temporal}
+    temporal_agreement = 1.0 / (1.0 + temporal_mse / (float(np.mean(rhs_delta**2)) + 1e-12))
+    return {
+        "video_mse": mse,
+        "video_psnr": psnr,
+        "frame_ssim_mean": statistics.fmean(frame_ssim),
+        "normalized_pixel_agreement": pixel_agreement,
+        "temporal_delta_mse": temporal_mse,
+        "temporal_delta_agreement": temporal_agreement,
+    }
 
 
 def content_descriptors(video: np.ndarray, latent: np.ndarray) -> dict[str, float]:
@@ -1028,8 +1419,33 @@ def scheduler_document(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def environment_document(config: dict[str, Any], scheduler: dict[str, Any]) -> dict[str, Any]:
+def expert_region_metadata(config: dict[str, Any], scheduler: dict[str, Any], checkpoint_step: int) -> dict[str, Any]:
+    timesteps = [float(value) for value in scheduler["timesteps"]]
+    if not 0 <= checkpoint_step < len(timesteps):
+        raise ValueError(f"Checkpoint step outside scheduler: {checkpoint_step}")
+    boundary = float(config["generation"]["boundary_ratio"]) * float(
+        config["scheduler"]["num_train_timesteps"]
+    )
+    remaining = timesteps[checkpoint_step:]
+    high = sum(value >= boundary for value in remaining)
+    low = sum(value < boundary for value in remaining)
+    current = "high_noise_transformer" if remaining[0] >= boundary else "low_noise_transformer_2"
+    return {
+        "checkpoint_scheduler_timestep": remaining[0],
+        "current_expert": current,
+        "remaining_high_noise_steps": high,
+        "remaining_low_noise_steps": low,
+        "crosses_expert_boundary_after_resume": current == "high_noise_transformer" and low > 0,
+        "expert_boundary_timestep": boundary,
+        "expert_rule": "transformer_2 iff scheduler timestep < boundary_timestep",
+    }
+
+
+def environment_document(
+    config: dict[str, Any], scheduler: dict[str, Any], provenance: dict[str, Any]
+) -> dict[str, Any]:
     import torch
+    import skimage
 
     try:
         import diffusers
@@ -1066,6 +1482,9 @@ def environment_document(config: dict[str, Any], scheduler: dict[str, Any]) -> d
         "model_revision": config.get("model_revision"),
         "resolved_model_revision": resolved_model_revision,
         "repository_commit": repository_commit,
+        "scikit_image_version": skimage.__version__,
+        "frame_ssim_implementation": "skimage.metrics.structural_similarity per frame, channel_axis=-1, data_range=1.0",
+        "provenance": provenance,
         **scheduler,
     }
 
@@ -1211,13 +1630,20 @@ def clean_capture_steps(config: dict[str, Any]) -> list[int]:
     return sorted(result)
 
 
-def _validate_clean_manifest(manifest: dict[str, Any], config_digest: str, prompt: dict[str, Any], seed: int) -> None:
+def _validate_clean_manifest(
+    manifest: dict[str, Any],
+    config_digest: str,
+    provenance: dict[str, Any],
+    prompt: dict[str, Any],
+    seed: int,
+) -> None:
     required = {
         "config_hash": config_digest,
         "prompt_id": prompt["prompt_id"],
         "prompt": prompt["prompt"],
         "generation_seed": seed,
         "scheduler": EXPECTED_SCHEDULER,
+        "provenance_hash": provenance["provenance_hash"],
     }
     for key, expected in required.items():
         if manifest.get(key) != expected:
@@ -1233,6 +1659,17 @@ def _validate_clean_manifest(manifest: dict[str, Any], config_digest: str, promp
             or array_sha256(array) != row["tensor_sha256"]
         ):
             raise RuntimeError(f"Cached clean latent metadata mismatch: {path}")
+        accounting = runtime_state_accounting(
+            runtime_dtype=row["runtime_dtype"],
+            runtime_element_size_bytes=int(row["runtime_element_size_bytes"]),
+            runtime_numel=int(row["runtime_numel"]),
+            probe=array,
+        )
+        if (
+            int(row["runtime_payload_bytes"]) != accounting["runtime_full_bytes"]
+            or int(row["probe_payload_bytes"]) != accounting["probe_payload_bytes"]
+        ):
+            raise RuntimeError("Cached runtime/probe byte accounting mismatch")
     video_path = Path(manifest["baseline_video_path"])
     if not video_path.exists() or sha256_file(video_path) != manifest["baseline_video_file_sha256"]:
         raise RuntimeError("Cached baseline video failed file validation")
@@ -1242,6 +1679,7 @@ def get_clean_trajectory(
     omni: Any,
     config: dict[str, Any],
     config_digest: str,
+    provenance: dict[str, Any],
     prompt: dict[str, Any],
     seed: int,
     directory: Path,
@@ -1249,7 +1687,7 @@ def get_clean_trajectory(
     manifest_path = directory / "manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        _validate_clean_manifest(manifest, config_digest, prompt, seed)
+        _validate_clean_manifest(manifest, config_digest, provenance, prompt, seed)
         states = {int(row["step"]): load_tensor_numpy(row["latent_path"]) for row in manifest["states"]}
         return np.load(manifest["baseline_video_path"], allow_pickle=False), states, manifest
     if directory.exists() and any(directory.iterdir()):
@@ -1279,6 +1717,13 @@ def get_clean_trajectory(
     state_rows = []
     for step in sorted(states):
         path = Path(records[step]["latent_path"])
+        record = records[step]
+        accounting = runtime_state_accounting(
+            runtime_dtype=record["runtime_dtype"],
+            runtime_element_size_bytes=int(record["runtime_element_size_bytes"]),
+            runtime_numel=int(record["runtime_numel"]),
+            probe=states[step],
+        )
         state_rows.append(
             {
                 "step": step,
@@ -1293,10 +1738,17 @@ def get_clean_trajectory(
                 "tensor_sha256": array_sha256(states[step]),
                 "shape": list(states[step].shape),
                 "dtype": str(states[step].dtype),
+                "runtime_dtype": accounting["runtime_dtype"],
+                "runtime_element_size_bytes": accounting["runtime_element_size_bytes"],
+                "runtime_numel": accounting["runtime_numel"],
+                "runtime_payload_bytes": accounting["runtime_full_bytes"],
+                "probe_dtype": accounting["probe_dtype"],
+                "probe_payload_bytes": accounting["probe_payload_bytes"],
             }
         )
     manifest = {
         "config_hash": config_digest,
+        "provenance_hash": provenance["provenance_hash"],
         "model": config["model"],
         "scheduler": EXPECTED_SCHEDULER,
         "scheduler_config_hash": sha256_bytes(canonical_json(scheduler)),
@@ -1344,14 +1796,40 @@ def _condition_result_valid(path: Path, expected: dict[str, Any]) -> bool:
             return False
     if row.get("status") != "COMPLETE":
         return False
-    numeric = ("initial_mse", "final_latent_mse", "final_video_mse", "spatial_quality", "temporal_quality")
+    numeric = (
+        "initial_mse_probe_dtype",
+        "initial_mse_runtime_dtype",
+        "final_latent_mse",
+        "video_mse",
+        "frame_ssim_mean",
+    )
     if any(not math.isfinite(float(row[key])) for key in numeric):
         return False
     metadata = json.loads(row["condition_metadata_json"])
+    required_artifacts = (
+        "recovered_video_path",
+        "recovered_final_latent_path",
+        "clean_reference_video_path",
+        "clean_reference_final_latent_path",
+    )
+    for key in required_artifacts:
+        artifact = row.get(key)
+        if not artifact or not Path(artifact).exists():
+            return False
+        expected_hash = metadata.get(f"{key.removesuffix('_path')}_sha256")
+        if not expected_hash or sha256_file(Path(artifact)) != expected_hash:
+            return False
     for artifact in metadata.get("artifact_paths", []):
         if not Path(artifact).exists():
             return False
     return True
+
+
+def _runtime_state_record(manifest: dict[str, Any], step: int) -> dict[str, Any]:
+    matches = [row for row in manifest["states"] if int(row["step"]) == step]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected exactly one runtime-state record for step {step}")
+    return matches[0]
 
 
 def run_resume_condition(
@@ -1359,6 +1837,7 @@ def run_resume_condition(
     evaluator: SemanticEvaluator,
     config: dict[str, Any],
     config_digest: str,
+    provenance: dict[str, Any],
     prompt: dict[str, Any],
     seed: int,
     checkpoint_step: int,
@@ -1367,15 +1846,21 @@ def run_resume_condition(
     trajectory_manifest: dict[str, Any],
     condition_name: str,
     cell_dir: Path,
-    *,
-    keep_video: bool,
 ) -> dict[str, Any]:
     import torch
 
     result_path = cell_dir / "result.json"
     clean = clean_states[checkpoint_step]
+    runtime_state = _runtime_state_record(trajectory_manifest, checkpoint_step)
+    accounting = runtime_state_accounting(
+        runtime_dtype=runtime_state["runtime_dtype"],
+        runtime_element_size_bytes=int(runtime_state["runtime_element_size_bytes"]),
+        runtime_numel=int(runtime_state["runtime_numel"]),
+        probe=clean,
+    )
     expected = {
         "config_hash": config_digest,
+        "provenance_hash": provenance["provenance_hash"],
         "prompt_id": prompt["prompt_id"],
         "generation_seed": seed,
         "checkpoint_step": checkpoint_step,
@@ -1393,6 +1878,7 @@ def run_resume_condition(
             clean_states,
             condition_name,
             config,
+            runtime_state=runtime_state,
             prompt_id=prompt["prompt_id"],
             generation_seed=seed,
             checkpoint_step=checkpoint_step,
@@ -1400,6 +1886,7 @@ def run_resume_condition(
         )
         require_difference = condition_name not in IDENTITY_ALLOWED_CONDITIONS
         initial = tensor_invariants(clean, prepared.restored, require_difference=require_difference)
+        initial_runtime_mse = runtime_dtype_mse(clean, prepared.restored, accounting["runtime_dtype"])
         metadata = {**prepared.artifact_metadata, "artifact_paths": prepared.artifact_paths, "invariants": initial}
     except Exception as error:
         failure = {
@@ -1432,25 +1919,53 @@ def run_resume_condition(
         quality = video_metrics(video, baseline_video)
         semantic = evaluator.score(prompt["prompt"], video)
         descriptors = content_descriptors(baseline_video, clean)
-        exact = final_error["mse"] == 0 and quality["final_video_mse"] == 0
+        exact = final_error["mse"] == 0 and quality["video_mse"] == 0
         if condition_name in {"full_direct", "full_disk"} and not exact:
             failure = {
                 **expected,
                 "status": "INVALID_IMPLEMENTATION",
                 "reason": "FULL condition was not bit-exact",
                 "final_latent_mse": final_error["mse"],
-                "final_video_mse": quality["final_video_mse"],
+                "video_mse": quality["video_mse"],
             }
             atomic_json(result_path, failure)
             raise GlobalStopError(f"GLOBAL STOP: {condition_name} failed exact resume at step {checkpoint_step}")
-        if keep_video:
-            video_path = cell_dir / "recovered_video.npy"
-            np.save(video_path, video, allow_pickle=False)
-            metadata["recovered_video_path"] = str(video_path)
+        scientific_dir = cell_dir / "scientific_artifacts"
+        scientific_dir.mkdir(parents=True, exist_ok=True)
+        video_path = scientific_dir / "recovered_video.npy"
+        final_latent_path = scientific_dir / "recovered_final_latent.npy"
+        np.save(video_path, video, allow_pickle=False)
+        np.save(final_latent_path, final, allow_pickle=False)
+        reference_video_path = Path(trajectory_manifest["baseline_video_path"])
+        reference_latent_path = Path(_runtime_state_record(trajectory_manifest, 40)["latent_path"])
+        scientific_artifacts = {
+            "recovered_video_path": str(video_path),
+            "recovered_video_sha256": sha256_file(video_path),
+            "recovered_final_latent_path": str(final_latent_path),
+            "recovered_final_latent_sha256": sha256_file(final_latent_path),
+            "clean_reference_video_path": str(reference_video_path),
+            "clean_reference_video_sha256": sha256_file(reference_video_path),
+            "clean_reference_final_latent_path": str(reference_latent_path),
+            "clean_reference_final_latent_sha256": sha256_file(reference_latent_path),
+        }
+        if not all(Path(value).exists() for key, value in scientific_artifacts.items() if key.endswith("_path")):
+            raise GlobalStopError("GLOBAL STOP: scientific artifact persistence failed")
+        metadata.update(scientific_artifacts)
+        meaningful_storage = condition_name != "full_direct" and prepared.spec.family not in {
+            "missing_geometry",
+            "gaussian",
+            "staleness",
+        }
+        candidate_ratio: float | str = (
+            prepared.total_bytes / accounting["runtime_full_bytes"] if meaningful_storage else ""
+        )
+        element_total = clean.size
+        expert = expert_region_metadata(config, scheduler_document(config), checkpoint_step)
         row = {
             "status": "COMPLETE",
             "experiment_version": config["experiment_version"],
             "config_hash": config_digest,
+            "provenance_hash": provenance["provenance_hash"],
             "model": config["model"],
             "scheduler": EXPECTED_SCHEDULER,
             "prompt_id": prompt["prompt_id"],
@@ -1465,23 +1980,28 @@ def run_resume_condition(
             "corruption_name": condition_name,
             "comparison_family": prepared.spec.comparison_family,
             "comparison_basis": prepared.spec.comparison_basis,
+            "comparison_role": comparison_role(condition_name),
             "clean_latent_hash": array_sha256(clean),
             "corrupted_latent_hash": array_sha256(prepared.restored),
-            "source_dtype": str(clean.dtype),
+            **accounting,
             "encoded_dtype": prepared.encoded_dtype,
             "encoded_shapes": json.dumps(prepared.encoded_shapes),
             "logical_bits_per_value": prepared.logical_bits_per_value,
             "theoretical_payload_bytes": prepared.theoretical_payload_bytes,
-            "full_bytes": clean.nbytes,
-            "payload_bytes": prepared.payload_bytes,
+            "serialized_payload_bytes": prepared.payload_bytes,
             "metadata_bytes": prepared.metadata_bytes,
-            "total_bytes": prepared.total_bytes,
-            "byte_ratio": prepared.total_bytes / clean.nbytes,
-            "missing_bytes": prepared.missing_bytes,
-            "retained_bytes": prepared.retained_bytes,
+            "serialized_candidate_bytes": prepared.total_bytes,
+            "candidate_ratio_vs_runtime_state": candidate_ratio,
+            "serialized_candidate_deployment_meaningful": meaningful_storage,
+            "total_elements": element_total,
+            "missing_elements": prepared.missing_elements,
+            "retained_elements": prepared.retained_elements,
+            "missing_fraction": prepared.missing_elements / element_total,
+            "retained_fraction": prepared.retained_elements / element_total,
             "changed_elements": initial["changed_elements"],
             "changed_fraction": initial["changed_fraction"],
-            "initial_mse": initial["mse"],
+            "initial_mse_probe_dtype": initial["mse"],
+            "initial_mse_runtime_dtype": initial_runtime_mse,
             "initial_normalized_l2": initial["normalized_l2"],
             "initial_max_abs": initial["max_abs"],
             "initial_cosine": initial["cosine"],
@@ -1491,9 +2011,11 @@ def run_resume_condition(
             "final_latent_normalized_l2": final_error["normalized_l2"],
             "final_latent_max_abs": final_error["max_abs"],
             **quality,
-            "semantic_quality": semantic,
+            "prompt_clip_score": semantic,
+            **expert,
             **descriptors,
             "exact_baseline_valid": condition_name not in {"full_direct", "full_disk"} or exact,
+            **{key: value for key, value in scientific_artifacts.items() if key.endswith("_path")},
             "condition_metadata_json": json.dumps({**metadata, "resume_ms": resume_ms}, sort_keys=True),
             "result_path": str(result_path),
         }
@@ -1547,6 +2069,7 @@ def run_matrix(
     evaluator: SemanticEvaluator,
     config: dict[str, Any],
     config_digest: str,
+    provenance: dict[str, Any],
     prompts: list[dict[str, Any]],
     output_dir: Path,
     *,
@@ -1554,7 +2077,6 @@ def run_matrix(
     conditions: list[str],
     prompt_start: int,
     prompt_end: int,
-    keep_videos: bool,
 ) -> list[dict[str, Any]]:
     root = output_dir / namespace
     failures = []
@@ -1562,7 +2084,7 @@ def run_matrix(
         seed = int(config["generation_seeds"][prompt["prompt_id"]])
         trajectory = root / "trajectories" / f"{prompt['prompt_id']}_{seed}"
         baseline_video, clean_states, manifest = get_clean_trajectory(
-            omni, config, config_digest, prompt, seed, trajectory
+            omni, config, config_digest, provenance, prompt, seed, trajectory
         )
         if namespace == "run":
             clean_trajectory_manifest(output_dir)
@@ -1574,6 +2096,7 @@ def run_matrix(
                     evaluator,
                     config,
                     config_digest,
+                    provenance,
                     prompt,
                     seed,
                     int(step),
@@ -1582,7 +2105,6 @@ def run_matrix(
                     manifest,
                     name,
                     cell,
-                    keep_video=keep_videos,
                 )
                 if row["status"] != "COMPLETE":
                     failures.append(row)
@@ -1593,7 +2115,8 @@ def run_matrix(
                 if row["status"] == "COMPLETE":
                     print(
                         f"[discovery] {prompt['prompt_id']} seed={seed} step={step} condition={name} "
-                        f"initial_mse={float(row['initial_mse']):.6g} temporal={float(row['temporal_quality']):.4f}"
+                        f"runtime_mse={float(row['initial_mse_runtime_dtype']):.6g} "
+                        f"ssim={float(row['frame_ssim_mean']):.4f}"
                     )
     if failures:
         atomic_json(root / "failed_conditions.json", failures)
@@ -1609,6 +2132,9 @@ def _metric_control_rows(
     exact: np.ndarray,
     different_seed: np.ndarray,
 ) -> list[dict[str, Any]]:
+    rng = np.random.default_rng(8128)
+    mild = np.clip(reference.astype(np.int16) + rng.integers(-3, 4, reference.shape), 0, 255).astype(np.uint8)
+    severe = np.clip(reference.astype(np.int16) + rng.integers(-64, 65, reference.shape), 0, 255).astype(np.uint8)
     blurred = np.rint(
         (
             reference.astype(np.float32)
@@ -1622,23 +2148,109 @@ def _metric_control_rows(
     controls = {
         "self": reference,
         "exact_resume": exact,
+        "mild_corruption": mild,
+        "severe_corruption": severe,
         "different_seed": different_seed,
         "temporal_shuffle": reference[::-1].copy(),
+        "frozen_first_frame": np.repeat(reference[:1], reference.shape[0], axis=0),
         "heavy_blur": blurred,
         "zero": np.zeros_like(reference),
     }
-    return [
-        {"control": name, **video_metrics(value, reference), "semantic_quality": evaluator.score(prompt, value)}
-        for name, value in controls.items()
-    ]
+    rows = []
+    for name, value in controls.items():
+        clip = evaluator.score(prompt, value)
+        rows.append(
+            {
+                "control": name,
+                **video_metrics(value, reference),
+                "prompt_clip_score": clip if math.isfinite(clip) else None,
+            }
+        )
+    return rows
 
 
-def _gate_report(output_dir: Path, checks: dict[str, tuple[bool, str]]) -> None:
+def evaluate_metric_controls(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_name = {row["control"]: row for row in rows}
+    required = {
+        "exact_self": (
+            by_name["self"]["video_mse"] == 0
+            and by_name["self"]["frame_ssim_mean"] == 1
+        ),
+        "exact_resume": (
+            by_name["exact_resume"]["video_mse"] == 0
+            and by_name["exact_resume"]["frame_ssim_mean"] == 1
+        ),
+        "severity_ordering": (
+            by_name["mild_corruption"]["video_mse"] < by_name["severe_corruption"]["video_mse"]
+            and by_name["mild_corruption"]["frame_ssim_mean"]
+            > by_name["severe_corruption"]["frame_ssim_mean"]
+        ),
+        "zero_not_high_fidelity": (
+            by_name["zero"]["video_mse"] > 0 and by_name["zero"]["frame_ssim_mean"] < 0.90
+        ),
+    }
+    descriptive = {
+        name: {
+            "temporal_delta_mse": by_name[name]["temporal_delta_mse"],
+            "temporal_delta_agreement": by_name[name]["temporal_delta_agreement"],
+            "frame_ssim_mean": by_name[name]["frame_ssim_mean"],
+        }
+        for name in ("self", "zero", "frozen_first_frame", "temporal_shuffle")
+    }
+    return {
+        "passed": all(required.values()),
+        "required_invariants": required,
+        "descriptive_temporal_controls": descriptive,
+    }
+
+
+def gate_record(
+    name: str,
+    passed: bool | None,
+    evidence: Any,
+    artifacts: Iterable[str | Path],
+    expected: str,
+    *,
+    required: bool = True,
+) -> dict[str, Any]:
+    if passed is None:
+        status = "NOT_TESTED" if required else "INFORMATIONAL"
+    else:
+        status = "PASS" if passed else "FAIL"
+    return {
+        "name": name,
+        "status": status,
+        "required": required,
+        "measured_evidence": evidence,
+        "artifact_paths": [str(path) for path in artifacts],
+        "expected_invariant": expected,
+    }
+
+
+def validate_gate_records(gates: list[dict[str, Any]]) -> bool:
+    required_fields = {
+        "name",
+        "status",
+        "required",
+        "measured_evidence",
+        "artifact_paths",
+        "expected_invariant",
+    }
+    if not gates or any(set(gate) != required_fields for gate in gates):
+        raise ValueError("Every preflight gate must contain measured gate schema")
+    allowed = {"PASS", "FAIL", "INFORMATIONAL", "NOT_TESTED"}
+    if any(gate["status"] not in allowed for gate in gates):
+        raise ValueError("Unknown gate status")
+    return all(gate["status"] == "PASS" for gate in gates if gate["required"])
+
+
+def _gate_report(output_dir: Path, gates: list[dict[str, Any]]) -> None:
     lines = ["# Video Runtime State Discovery Preflight", ""]
-    for index, (question, (passed, evidence)) in enumerate(checks.items(), start=1):
-        lines.append(f"{index}. **{'YES' if passed else 'NO'}** — {question}")
-        lines.append(f"   Evidence: {evidence}")
-    all_passed = all(value[0] for value in checks.values())
+    for index, gate in enumerate(gates, start=1):
+        lines.append(f"{index}. **{gate['status']}** — {gate['name']}")
+        lines.append(f"   Expected: {gate['expected_invariant']}")
+        lines.append(f"   Evidence: {json.dumps(gate['measured_evidence'], sort_keys=True)}")
+    all_passed = validate_gate_records(gates)
     lines += ["", f"Overall: **{'PASS' if all_passed else 'STOP'}**", ""]
     (output_dir / "preflight_report.md").write_text("\n".join(lines))
 
@@ -1648,6 +2260,7 @@ def run_preflight(
     evaluator: SemanticEvaluator,
     config: dict[str, Any],
     config_digest: str,
+    provenance: dict[str, Any],
     prompts: list[dict[str, Any]],
     output_dir: Path,
 ) -> None:
@@ -1656,32 +2269,52 @@ def run_preflight(
     seed = int(config["generation_seeds"][prompt["prompt_id"]])
     root = output_dir / "preflight"
     baseline_video, states, manifest = get_clean_trajectory(
-        omni, config, config_digest, prompt, seed, root / "trajectory"
+        omni, config, config_digest, provenance, prompt, seed, root / "trajectory"
     )
     evaluator_scores: dict[str, np.ndarray] = {}
     exact_rows = []
     iso_error_mismatches = []
-    serialized_bytes: dict[int, dict[str, int]] = {}
+    serialized_bytes: dict[int, dict[str, dict[str, int]]] = {}
+    runtime_rows = []
+    mask_rows = []
+    preflight_artifacts: list[str] = []
     for step in config["generation"]["checkpoint_steps"]:
+        runtime_state = _runtime_state_record(manifest, int(step))
+        runtime_rows.append(runtime_state)
         for name in config["conditions"]:
             prepared = prepare_condition(
                 states[step],
                 states,
                 name,
                 config,
+                runtime_state=runtime_state,
                 prompt_id=prompt["prompt_id"],
                 generation_seed=seed,
                 checkpoint_step=step,
                 directory=root / "corruptions" / f"step_{step}" / name,
             )
-            serialized_bytes.setdefault(int(step), {})[name] = prepared.total_bytes
+            serialized_bytes.setdefault(int(step), {})[name] = {
+                "payload_bytes": prepared.payload_bytes,
+                "metadata_bytes": prepared.metadata_bytes,
+                "total_bytes": prepared.total_bytes,
+            }
             invariant = tensor_invariants(
                 states[step],
                 prepared.restored,
                 require_difference=name not in IDENTITY_ALLOWED_CONDITIONS,
             )
             if name.startswith("gaussian_matched_"):
-                iso_error_mismatches.append(float(prepared.artifact_metadata["relative_mismatch"]))
+                iso_error_mismatches.append(float(prepared.artifact_metadata["runtime_relative_mismatch"]))
+            if prepared.spec.family == "missing_geometry":
+                mask_rows.append(
+                    {
+                        "step": step,
+                        "condition": name,
+                        "comparison_family": prepared.spec.comparison_family,
+                        "missing_elements": prepared.missing_elements,
+                        "mask_path": prepared.artifact_metadata["mask_path"],
+                    }
+                )
             if name in {"full_direct", "full_disk"}:
                 import torch
 
@@ -1701,10 +2334,16 @@ def run_preflight(
                 quality = video_metrics(video, baseline_video)
                 exact_rows.append({"step": step, "condition": name, "final_latent_mse": final_error["mse"], **quality})
                 evaluator_scores[f"{name}_{step}"] = video
+                saved_path = root / "exact_recovered" / f"{name}_step_{step}.npy"
+                saved_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(saved_path, video, allow_pickle=False)
+                preflight_artifacts.append(str(saved_path))
                 _cleanup_probe(probe)
             if invariant["sha256"] != array_sha256(prepared.restored):
                 raise AssertionError("Corruption invariant hash mismatch")
-    exact_pass = all(row["final_latent_mse"] == 0 and row["final_video_mse"] == 0 for row in exact_rows)
+    exact_pass = len(exact_rows) == 6 and all(
+        row["final_latent_mse"] == 0 and row["video_mse"] == 0 for row in exact_rows
+    )
     if not exact_pass:
         atomic_json(root / "exact_resume_failures.json", exact_rows)
     # Independent-audit semantics are rechecked in this namespace: z20 is
@@ -1735,19 +2374,25 @@ def run_preflight(
         )
         _cleanup_probe(probe)
     write_csv(output_dir / "resume_index_controls.csv", off_by_one_rows)
-    index_pass = all(row["final_latent_mse"] > 0 and row["final_video_mse"] > 0 for row in off_by_one_rows)
+    index_pass = all(row["final_latent_mse"] > 0 and row["video_mse"] > 0 for row in off_by_one_rows)
 
     iso_storage_mismatches = []
+    iso_storage_payload_checks = []
     for step, values in serialized_bytes.items():
-        for left, right in itertools.combinations(("int8", "spatial_down2", "low_rank_25"), 2):
-            mismatch = abs(values[left] - values[right]) / max(values[left], values[right])
-            iso_storage_mismatches.append(
-                {"checkpoint_step": step, "condition_a": left, "condition_b": right, "relative_byte_mismatch": mismatch}
-            )
+        payload_rows, pair_rows = validate_primary_iso_storage_accounting(
+            {condition: values[condition] for condition in PRIMARY_ISO_STORAGE_CONDITIONS},
+            tuple(states[int(step)].shape),
+            float(config["corruption"]["iso_storage_relative_tolerance"]),
+        )
+        iso_storage_payload_checks.extend(
+            {"checkpoint_step": step, **row} for row in payload_rows
+        )
+        iso_storage_mismatches.extend(
+            {"checkpoint_step": step, **row} for row in pair_rows
+        )
     write_csv(output_dir / "preflight_iso_storage.csv", iso_storage_mismatches)
-    iso_storage_pass = max(row["relative_byte_mismatch"] for row in iso_storage_mismatches) <= float(
-        config["corruption"]["iso_storage_relative_tolerance"]
-    )
+    write_csv(output_dir / "preflight_iso_storage_payload_checks.csv", iso_storage_payload_checks)
+    iso_storage_pass = bool(iso_storage_payload_checks and iso_storage_mismatches)
 
     different_video, different_probe, _ = run_generate(
         omni,
@@ -1762,97 +2407,141 @@ def run_preflight(
     metric_rows = _metric_control_rows(evaluator, prompt["prompt"], baseline_video, exact_video, different_video)
     write_csv(output_dir / "metric_controls.csv", metric_rows)
     _cleanup_probe(different_probe)
-    by_name = {row["control"]: row for row in metric_rows}
-    metric_pass = (
-        by_name["self"]["final_video_mse"] == 0
-        and by_name["exact_resume"]["final_video_mse"] == 0
-        and by_name["different_seed"]["final_video_mse"] > 0
-        and by_name["temporal_shuffle"]["temporal_quality"] < 0.95
-        and by_name["heavy_blur"]["spatial_quality"] < 1.0
-        and by_name["zero"]["spatial_quality"] < 1.0
-        and by_name["zero"]["semantic_quality"] < by_name["self"]["semantic_quality"]
-        and all(math.isfinite(float(row["semantic_quality"])) for row in metric_rows if evaluator.enabled)
-    )
+    metric_control_result = evaluate_metric_controls(metric_rows)
     scheduler = scheduler_document(config)
-    checks = {
-        "Is Euler explicitly selected?": (
-            scheduler["scheduler_class"].endswith(EXPECTED_SCHEDULER),
-            scheduler["scheduler_class"],
-        ),
-        "Is exact resume bit-exact at steps 10/20/30?": (exact_pass, json.dumps(exact_rows)),
-        "Is the correct resume index uniquely verified?": (index_pass, json.dumps(off_by_one_rows)),
-        "What is the exact latent shape/dtype?": (
-            all(
-                value.shape == expected_latent_shape(config) and value.dtype == np.float32 for value in states.values()
-            ),
-            f"{expected_latent_shape(config)}, float32",
-        ),
-        "Do all synthetic geometry tests pass?": (cpu["passed"], json.dumps(cpu["mask_cardinality"])),
-        "Are missing layouts defined in logical coordinates?": (
-            True,
-            "all masks are materialized as [B,C,T,H,W] boolean arrays",
-        ),
-        "Is temporal loss composed of complete temporal slices?": (True, "exactly T indices [0,1], 2/9 elements"),
-        "Is random corruption RNG independent of model RNG?": (
-            True,
-            "separate np.random.default_rng seeded by provenance hash; CPU gate preserves global state",
-        ),
-        "Are INT8/INT4 implementations documented?": (
-            True,
-            "signed per-tensor grids [-127,127] and [-7,7]; INT4 storage reported unpacked",
-        ),
-        "Are actual serialized bytes measured?": (
-            True,
-            "payload and canonical JSON metadata are written and stat-counted",
-        ),
-        "Do preregistered iso-storage cells meet 2% tolerance?": (
-            iso_storage_pass,
-            f"max relative mismatch={max(row['relative_byte_mismatch'] for row in iso_storage_mismatches):.8g}",
-        ),
-        "Do iso-error controls meet tolerance?": (
-            max(iso_error_mismatches, default=0.0) <= float(config["corruption"]["iso_error_relative_tolerance"]),
-            f"max relative mismatch={max(iso_error_mismatches, default=0.0):.8g}",
-        ),
-        "Do metric negative controls pass?": (metric_pass, json.dumps(metric_rows)),
-        "Are clean checkpoints paired across all corruptions?": (True, f"trajectory_id={manifest['trajectory_id']}"),
-        "Is old invalid Stage B data excluded?": (True, "no Stage A/B path or row is read by this script"),
+    runtime_pass = all(
+        row["runtime_dtype"] == EXPECTED_RUNTIME_DTYPE
+        and int(row["runtime_element_size_bytes"]) == 2
+        and int(row["runtime_payload_bytes"]) == int(row["runtime_numel"]) * 2
+        for row in runtime_rows
+    )
+    iso_missing_rows = [
+        row for row in mask_rows if row["comparison_family"] == "iso_missing_2of9"
+    ]
+    expected_missing = {
+        int(step): {
+            row["missing_elements"] for row in iso_missing_rows if int(row["step"]) == int(step)
+        }
+        for step in config["generation"]["checkpoint_steps"]
     }
+    expected_iso_missing_names = {
+        int(step): {
+            row["condition"] for row in iso_missing_rows if int(row["step"]) == int(step)
+        }
+        for step in config["generation"]["checkpoint_steps"]
+    }
+    real_shape_expected = (
+        states[int(config["generation"]["checkpoint_steps"][0])].shape[0]
+        * states[int(config["generation"]["checkpoint_steps"][0])].shape[1]
+        * int(config["corruption"]["temporal_missing_slices"])
+        * states[int(config["generation"]["checkpoint_steps"][0])].shape[3]
+        * states[int(config["generation"]["checkpoint_steps"][0])].shape[4]
+    )
+    cardinality_pass = all(
+        values == {int(real_shape_expected)}
+        and expected_iso_missing_names[step] == set(ISO_MISSING_CONDITIONS)
+        for step, values in expected_missing.items()
+    )
+    artifact_pass = bool(preflight_artifacts) and all(Path(path).exists() for path in preflight_artifacts)
+    provenance_pass = manifest["provenance_hash"] == provenance["provenance_hash"]
+    no_v2_reuse = all("video_runtime_state_discovery_v2" not in path for path in preflight_artifacts)
+    gates = [
+        gate_record("G1 explicit Euler", scheduler["scheduler_class"].endswith(EXPECTED_SCHEDULER), scheduler, [], EXPECTED_SCHEDULER),
+        gate_record("G2 runtime BF16", runtime_pass, runtime_rows, [manifest["states"][0]["latent_path"]], "captured runtime state is BF16"),
+        gate_record("G3 authoritative runtime bytes", runtime_pass, runtime_rows, [], "runtime bytes = numel * 2"),
+        gate_record("G4 FULL direct exact", exact_pass and all(row["final_latent_mse"] == 0 for row in exact_rows if row["condition"] == "full_direct"), exact_rows, preflight_artifacts, "exact at steps 10/20/30"),
+        gate_record("G5 FULL disk exact", exact_pass and all(row["final_latent_mse"] == 0 for row in exact_rows if row["condition"] == "full_disk"), exact_rows, preflight_artifacts, "exact at steps 10/20/30"),
+        gate_record("G6 resume-index controls", index_pass, off_by_one_rows, [output_dir / "resume_index_controls.csv"], "indices 19 and 21 are non-exact"),
+        gate_record(
+            "G7 corruption cardinality",
+            cpu["passed"] and cardinality_pass,
+            {
+                "cpu": cpu,
+                "real_iso_missing_cardinality": expected_missing,
+                "real_iso_missing_conditions": expected_iso_missing_names,
+                "expected_cardinality": int(real_shape_expected),
+                "excluded_descriptive_conditions": ["channel_contiguous"],
+            },
+            [row["mask_path"] for row in mask_rows],
+            "exactly the four preregistered iso-missing conditions retain equal cardinality",
+        ),
+        gate_record("G8 recovered artifacts persist", artifact_pass, preflight_artifacts, preflight_artifacts, "all exact recovered videos exist"),
+        gate_record("G9 reference-fidelity controls", metric_control_result["passed"], metric_control_result, [output_dir / "metric_controls.csv"], "exact/mild/severe/zero invariants pass"),
+        gate_record(
+            "G10 temporal controls descriptive only",
+            None,
+            metric_control_result["descriptive_temporal_controls"],
+            [output_dir / "metric_controls.csv"],
+            "zero/frozen/shuffle temporal-delta measurements are descriptive and do not gate science",
+            required=False,
+        ),
+        gate_record("G11 CLIP auxiliary only", "prompt_clip_score" in RAW_FIELDS and "semantic_quality" not in RAW_FIELDS, {"raw_field": "prompt_clip_score", "primary_metric_fields": ["video_mse", "video_psnr", "frame_ssim_mean"]}, [], "CLIP and temporal-delta metrics are excluded from recovery gates"),
+        gate_record("G12 designed runtime-dtype iso-error", max(iso_error_mismatches, default=math.inf) <= float(config["corruption"]["iso_error_relative_tolerance"]), {"mismatches": iso_error_mismatches}, [], "all designed pairs meet runtime-dtype tolerance"),
+        gate_record("G13 provenance", provenance_pass, provenance, [output_dir / "run_provenance.json"], "code/config/runtime provenance matches"),
+        gate_record("G14 v2 isolation", no_v2_reuse and config["experiment_version"].startswith("video-runtime-state-discovery-v3"), {"namespace": str(output_dir), "artifacts": preflight_artifacts}, preflight_artifacts, "no v2 artifact is reused"),
+        gate_record("G15 computed gate schema", None, {"gate_count": 15}, [], "all required gates are measured", required=False),
+        gate_record(
+            "Iso-storage byte match",
+            iso_storage_pass,
+            {"pairs": iso_storage_mismatches, "payload_checks": iso_storage_payload_checks},
+            [output_dir / "preflight_iso_storage.csv", output_dir / "preflight_iso_storage_payload_checks.csv"],
+            "planned payloads match exactly and serialized candidate bytes are within configured tolerance",
+        ),
+    ]
+    gates[14] = gate_record("G15 computed gate schema", validate_gate_records(gates[:14]), {"required_gate_count": 14}, [], "all required gates are measured")
+    all_passed = validate_gate_records(gates)
     atomic_json(
         output_dir / "preflight_gates.json",
         {
             "config_hash": config_digest,
-            "all_passed": all(value[0] for value in checks.values()),
-            "checks": checks,
+            "provenance_hash": provenance["provenance_hash"],
+            "all_passed": all_passed,
+            "gates": gates,
             "exact_rows": exact_rows,
         },
     )
-    _gate_report(output_dir, checks)
-    if not all(value[0] for value in checks.values()):
+    _gate_report(output_dir, gates)
+    if not all_passed:
         raise RuntimeError("STOP: one or more discovery preflight gates failed")
 
 
-def require_gate(path: Path, config_digest: str, name: str) -> dict[str, Any]:
+def require_gate(path: Path, config_digest: str, provenance: dict[str, Any], name: str) -> dict[str, Any]:
     if not path.exists():
         raise RuntimeError(f"{name} gate missing: {path}")
     document = json.loads(path.read_text())
-    if document.get("config_hash") != config_digest or not document.get("all_passed"):
+    if (
+        document.get("config_hash") != config_digest
+        or document.get("provenance_hash") != provenance["provenance_hash"]
+        or not document.get("all_passed")
+    ):
         raise RuntimeError(f"{name} gate is stale or failed")
     return document
 
 
-def require_cpu_gate(path: Path, config_digest: str) -> dict[str, Any]:
+def require_cpu_gate(path: Path, config_digest: str, provenance: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         raise RuntimeError("CPU test/preflight marker missing; run the wrapper's cpu stage first")
     document = json.loads(path.read_text())
-    if document.get("config_hash") != config_digest or not document.get("passed"):
+    if (
+        document.get("config_hash") != config_digest
+        or document.get("provenance_hash") != provenance["provenance_hash"]
+        or not document.get("passed")
+    ):
         raise RuntimeError("CPU test/preflight marker is stale or failed")
     return document
 
 
-def write_preregistered_config(output_dir: Path, config: dict[str, Any], prompt_sha: str, config_digest: str) -> None:
+def write_preregistered_config(
+    output_dir: Path,
+    config: dict[str, Any],
+    prompt_sha: str,
+    config_digest: str,
+    provenance: dict[str, Any],
+) -> None:
     document = {
         "config_hash": config_digest,
         "prompt_set_sha256": prompt_sha,
+        "provenance_hash": provenance["provenance_hash"],
         "frozen_before_full_discovery": True,
         "config": config,
     }
@@ -1867,42 +2556,99 @@ def run_smoke(
     evaluator: SemanticEvaluator,
     config: dict[str, Any],
     config_digest: str,
+    provenance: dict[str, Any],
     prompt_sha: str,
     prompts: list[dict[str, Any]],
     output_dir: Path,
 ) -> None:
-    require_gate(output_dir / "preflight_gates.json", config_digest, "preflight")
+    preflight = require_gate(output_dir / "preflight_gates.json", config_digest, provenance, "preflight")
     rows = run_matrix(
         omni,
         evaluator,
         config,
         config_digest,
+        provenance,
         prompts,
         output_dir,
         namespace="smoke",
         conditions=config["smoke_conditions"],
         prompt_start=0,
         prompt_end=1,
-        keep_videos=True,
     )
-    expected = len(config["generation"]["checkpoint_steps"]) * len(config["smoke_conditions"])
-    all_passed = len(rows) == expected and all(
+    expected_keys = expected_smoke_keys(config, prompts[0]["prompt_id"])
+    completeness = validate_expected_key_set(rows, expected_keys)
+    expected = len(expected_keys)
+    all_passed = completeness["passed"] and all(
         math.isfinite(float(row[key]))
         for row in rows
         for key in (
-            "initial_mse",
+            "initial_mse_probe_dtype",
+            "initial_mse_runtime_dtype",
             "final_latent_mse",
-            "final_video_mse",
-            "spatial_quality",
-            "temporal_quality",
-            "semantic_quality",
+            "video_mse",
+            "frame_ssim_mean",
         )
     )
     if not all_passed:
         raise RuntimeError(f"Smoke matrix incomplete or invalid: {len(rows)}/{expected}")
-    write_preregistered_config(output_dir, config, prompt_sha, config_digest)
+    smoke_artifact_pass = all(
+        Path(row[key]).exists()
+        for row in rows
+        for key in (
+            "recovered_video_path",
+            "recovered_final_latent_path",
+            "clean_reference_video_path",
+            "clean_reference_final_latent_path",
+        )
+    )
+    smoke_provenance_pass = all(row["provenance_hash"] == provenance["provenance_hash"] for row in rows)
+    smoke_runtime_pass = all(
+        row["runtime_dtype"] == EXPECTED_RUNTIME_DTYPE
+        and int(row["runtime_full_bytes"]) == int(row["runtime_numel"]) * 2
+        for row in rows
+    )
+    smoke_exact_pass = all(
+        _float(row, "final_latent_mse") == 0 and _float(row, "video_mse") == 0
+        for row in rows
+        if row["corruption_name"] in {"full_direct", "full_disk"}
+    )
+    smoke_gates = [
+        gate_record(
+            "smoke matrix complete",
+            completeness["passed"],
+            completeness,
+            [output_dir / "smoke" / "smoke_raw_results.csv"],
+            "exact expected key-set equality for one prompt",
+        ),
+        gate_record("smoke runtime BF16 bytes", smoke_runtime_pass, {"runtime_full_bytes": sorted({int(row["runtime_full_bytes"]) for row in rows})}, [], "BF16 and numel*2"),
+        gate_record("smoke FULL exact", smoke_exact_pass, {"full_rows": sum(row["corruption_name"] in {"full_direct", "full_disk"} for row in rows)}, [], "direct/disk exact at 10/20/30"),
+        gate_record("smoke scientific artifacts", smoke_artifact_pass, {"conditions": len(rows)}, [row["recovered_video_path"] for row in rows], "all final videos and latents persist"),
+        gate_record("smoke provenance", smoke_provenance_pass, provenance, [output_dir / "run_provenance.json"], "all rows match current provenance"),
+        gate_record("preflight G1-G15 inherited", preflight["all_passed"] and len([gate for gate in preflight["gates"] if gate["name"].startswith("G")]) == 15, {"gates": preflight["gates"]}, [output_dir / "preflight_gates.json"], "all required scientific gates were measured and passed"),
+    ]
+    smoke_gates_pass = validate_gate_records(smoke_gates)
     atomic_json(
-        output_dir / "smoke_complete.json", {"config_hash": config_digest, "all_passed": True, "rows": len(rows)}
+        output_dir / "smoke_gates.json",
+        {
+            "config_hash": config_digest,
+            "provenance_hash": provenance["provenance_hash"],
+            "all_passed": smoke_gates_pass,
+            "gates": smoke_gates,
+        },
+    )
+    if not smoke_gates_pass:
+        raise RuntimeError("Smoke scientific gates failed")
+    write_preregistered_config(output_dir, config, prompt_sha, config_digest, provenance)
+    atomic_json(
+        output_dir / "smoke_complete.json",
+        {
+            "config_hash": config_digest,
+            "provenance_hash": provenance["provenance_hash"],
+            "all_passed": smoke_gates_pass,
+            "rows": len(rows),
+            "expected_rows": expected,
+            "key_set_completeness": completeness,
+        },
     )
 
 
@@ -1923,6 +2669,12 @@ def clean_trajectory_manifest(output_dir: Path) -> list[dict[str, Any]]:
                     "tensor_sha256": state["tensor_sha256"],
                     "shape": json.dumps(state["shape"]),
                     "dtype": state["dtype"],
+                    "runtime_dtype": state["runtime_dtype"],
+                    "runtime_element_size_bytes": state["runtime_element_size_bytes"],
+                    "runtime_numel": state["runtime_numel"],
+                    "runtime_payload_bytes": state["runtime_payload_bytes"],
+                    "probe_dtype": state["probe_dtype"],
+                    "probe_payload_bytes": state["probe_payload_bytes"],
                     "latent_path": state["latent_path"],
                 }
             )
@@ -1945,9 +2697,11 @@ def corruption_manifest(output_dir: Path) -> list[dict[str, Any]]:
                 "corruption_seed",
                 "clean_latent_hash",
                 "corrupted_latent_hash",
-                "payload_bytes",
+                "runtime_full_bytes",
+                "serialized_payload_bytes",
                 "metadata_bytes",
-                "total_bytes",
+                "serialized_candidate_bytes",
+                "candidate_ratio_vs_runtime_state",
                 "condition_metadata_json",
                 "result_path",
             )
@@ -1998,410 +2752,354 @@ def spearman(values_a: list[float], values_b: list[float]) -> float:
     return float(np.corrcoef(rank_a, rank_b)[0, 1])
 
 
-def analyze_discovery(config: dict[str, Any], config_digest: str, output_dir: Path) -> None:
+
+
+def expected_matrix_keys(config: dict[str, Any]) -> set[tuple[str, int, int, str]]:
+    return {
+        (prompt_id, int(config["generation_seeds"][prompt_id]), int(step), condition)
+        for prompt_id in config["prompt_ids"]
+        for step in config["generation"]["checkpoint_steps"]
+        for condition in config["conditions"]
+    }
+
+
+def expected_smoke_keys(
+    config: dict[str, Any], prompt_id: str
+) -> set[tuple[str, int, int, str]]:
+    return {
+        (
+            prompt_id,
+            int(config["generation_seeds"][prompt_id]),
+            int(step),
+            condition,
+        )
+        for step in config["generation"]["checkpoint_steps"]
+        for condition in config["smoke_conditions"]
+    }
+
+
+def validate_expected_key_set(
+    rows: list[dict[str, Any]], expected: set[tuple[str, int, int, str]], *, raise_on_error: bool = True
+) -> dict[str, Any]:
+    observed = [
+        (
+            row["prompt_id"],
+            int(row["generation_seed"]),
+            int(row["checkpoint_step"]),
+            row["corruption_name"],
+        )
+        for row in rows
+    ]
+    counts: dict[tuple[str, int, int, str], int] = {}
+    for key in observed:
+        counts[key] = counts.get(key, 0) + 1
+    observed_set = set(observed)
+    document = {
+        "expected_count": len(expected),
+        "observed_count": len(observed),
+        "missing_keys": [list(key) for key in sorted(expected - observed_set)],
+        "duplicate_keys": [list(key) for key, count in sorted(counts.items()) if count > 1],
+        "unexpected_keys": [list(key) for key in sorted(observed_set - expected)],
+    }
+    document["passed"] = not any(
+        document[key] for key in ("missing_keys", "duplicate_keys", "unexpected_keys")
+    )
+    if raise_on_error and not document["passed"]:
+        raise RuntimeError(f"Discovery matrix key-set mismatch: {json.dumps(document, sort_keys=True)}")
+    return document
+
+
+def validate_clean_checkpoint_pairing(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[tuple[str, int, int], set[str]] = {}
+    for row in rows:
+        key = (
+            row["prompt_id"],
+            int(row["generation_seed"]),
+            int(row["checkpoint_step"]),
+        )
+        clean_hash = str(row.get("clean_latent_hash", "")).strip()
+        if not clean_hash:
+            raise RuntimeError(f"Missing clean_latent_hash for clean checkpoint cell {key}")
+        grouped.setdefault(key, set()).add(clean_hash)
+    mismatched = {
+        key: sorted(hashes) for key, hashes in grouped.items() if len(hashes) != 1
+    }
+    if mismatched:
+        raise RuntimeError(
+            "Clean checkpoint pairing mismatch: "
+            + json.dumps({str(key): value for key, value in mismatched.items()}, sort_keys=True)
+        )
+    return {"passed": True, "cell_count": len(grouped)}
+
+
+def build_prompt_corruption_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries = []
+    ordered = sorted(
+        rows,
+        key=lambda row: (
+            row["prompt_id"],
+            row["corruption_name"],
+            int(row["checkpoint_step"]),
+        ),
+    )
+    for (prompt_id, condition), iterator in itertools.groupby(
+        ordered,
+        key=lambda row: (row["prompt_id"], row["corruption_name"]),
+    ):
+        group = list(iterator)
+        checkpoint_steps = [int(row["checkpoint_step"]) for row in group]
+        if checkpoint_steps != sorted(checkpoint_steps) or len(checkpoint_steps) != len(set(checkpoint_steps)):
+            raise RuntimeError(f"Invalid by-step alignment for {prompt_id}/{condition}: {checkpoint_steps}")
+        summaries.append(
+            {
+                "prompt_id": prompt_id,
+                "motion_category": group[0]["motion_category"],
+                "corruption_name": condition,
+                "checkpoint_steps": json.dumps(checkpoint_steps),
+                "frame_ssim_by_step": json.dumps(
+                    [_float(row, "frame_ssim_mean") for row in group]
+                ),
+                "temporal_delta_agreement_by_step_descriptive": json.dumps(
+                    [_float(row, "temporal_delta_agreement") for row in group]
+                ),
+                "runtime_mse_by_step": json.dumps(
+                    [_float(row, "initial_mse_runtime_dtype") for row in group]
+                ),
+            }
+        )
+    return summaries
+
+
+def designed_iso_error_comparisons(
+    cell: dict[str, dict[str, Any]], tolerance: float
+) -> list[dict[str, Any]]:
+    rows = []
+    for source_name, matched_name in DESIGNED_ISO_ERROR_PAIRS:
+        source = cell[source_name]
+        matched = cell[matched_name]
+        source_mse = _float(source, "initial_mse_runtime_dtype")
+        matched_mse = _float(matched, "initial_mse_runtime_dtype")
+        mismatch = abs(source_mse - matched_mse) / max(source_mse, matched_mse, 1e-30)
+        if mismatch > tolerance:
+            raise RuntimeError(
+                f"Designed runtime-dtype iso-error pair exceeds tolerance: {source_name}/{matched_name}={mismatch}"
+            )
+        rows.append(
+            {
+                "condition_a": source_name,
+                "condition_b": matched_name,
+                "initial_mse_probe_dtype_a": _float(source, "initial_mse_probe_dtype"),
+                "initial_mse_probe_dtype_b": _float(matched, "initial_mse_probe_dtype"),
+                "initial_mse_runtime_dtype_a": source_mse,
+                "initial_mse_runtime_dtype_b": matched_mse,
+                "runtime_relative_mse_mismatch": mismatch,
+                "frame_ssim_delta_a_minus_b": _float(source, "frame_ssim_mean")
+                - _float(matched, "frame_ssim_mean"),
+            }
+        )
+    return rows
+
+
+def stale_minus_matched(stale: dict[str, Any], matched: dict[str, Any]) -> dict[str, Any]:
+    if stale["corruption_family"] != "staleness" or matched["corruption_family"] == "staleness":
+        raise ValueError("stale_minus_matched requires explicit stale and matched arguments")
+    return {
+        "stale_condition": stale["corruption_name"],
+        "matched_condition": matched["corruption_name"],
+        "stale_metric": _float(stale, "frame_ssim_mean"),
+        "matched_metric": _float(matched, "frame_ssim_mean"),
+        "stale_minus_matched": _float(stale, "frame_ssim_mean") - _float(matched, "frame_ssim_mean"),
+    }
+
+
+def analyze_discovery(
+    config: dict[str, Any],
+    config_digest: str,
+    provenance: dict[str, Any],
+    output_dir: Path,
+) -> None:
     input_path = output_dir / "raw_results.csv"
     if not input_path.exists():
         raise RuntimeError(f"Raw discovery matrix missing: {input_path}")
     rows = read_csv(input_path)
-    expected = 12 * len(config["generation"]["checkpoint_steps"]) * len(config["conditions"])
-    keys = [(row["prompt_id"], row["generation_seed"], row["checkpoint_step"], row["corruption_name"]) for row in rows]
-    if len(rows) != expected or len(keys) != len(set(keys)):
-        raise RuntimeError(f"Discovery analysis requires exactly {expected} unique COMPLETE rows, got {len(rows)}")
-    if any(row["config_hash"] != config_digest or row["scheduler"] != EXPECTED_SCHEDULER for row in rows):
-        raise RuntimeError("Raw rows contain stale config or non-Euler scheduler")
+    for row in rows:
+        validate_raw_schema(row)
+    completeness = validate_expected_key_set(rows, expected_matrix_keys(config))
+    atomic_json(output_dir / "matrix_completeness.json", completeness)
+    clean_pairing = validate_clean_checkpoint_pairing(rows)
+    atomic_json(output_dir / "clean_checkpoint_pairing.json", clean_pairing)
+    if any(
+        row["config_hash"] != config_digest
+        or row["provenance_hash"] != provenance["provenance_hash"]
+        or row["scheduler"] != EXPECTED_SCHEDULER
+        for row in rows
+    ):
+        raise RuntimeError("Raw rows contain stale provenance/config or non-Euler scheduler")
     full_rows = [row for row in rows if row["corruption_name"] in {"full_direct", "full_disk"}]
-    if any(_float(row, "final_latent_mse") != 0 or _float(row, "final_video_mse") != 0 for row in full_rows):
+    if any(_float(row, "final_latent_mse") != 0 or _float(row, "video_mse") != 0 for row in full_rows):
         raise RuntimeError("GLOBAL STOP: FULL condition is non-exact in discovery input")
 
+    by_cell: dict[tuple[str, int], dict[str, dict[str, Any]]] = {}
+    for row in rows:
+        by_cell.setdefault((row["prompt_id"], int(row["checkpoint_step"])), {})[
+            row["corruption_name"]
+        ] = row
+
     progress_rows = []
-    for (name, step), group in itertools.groupby(
+    for (condition, step), iterator in itertools.groupby(
         sorted(rows, key=lambda row: (row["corruption_name"], int(row["checkpoint_step"]))),
         key=lambda row: (row["corruption_name"], int(row["checkpoint_step"])),
     ):
-        group_rows = list(group)
+        group = list(iterator)
         progress_rows.append(
             {
-                "corruption_name": name,
+                "corruption_name": condition,
                 "checkpoint_step": step,
-                "prompt_count": len(group_rows),
-                "initial_mse_mean": _mean(_float(row, "initial_mse") for row in group_rows),
-                "final_latent_mse_mean": _mean(_float(row, "final_latent_mse") for row in group_rows),
-                "spatial_quality_mean": _mean(_float(row, "spatial_quality") for row in group_rows),
-                "spatial_quality_median": _median(_float(row, "spatial_quality") for row in group_rows),
-                "temporal_quality_mean": _mean(_float(row, "temporal_quality") for row in group_rows),
-                "temporal_quality_median": _median(_float(row, "temporal_quality") for row in group_rows),
-                "temporal_quality_min": min(_float(row, "temporal_quality") for row in group_rows),
-                "temporal_quality_max": max(_float(row, "temporal_quality") for row in group_rows),
+                "checkpoint_scheduler_timestep": group[0]["checkpoint_scheduler_timestep"],
+                "current_expert": group[0]["current_expert"],
+                "crosses_expert_boundary_after_resume": group[0]["crosses_expert_boundary_after_resume"],
+                "progress_interpretation_warning": "step effects are confounded with Wan2.2 expert region",
+                "initial_mse_runtime_dtype_mean": _mean(_float(row, "initial_mse_runtime_dtype") for row in group),
+                "frame_ssim_mean": _mean(_float(row, "frame_ssim_mean") for row in group),
+                "video_mse_mean": _mean(_float(row, "video_mse") for row in group),
+                "temporal_delta_mse_mean": _mean(_float(row, "temporal_delta_mse") for row in group),
+                "prompt_count": len(group),
             }
         )
     write_csv(output_dir / "progress_summary.csv", progress_rows)
 
-    prompt_rows = []
-    for (prompt_id, name), group in itertools.groupby(
-        sorted(rows, key=lambda row: (row["prompt_id"], row["corruption_name"], int(row["checkpoint_step"]))),
-        key=lambda row: (row["prompt_id"], row["corruption_name"]),
-    ):
-        group_rows = list(group)
-        prompt_rows.append(
-            {
-                "prompt_id": prompt_id,
-                "corruption_name": name,
-                "checkpoint_steps": json.dumps([int(row["checkpoint_step"]) for row in group_rows]),
-                "spatial_quality_by_step": json.dumps([_float(row, "spatial_quality") for row in group_rows]),
-                "temporal_quality_by_step": json.dumps([_float(row, "temporal_quality") for row in group_rows]),
-                "initial_mse_by_step": json.dumps([_float(row, "initial_mse") for row in group_rows]),
-            }
-        )
+    prompt_rows = build_prompt_corruption_summary(rows)
     write_csv(output_dir / "prompt_corruption_summary.csv", prompt_rows)
 
-    by_cell: dict[tuple[str, int], dict[str, dict[str, str]]] = {}
-    for row in rows:
-        by_cell.setdefault((row["prompt_id"], int(row["checkpoint_step"])), {})[row["corruption_name"]] = row
-    reversal_threshold = float(config["discovery_flags"]["ordering_reversal_quality_delta"])
-    reversal_rows = []
-    names = [name for name in config["conditions"] if name not in {"full_direct", "full_disk"}]
-    for prompt_id in config["prompt_ids"]:
-        for left, right in itertools.combinations(names, 2):
-            deltas = {}
-            for step in config["generation"]["checkpoint_steps"]:
-                cell = by_cell[(prompt_id, step)]
-                deltas[step] = _float(cell[left], "temporal_quality") - _float(cell[right], "temporal_quality")
-            positive = [step for step, value in deltas.items() if value >= reversal_threshold]
-            negative = [step for step, value in deltas.items() if value <= -reversal_threshold]
-            if positive and negative:
-                reversal_rows.append(
-                    {
-                        "prompt_id": prompt_id,
-                        "condition_a": left,
-                        "condition_b": right,
-                        "delta_step10": deltas[10],
-                        "delta_step20": deltas[20],
-                        "delta_step30": deltas[30],
-                        "positive_steps": json.dumps(positive),
-                        "negative_steps": json.dumps(negative),
-                    }
-                )
-    write_csv(
-        output_dir / "ordering_reversals.csv",
-        reversal_rows,
-        (
-            "prompt_id",
-            "condition_a",
-            "condition_b",
-            "delta_step10",
-            "delta_step20",
-            "delta_step30",
-            "positive_steps",
-            "negative_steps",
-        ),
-    )
-
     iso_error_rows = []
-    iso_storage_rows = []
-    staleness_rows = []
+    incidental_rows = []
     error_tolerance = float(config["corruption"]["iso_error_relative_tolerance"])
-    storage_tolerance = float(config["corruption"]["iso_storage_relative_tolerance"])
-    stale_tolerance = float(config["corruption"]["staleness_relative_tolerance"])
-    for (prompt_id, step), cell in by_cell.items():
-        cell_rows = list(cell.values())
+    for (prompt_id, step), cell in sorted(by_cell.items()):
+        for row in designed_iso_error_comparisons(cell, error_tolerance):
+            iso_error_rows.append({"prompt_id": prompt_id, "checkpoint_step": step, **row})
+        cell_rows = sorted(cell.values(), key=lambda row: row["corruption_name"])
+        designed = {frozenset(pair) for pair in DESIGNED_ISO_ERROR_PAIRS}
         for left, right in itertools.combinations(cell_rows, 2):
-            mse_l = _float(left, "initial_mse")
-            mse_r = _float(right, "initial_mse")
-            if max(mse_l, mse_r) > 0:
-                mismatch = abs(mse_l - mse_r) / max(mse_l, mse_r)
-                if mismatch <= error_tolerance:
-                    iso_error_rows.append(
-                        {
-                            "prompt_id": prompt_id,
-                            "checkpoint_step": step,
-                            "condition_a": left["corruption_name"],
-                            "condition_b": right["corruption_name"],
-                            "initial_mse_a": mse_l,
-                            "initial_mse_b": mse_r,
-                            "relative_mse_mismatch": mismatch,
-                            "spatial_quality_delta": _float(left, "spatial_quality") - _float(right, "spatial_quality"),
-                            "temporal_quality_delta": _float(left, "temporal_quality")
-                            - _float(right, "temporal_quality"),
-                        }
-                    )
-                if (left["corruption_family"] == "staleness") != (
-                    right["corruption_family"] == "staleness"
-                ) and mismatch <= stale_tolerance:
-                    staleness_rows.append(
-                        {
-                            "prompt_id": prompt_id,
-                            "checkpoint_step": step,
-                            "stale_condition": left["corruption_name"]
-                            if left["corruption_family"] == "staleness"
-                            else right["corruption_name"],
-                            "matched_condition": right["corruption_name"]
-                            if left["corruption_family"] == "staleness"
-                            else left["corruption_name"],
-                            "relative_mse_mismatch": mismatch,
-                            "temporal_quality_delta": _float(left, "temporal_quality")
-                            - _float(right, "temporal_quality"),
-                        }
-                    )
-            bytes_l = int(left["total_bytes"])
-            bytes_r = int(right["total_bytes"])
-            byte_mismatch = abs(bytes_l - bytes_r) / max(bytes_l, bytes_r)
-            if (
-                left["comparison_family"] == "iso_storage_25pct"
-                and right["comparison_family"] == "iso_storage_25pct"
-                and byte_mismatch <= storage_tolerance
-            ):
-                iso_storage_rows.append(
+            pair = frozenset((left["corruption_name"], right["corruption_name"]))
+            if pair in designed:
+                continue
+            left_mse = _float(left, "initial_mse_runtime_dtype")
+            right_mse = _float(right, "initial_mse_runtime_dtype")
+            mismatch = abs(left_mse - right_mse) / max(left_mse, right_mse, 1e-30)
+            if max(left_mse, right_mse) > 0 and mismatch <= error_tolerance:
+                incidental_rows.append(
                     {
                         "prompt_id": prompt_id,
                         "checkpoint_step": step,
                         "condition_a": left["corruption_name"],
                         "condition_b": right["corruption_name"],
-                        "bytes_a": bytes_l,
-                        "bytes_b": bytes_r,
-                        "relative_byte_mismatch": byte_mismatch,
-                        "spatial_quality_delta": _float(left, "spatial_quality") - _float(right, "spatial_quality"),
-                        "temporal_quality_delta": _float(left, "temporal_quality") - _float(right, "temporal_quality"),
+                        "runtime_relative_mse_mismatch": mismatch,
                     }
                 )
     write_csv(output_dir / "iso_error_pairs.csv", iso_error_rows)
-    write_csv(output_dir / "iso_storage_pairs.csv", iso_storage_rows)
-    write_csv(output_dir / "staleness_pairs.csv", staleness_rows)
+    write_csv(output_dir / "exploratory_incidental_iso_error_pairs.csv", incidental_rows)
 
-    interaction_rows = []
-    for name in names:
-        for step in config["generation"]["checkpoint_steps"]:
-            group = [row for row in rows if row["corruption_name"] == name and int(row["checkpoint_step"]) == step]
-            temporal_loss = [1.0 - _float(row, "temporal_quality") for row in group]
-            for descriptor in (
-                "content_motion_proxy",
-                "content_spatial_gradient_proxy",
-                "latent_temporal_change_proxy",
-            ):
-                interaction_rows.append(
-                    {
-                        "corruption_name": name,
-                        "checkpoint_step": step,
-                        "descriptor": descriptor,
-                        "spearman_rho_exploratory": spearman([_float(row, descriptor) for row in group], temporal_loss),
-                        "prompt_count": len(group),
-                        "confirmatory_p_value": "NOT_COMPUTED_DISCOVERY_SET",
-                    }
+    iso_storage_rows = []
+    storage_tolerance = float(config["corruption"]["iso_storage_relative_tolerance"])
+    for (prompt_id, step), cell in sorted(by_cell.items()):
+        candidates = {
+            row["corruption_name"]: row
+            for row in cell.values()
+            if row["comparison_family"] == "iso_storage_runtime"
+            and row["comparison_role"] == "checkpoint_representation_candidate"
+            and row["serialized_candidate_deployment_meaningful"] in (True, "True", "true", "1")
+        }
+        if set(candidates) != set(PRIMARY_ISO_STORAGE_CONDITIONS):
+            raise RuntimeError(
+                f"Primary iso-storage cell {prompt_id}/{step} has {sorted(candidates)}, "
+                f"expected {list(PRIMARY_ISO_STORAGE_CONDITIONS)}"
+            )
+        for left_name, right_name in itertools.combinations(PRIMARY_ISO_STORAGE_CONDITIONS, 2):
+            left = candidates[left_name]
+            right = candidates[right_name]
+            left_bytes = int(left["serialized_candidate_bytes"])
+            right_bytes = int(right["serialized_candidate_bytes"])
+            mismatch = abs(left_bytes - right_bytes) / max(left_bytes, right_bytes)
+            if mismatch > storage_tolerance:
+                raise RuntimeError(
+                    f"Primary iso-storage byte mismatch exceeds tolerance for "
+                    f"{prompt_id}/{step}/{left_name}/{right_name}: {mismatch}"
                 )
-    write_csv(output_dir / "content_interactions.csv", interaction_rows)
+            iso_storage_rows.append(
+                {
+                    "prompt_id": prompt_id,
+                    "checkpoint_step": step,
+                    "condition_a": left["corruption_name"],
+                    "condition_b": right["corruption_name"],
+                    "candidate_ratio_vs_runtime_state_a": _float(left, "candidate_ratio_vs_runtime_state"),
+                    "candidate_ratio_vs_runtime_state_b": _float(right, "candidate_ratio_vs_runtime_state"),
+                    "relative_byte_mismatch": mismatch,
+                    "frame_ssim_delta_a_minus_b": _float(left, "frame_ssim_mean")
+                    - _float(right, "frame_ssim_mean"),
+                }
+            )
+    write_csv(output_dir / "iso_storage_pairs.csv", iso_storage_rows)
 
-    disagreement_rows = []
-    for row in rows:
-        spatial = _float(row, "spatial_quality")
-        temporal = _float(row, "temporal_quality")
-        if spatial >= 0.95 and temporal <= 0.70:
-            disagreement_rows.append(
-                {
-                    "prompt_id": row["prompt_id"],
-                    "checkpoint_step": row["checkpoint_step"],
-                    "corruption_name": row["corruption_name"],
-                    "disagreement": "spatial_high_temporal_low",
-                    "spatial_quality": spatial,
-                    "temporal_quality": temporal,
-                    "semantic_quality": row["semantic_quality"],
-                    "initial_mse": row["initial_mse"],
-                }
+    staleness_rows = []
+    stale_tolerance = float(config["corruption"]["staleness_relative_tolerance"])
+    for (prompt_id, step), cell in sorted(by_cell.items()):
+        nonstale = sorted(
+            (row for row in cell.values() if row["corruption_family"] != "staleness"),
+            key=lambda row: row["corruption_name"],
+        )
+        for stale_name in ("stale_1", "stale_2"):
+            stale = cell[stale_name]
+            stale_mse = _float(stale, "initial_mse_runtime_dtype")
+            matched = min(
+                nonstale,
+                key=lambda row: (
+                    abs(_float(row, "initial_mse_runtime_dtype") - stale_mse),
+                    row["corruption_name"],
+                ),
             )
-        full = by_cell[(row["prompt_id"], int(row["checkpoint_step"]))]["full_direct"]
-        semantic = _float(row, "semantic_quality")
-        full_semantic = _float(full, "semantic_quality")
-        if (
-            math.isfinite(semantic)
-            and math.isfinite(full_semantic)
-            and semantic >= 0.95 * full_semantic
-            and temporal <= 0.70
-        ):
-            disagreement_rows.append(
-                {
-                    "prompt_id": row["prompt_id"],
-                    "checkpoint_step": row["checkpoint_step"],
-                    "corruption_name": row["corruption_name"],
-                    "disagreement": "semantic_high_temporal_low",
-                    "spatial_quality": spatial,
-                    "temporal_quality": temporal,
-                    "semantic_quality": semantic,
-                    "initial_mse": row["initial_mse"],
-                }
-            )
-    for (prompt_id, step), cell in by_cell.items():
-        candidates = [row for row in cell.values() if row["corruption_name"] not in {"full_direct", "full_disk"}]
-        for left, right in itertools.combinations(candidates, 2):
-            mse_delta = _float(left, "initial_mse") - _float(right, "initial_mse")
-            temporal_delta = _float(left, "temporal_quality") - _float(right, "temporal_quality")
-            if mse_delta * temporal_delta > 0 and abs(temporal_delta) >= 0.10:
-                disagreement_rows.append(
+            matched_mse = _float(matched, "initial_mse_runtime_dtype")
+            mismatch = abs(stale_mse - matched_mse) / max(stale_mse, matched_mse, 1e-30)
+            if mismatch <= stale_tolerance:
+                staleness_rows.append(
                     {
                         "prompt_id": prompt_id,
                         "checkpoint_step": step,
-                        "corruption_name": f"{left['corruption_name']} vs {right['corruption_name']}",
-                        "disagreement": "latent_mse_ranking_opposes_temporal_ranking",
-                        "spatial_quality": "",
-                        "temporal_quality": temporal_delta,
-                        "semantic_quality": "",
-                        "initial_mse": mse_delta,
+                        "relative_runtime_mse_mismatch": mismatch,
+                        **stale_minus_matched(stale, matched),
                     }
                 )
-    write_csv(
-        output_dir / "metric_disagreements.csv",
-        disagreement_rows,
-        (
-            "prompt_id",
-            "checkpoint_step",
-            "corruption_name",
-            "disagreement",
-            "spatial_quality",
-            "temporal_quality",
-            "semantic_quality",
-            "initial_mse",
-        ),
-    )
+    write_csv(output_dir / "staleness_pairs.csv", staleness_rows)
 
-    error_delta_threshold = float(config["discovery_flags"]["error_equivalence_quality_delta"])
-    storage_delta_threshold = float(config["discovery_flags"]["storage_equivalence_quality_delta"])
-    stale_delta_threshold = float(config["discovery_flags"]["staleness_quality_delta"])
     flags = {
-        "ordering_reversals": len(reversal_rows),
-        "error_equivalence_failures": sum(
-            abs(float(row["temporal_quality_delta"])) >= error_delta_threshold for row in iso_error_rows
-        ),
-        "storage_equivalence_failures": sum(
-            abs(float(row["temporal_quality_delta"])) >= storage_delta_threshold for row in iso_storage_rows
-        ),
-        "staleness_asymmetries": sum(
-            abs(float(row["temporal_quality_delta"])) >= stale_delta_threshold for row in staleness_rows
-        ),
-        "content_interaction_screening": sorted(
-            [row for row in interaction_rows if math.isfinite(float(row["spearman_rho_exploratory"]))],
-            key=lambda row: abs(float(row["spearman_rho_exploratory"])),
-            reverse=True,
-        )[:20],
-        "thresholds": config["discovery_flags"],
-        "interpretation": "Screening flags only; no confirmatory p-values and no mechanism claim.",
+        "primary_iso_error_pair_count": len(iso_error_rows),
+        "exploratory_incidental_pair_count": len(incidental_rows),
+        "iso_storage_pair_count": len(iso_storage_rows),
+        "staleness_pair_count": len(staleness_rows),
+        "expert_regime_warning": "checkpoint progress is not interpreted independently of Wan2.2 expert region",
+        "prompt_clip_role": "auxiliary prompt alignment only; excluded from all discovery decisions",
     }
     atomic_json(output_dir / "discovery_flags.json", flags)
     clean_trajectory_manifest(output_dir)
     corruption_manifest(output_dir)
-    follow_ups = []
-    if iso_error_rows:
-        strongest = max(iso_error_rows, key=lambda row: abs(float(row["temporal_quality_delta"])))
-        effect = abs(float(strongest["temporal_quality_delta"]))
-        follow_ups.append(
-            {
-                "observation": (
-                    f"Matched-error conditions {strongest['condition_a']} and {strongest['condition_b']} "
-                    f"differ by {effect:.3f} temporal quality."
-                ),
-                "alternative": (
-                    "The pair may differ in higher-order error statistics or metric sensitivity "
-                    "rather than runtime recoverability."
-                ),
-                "falsification": (
-                    "Repeat the frozen pair on new seeds while matching MSE and error spectrum independently."
-                ),
-                "broken_assumption": "Initial latent MSE alone predicts downstream recovery loss.",
-                "effect": effect,
-            }
-        )
-    if iso_storage_rows:
-        strongest = max(iso_storage_rows, key=lambda row: abs(float(row["temporal_quality_delta"])))
-        effect = abs(float(strongest["temporal_quality_delta"]))
-        follow_ups.append(
-            {
-                "observation": (
-                    f"Iso-storage conditions {strongest['condition_a']} and {strongest['condition_b']} "
-                    f"differ by {effect:.3f} temporal quality."
-                ),
-                "alternative": (
-                    "A single prompt/step or reconstruction implementation may dominate "
-                    "the apparent representation effect."
-                ),
-                "falsification": "Confirm the same pair with new seeds and an independently implemented decoder.",
-                "broken_assumption": "Checkpoint byte footprint is sufficient to characterize protected state value.",
-                "effect": effect,
-            }
-        )
-    if reversal_rows:
-        strongest = max(
-            reversal_rows,
-            key=lambda row: (
-                max(float(row["delta_step10"]), float(row["delta_step20"]), float(row["delta_step30"]))
-                - min(float(row["delta_step10"]), float(row["delta_step20"]), float(row["delta_step30"]))
-            ),
-        )
-        follow_ups.append(
-            {
-                "observation": (
-                    f"Ordering of {strongest['condition_a']} and {strongest['condition_b']} "
-                    f"reverses across progress for {strongest['prompt_id']}."
-                ),
-                "alternative": "One-seed trajectory noise or a metric floor may create the crossing.",
-                "falsification": "Freeze this prompt/pair and run new generation seeds at all three steps.",
-                "broken_assumption": "A progress-independent corruption ranking is sufficient.",
-                "effect": max(
-                    float(strongest["delta_step10"]), float(strongest["delta_step20"]), float(strongest["delta_step30"])
-                )
-                - min(
-                    float(strongest["delta_step10"]), float(strongest["delta_step20"]), float(strongest["delta_step30"])
-                ),
-            }
-        )
-    follow_ups = sorted(follow_ups, key=lambda item: item["effect"], reverse=True)[:3]
-    report_lines = [
-        "# Video Runtime State Discovery",
-        "",
-        "This is an exploratory map. Existing invalid UniPC Stage B rows were not imported.",
-        "",
-        "## VERIFIED OBSERVATIONS",
-        "",
-        f"- Complete paired Euler matrix: {len(rows)} rows; FULL exact rows: {len(full_rows)}.",
-        f"- Iso-error pairs within 1% initial MSE: {len(iso_error_rows)}.",
-        f"- Iso-storage pairs within 2% actual serialized bytes: {len(iso_storage_rows)}.",
-        "",
-        "## EXPLORATORY ANOMALIES",
-        "",
-        f"- Ordering-reversal flags: {len(reversal_rows)}.",
-        f"- Error-equivalence flags: {flags['error_equivalence_failures']}.",
-        f"- Storage-equivalence flags: {flags['storage_equivalence_failures']}.",
-        f"- Staleness-asymmetry flags: {flags['staleness_asymmetries']}.",
-        "",
-        "## BORING / NULL RESULTS",
-        "",
-        "- Consult progress_summary.csv for monotonic or consistently ordered families that did not flag.",
-        "",
-        "## INVALID OR FAILED CONDITIONS",
-        "",
-        "- None: analysis refuses to run unless all preregistered rows are COMPLETE and FULL is exact.",
-        "",
-        "## FOLLOW-UP CANDIDATES",
-        "",
-    ]
-    if follow_ups:
-        for index, candidate in enumerate(follow_ups, start=1):
-            report_lines.extend(
-                [
-                    f"### {index}. Screening candidate",
-                    "",
-                    f"- Observation: {candidate['observation']}",
-                    f"- Strongest alternative explanation: {candidate['alternative']}",
-                    f"- Cheapest falsification test: {candidate['falsification']}",
-                    f"- Potential broken systems assumption: {candidate['broken_assumption']}",
-                    "",
-                ]
-            )
-    else:
-        report_lines.append("- None. The preregistered screening heuristics found no candidate worth confirmation.")
-    (output_dir / "video_runtime_state_discovery.md").write_text("\n".join(report_lines) + "\n")
+    (output_dir / "video_runtime_state_discovery.md").write_text(
+        "# Video Runtime State Discovery v3\n\n"
+        f"- Complete Euler rows: {len(rows)}.\n"
+        f"- Designed runtime-dtype iso-error pairs: {len(iso_error_rows)}.\n"
+        f"- BF16-relative iso-storage pairs: {len(iso_storage_rows)}.\n"
+        "- Prompt CLIP is auxiliary and excluded from recovery-fidelity decisions.\n"
+        "- Progress summaries retain Wan2.2 expert-region metadata and are not interpreted as progress-only.\n"
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("cpu-preflight", "preflight", "smoke", "full", "analyze"), required=True)
     parser.add_argument("--config", type=Path, default=Path("experiments/video_runtime_state_discovery_config.yaml"))
-    parser.add_argument("--output-dir", type=Path, default=Path("results/video_runtime_state_discovery"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/video_runtime_state_discovery_v3_corrected"),
+    )
     parser.add_argument("--prompt-start", type=int, default=0)
     parser.add_argument("--prompt-end", type=int, default=12)
     parser.add_argument("--enable-cpu-offload", action="store_true")
@@ -2416,61 +3114,69 @@ def main() -> None:
     config = load_config(args.config)
     prompts, prompt_sha = load_prompts(config)
     digest = config_hash(config, prompt_sha)
+    provenance = build_code_provenance()
+    if args.output_dir.name == "video_runtime_state_discovery_v2":
+        raise RuntimeError("v2 is immutable forensic evidence; choose a fresh v3 output namespace")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    provenance_path = args.output_dir / "run_provenance.json"
+    if provenance_path.exists():
+        assert_provenance_matches(json.loads(provenance_path.read_text()), provenance)
+    else:
+        atomic_json(provenance_path, provenance)
     if args.mode == "cpu-preflight":
         cpu = run_cpu_corruption_gates()
-        atomic_json(args.output_dir / "cpu_preflight.json", {"config_hash": digest, **cpu})
+        atomic_json(
+            args.output_dir / "cpu_preflight.json",
+            {"config_hash": digest, "provenance_hash": provenance["provenance_hash"], **cpu},
+        )
         print(json.dumps(cpu, indent=2))
         return
-    require_cpu_gate(args.output_dir / "cpu_preflight.json", digest)
+    require_cpu_gate(args.output_dir / "cpu_preflight.json", digest, provenance)
     if args.mode == "analyze":
-        require_gate(args.output_dir / "preflight_gates.json", digest, "preflight")
-        require_gate(args.output_dir / "smoke_complete.json", digest, "smoke")
-        analyze_discovery(config, digest, args.output_dir)
+        require_gate(args.output_dir / "preflight_gates.json", digest, provenance, "preflight")
+        require_gate(args.output_dir / "smoke_complete.json", digest, provenance, "smoke")
+        analyze_discovery(config, digest, provenance, args.output_dir)
         return
     if args.disable_semantic_metric:
-        raise RuntimeError(
-            "Semantic metric passed the independent audit and is mandatory for scientific discovery modes"
-        )
+        print("[discovery] prompt CLIP disabled; reference-fidelity metrics remain authoritative")
     if os.environ.get("CUDA_VISIBLE_DEVICES") not in ("0", None):
         raise RuntimeError("Discovery must run exclusively on GPU0")
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     scheduler = scheduler_document(config)
     print(json.dumps(scheduler, indent=2))
-    atomic_json(args.output_dir / "environment.json", environment_document(config, scheduler))
+    atomic_json(args.output_dir / "environment.json", environment_document(config, scheduler, provenance))
     evaluator = SemanticEvaluator(args.semantic_model, not args.disable_semantic_metric)
     omni = build_omni(config, args)
     try:
         if args.mode == "preflight":
-            run_preflight(omni, evaluator, config, digest, prompts, args.output_dir)
+            run_preflight(omni, evaluator, config, digest, provenance, prompts, args.output_dir)
         elif args.mode == "smoke":
-            run_smoke(omni, evaluator, config, digest, prompt_sha, prompts, args.output_dir)
+            run_smoke(omni, evaluator, config, digest, provenance, prompt_sha, prompts, args.output_dir)
         else:
-            require_gate(args.output_dir / "preflight_gates.json", digest, "preflight")
-            require_gate(args.output_dir / "smoke_complete.json", digest, "smoke")
+            require_gate(args.output_dir / "preflight_gates.json", digest, provenance, "preflight")
+            require_gate(args.output_dir / "smoke_complete.json", digest, provenance, "smoke")
             frozen = json.loads((args.output_dir / "preregistered_config.yaml").read_text())
-            if frozen["config_hash"] != digest:
+            if frozen["config_hash"] != digest or frozen["provenance_hash"] != provenance["provenance_hash"]:
                 raise RuntimeError("Frozen preregistration does not match current config")
             rows = run_matrix(
                 omni,
                 evaluator,
                 config,
                 digest,
+                provenance,
                 prompts,
                 args.output_dir,
                 namespace="run",
                 conditions=config["conditions"],
                 prompt_start=args.prompt_start,
                 prompt_end=args.prompt_end,
-                keep_videos=False,
             )
             clean_trajectory_manifest(args.output_dir)
             corruption_manifest(args.output_dir)
             complete_expected = args.prompt_start == 0 and args.prompt_end == 12
             if complete_expected:
-                expected = 12 * len(config["generation"]["checkpoint_steps"]) * len(config["conditions"])
-                if len(rows) != expected:
-                    raise RuntimeError(f"Full matrix incomplete: {len(rows)}/{expected}")
+                completeness = validate_expected_key_set(rows, expected_matrix_keys(config))
+                atomic_json(args.output_dir / "matrix_completeness.json", completeness)
     finally:
         omni.shutdown()
 

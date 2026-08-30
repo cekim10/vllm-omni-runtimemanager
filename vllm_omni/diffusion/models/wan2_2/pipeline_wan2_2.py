@@ -530,6 +530,10 @@ class Wan22Pipeline(
             peak_allocated_bytes = int(current_omni_platform.max_memory_allocated())
 
         copy_start = time.perf_counter()
+        runtime_dtype = str(latents.dtype)
+        runtime_element_size_bytes = int(latents.element_size())
+        runtime_numel = int(latents.nelement())
+        runtime_payload_bytes = runtime_numel * runtime_element_size_bytes
         latent_cpu = latents.detach().to(device="cpu", dtype=torch.float32).contiguous()
         latent_cpu_copy_ms = (time.perf_counter() - copy_start) * 1000.0
 
@@ -540,6 +544,12 @@ class Wan22Pipeline(
                 "timestep": timestep_value,
                 "latent_shape": list(latents.shape),
                 "latent_dtype": str(latents.dtype),
+                "runtime_dtype": runtime_dtype,
+                "runtime_element_size_bytes": runtime_element_size_bytes,
+                "runtime_numel": runtime_numel,
+                "runtime_payload_bytes": runtime_payload_bytes,
+                "probe_dtype": str(latent_cpu.dtype),
+                "probe_payload_bytes": int(latent_cpu.nelement() * latent_cpu.element_size()),
                 "latent_cpu": latent_cpu,
                 "latent_cpu_bytes": int(latent_cpu.nelement() * latent_cpu.element_size()),
                 "latent_cpu_copy_ms": float(latent_cpu_copy_ms),
@@ -613,6 +623,12 @@ class Wan22Pipeline(
                     "timestep": record["timestep"],
                     "latent_shape": record["latent_shape"],
                     "latent_dtype": record["latent_dtype"],
+                    "runtime_dtype": record["runtime_dtype"],
+                    "runtime_element_size_bytes": record["runtime_element_size_bytes"],
+                    "runtime_numel": record["runtime_numel"],
+                    "runtime_payload_bytes": record["runtime_payload_bytes"],
+                    "probe_dtype": record["probe_dtype"],
+                    "probe_payload_bytes": record["probe_payload_bytes"],
                     "step_latency_ms": record["step_latency_ms"],
                     "cumulative_dit_ms": record["cumulative_dit_ms"],
                     "latent_cpu_bytes": record["latent_cpu_bytes"],

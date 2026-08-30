@@ -1,5 +1,5 @@
 {
-  "experiment_version": "video-runtime-state-discovery-v2",
+  "experiment_version": "video-runtime-state-discovery-v3-corrected",
   "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
   "model_revision": null,
   "prompt_set": "experiments/video_recovery_prompt_set.json",
@@ -45,7 +45,6 @@
     "spatial_contiguous_definition": "compact_center_region_plus_deterministic_axis_fringe_v1",
     "int8_levels": 127,
     "int4_levels": 7,
-    "low_rank_ratio": 0.24305555555555555,
     "iso_error_relative_tolerance": 0.01,
     "iso_storage_relative_tolerance": 0.02,
     "staleness_relative_tolerance": 0.05
@@ -56,17 +55,26 @@
     "storage_equivalence_quality_delta": 0.10,
     "staleness_quality_delta": 0.10
   },
+  "analysis": {
+    "designed_iso_error_pairs": [
+      ["int8", "gaussian_matched_int8"],
+      ["random_missing", "gaussian_matched_random_missing"]
+    ],
+    "primary_recovery_metrics": ["video_mse", "video_psnr", "frame_ssim_mean"],
+    "temporal_specific_metrics": ["temporal_delta_mse", "temporal_delta_agreement"],
+    "prompt_clip_role": "auxiliary_prompt_alignment_only"
+  },
   "conditions": [
     "full_direct", "full_disk",
     "fp16", "int8", "int4_like",
-    "spatial_down2", "temporal_down2", "low_rank_25",
+    "spatial_width_down2_bf16", "temporal_down2", "low_rank_byte_matched_bf16",
     "spatial_contiguous", "temporal_contiguous", "channel_contiguous",
     "block_interleaved", "random_missing",
     "gaussian_matched_int8", "gaussian_matched_random_missing",
     "stale_1", "stale_2"
   ],
   "smoke_conditions": [
-    "full_direct", "full_disk", "fp16", "int8", "spatial_down2",
+    "full_direct", "full_disk", "fp16", "int8", "spatial_width_down2_bf16",
     "random_missing", "temporal_contiguous", "block_interleaved",
     "gaussian_matched_int8", "stale_1"
   ]

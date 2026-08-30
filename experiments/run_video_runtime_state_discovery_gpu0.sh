@@ -2,7 +2,7 @@
 set -euo pipefail
 
 mode="${1:-cpu}"
-output_dir="${2:-results/video_runtime_state_discovery}"
+output_dir="${2:-results/video_runtime_state_discovery_v3_corrected}"
 prompt_start="${3:-0}"
 prompt_end="${4:-12}"
 python_bin="${PYTHON_BIN:-python}"
@@ -14,7 +14,8 @@ case "${mode}" in
   cpu)
     "${python_bin}" -m pytest -q \
       -m "core_model and cpu and diffusion" \
-      tests/diffusion/test_video_runtime_state_discovery.py
+      tests/diffusion/test_video_runtime_state_discovery.py \
+      tests/diffusion/models/wan2_2/test_wan22_pipeline_diffuse.py
     "${python_bin}" experiments/video_runtime_state_discovery.py \
       --mode cpu-preflight \
       --config experiments/video_runtime_state_discovery_config.yaml \
