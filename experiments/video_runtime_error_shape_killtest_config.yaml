@@ -1,0 +1,84 @@
+{
+  "experiment_version": "video-runtime-error-shape-killtest-v1",
+  "output_root": "results/video_runtime_error_shape_killtest",
+  "source_v3": {
+    "root": "results/video_runtime_state_discovery_v3_corrected",
+    "raw_results_sha256": "cff182fb113677897cd69727bd99d2d665ca97125eae920dfddcb8fe8db064a0",
+    "config_hash": "6ac879a3c09fc16e1869ee1d6f19f8ae4a7f663770f9e674f964a9b2a52a5295",
+    "provenance_hash": "5f52aed2d3862e21370834e63e5c846f6669ead1810215b1236e8cbc2f949814",
+    "scheduler": "WanEulerScheduler",
+    "runtime_dtype": "torch.bfloat16",
+    "expected_raw_rows": 612
+  },
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875,
+    "checkpoint_steps": [10, 20, 30]
+  },
+  "fp16_replay": {
+    "prompt_id": "recovery_008",
+    "generation_seed": 9234,
+    "checkpoint_step": 10,
+    "condition": "fp16",
+    "repeats": 10,
+    "full_direct_repeats": 3,
+    "original_frame_ssim_mean": 0.8658326932016058,
+    "a1_ssim_absolute_tolerance": 0.02
+  },
+  "concentration": {
+    "checkpoint_step": 20,
+    "selection_rule": "rank v3 step-20 INT8 frame_ssim_mean ascending; take bottom 3, top 3, then the 3 unused prompts nearest the 12-prompt median with prompt_id tie-break",
+    "selected_prompts": [
+      {"difficulty": "hard", "prompt_id": "recovery_009", "generation_seed": 10234, "source_ssim": 0.7347896856505952},
+      {"difficulty": "hard", "prompt_id": "recovery_008", "generation_seed": 9234, "source_ssim": 0.8771608995210267},
+      {"difficulty": "hard", "prompt_id": "recovery_010", "generation_seed": 11234, "source_ssim": 0.8797902816241989},
+      {"difficulty": "middle", "prompt_id": "recovery_004", "generation_seed": 5234, "source_ssim": 0.9281149919536436},
+      {"difficulty": "middle", "prompt_id": "recovery_012", "generation_seed": 13234, "source_ssim": 0.9193946529770975},
+      {"difficulty": "middle", "prompt_id": "recovery_013", "generation_seed": 14234, "source_ssim": 0.9127991656655947},
+      {"difficulty": "easy", "prompt_id": "recovery_005", "generation_seed": 6234, "source_ssim": 0.9769155615106713},
+      {"difficulty": "easy", "prompt_id": "recovery_000", "generation_seed": 1234, "source_ssim": 0.9799797653274269},
+      {"difficulty": "easy", "prompt_id": "recovery_002", "generation_seed": 3234, "source_ssim": 0.9869524176700024}
+    ],
+    "targets": [
+      {"name": "small", "mse": 0.00011270707699032352, "source_condition": "int8", "derivation": "global arithmetic mean of all 36 validated v3 initial_mse_runtime_dtype rows"},
+      {"name": "large", "mse": 0.18375200334211897, "source_condition": "random_missing", "derivation": "global arithmetic mean of all 36 validated v3 initial_mse_runtime_dtype rows"}
+    ],
+    "additive_support_fractions": [1.0, 0.5, 0.2, 0.1, 0.05, 0.02, 0.01],
+    "replacement_support_fractions": [1.0, 0.2, 0.05],
+    "smoke_additive_support_fractions": [1.0, 0.2, 0.05],
+    "smoke_replacement_support_fractions": [0.2],
+    "runtime_mse_relative_tolerance": 0.01,
+    "primary_condition_count": 126,
+    "secondary_condition_count": 54,
+    "full_condition_count": 180,
+    "smoke_condition_count": 8
+  },
+  "analysis": {
+    "primary_metric": "frame_ssim_mean",
+    "secondary_metrics": ["video_mse", "final_latent_mse"],
+    "descriptive_only_metrics": ["temporal_delta_mse", "temporal_delta_agreement"],
+    "auxiliary_only_metrics": ["prompt_clip_score"],
+    "endpoint_dense_fraction": 1.0,
+    "endpoint_concentrated_fraction": 0.05,
+    "go_endpoint_ssim_difference": 0.10,
+    "no_go_endpoint_ssim_difference": 0.05,
+    "go_direction_prompt_count": 7,
+    "go_monotonic_prompt_count": 6,
+    "go_spearman_rho": 0.7,
+    "total_prompts": 9,
+    "decision_labels": ["GO_TO_INDEPENDENT_CONFIRMATION", "NO_GO", "WEAK_INCONCLUSIVE"]
+  }
+}
