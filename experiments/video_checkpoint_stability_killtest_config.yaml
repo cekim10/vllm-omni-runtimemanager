@@ -1,0 +1,105 @@
+{
+  "experiment_version": "video-checkpoint-stability-killtest-v2-fixed-step",
+  "output_root": "results/video_checkpoint_stability_killtest",
+  "trusted_v3": {
+    "root": "results/video_runtime_state_discovery_v3_corrected",
+    "raw_results_sha256": "cff182fb113677897cd69727bd99d2d665ca97125eae920dfddcb8fe8db064a0",
+    "config_file": "results/video_runtime_state_discovery_v3_corrected/preregistered_config.yaml",
+    "config_file_sha256": "12388addb6a90be52ff9baea54d565732a4ba568ecef5517f86410f301874d39",
+    "config_hash": "6ac879a3c09fc16e1869ee1d6f19f8ae4a7f663770f9e674f964a9b2a52a5295",
+    "provenance_file": "results/video_runtime_state_discovery_v3_corrected/run_provenance.json",
+    "provenance_file_sha256": "39ae614a6386f6bcc21333ab4f3b20aa638986d99990ef435667ee39c287f5c0",
+    "provenance_hash": "5f52aed2d3862e21370834e63e5c846f6669ead1810215b1236e8cbc2f949814",
+    "scheduler": "WanEulerScheduler",
+    "runtime_dtype": "torch.bfloat16",
+    "expected_raw_rows": 612,
+    "expected_prompt_count": 12
+  },
+  "validated_error_shape_source": {
+    "root": "results/video_runtime_error_shape_killtest",
+    "config_file": "experiments/video_runtime_error_shape_killtest_config.yaml",
+    "config_file_sha256": "672b8c0ee26bc275115ec14288981a98f01340936fdf3fe824bdff596e64fc56",
+    "matcher_script": "experiments/video_runtime_error_shape_killtest.py",
+    "matcher_script_sha256": "8b8621641fe20a72fdb1301e6cadc159966b60a4419e4d616571e7678625593b",
+    "target_config_key": "concentration.targets[name=small].mse",
+    "target_source_condition": "int8",
+    "target_mse": 0.00011270707699032352,
+    "target_derivation": "global arithmetic mean of all 36 validated v3 initial_mse_runtime_dtype rows for corruption_name=int8"
+  },
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875,
+    "checkpoint_steps": [20],
+    "primary_checkpoint_step": 20,
+    "expected_expert_regime": "high_noise_transformer"
+  },
+  "selection": {
+    "rule": "all unique trusted-v3 prompt trajectories at checkpoint step 20, sorted by prompt_id then generation_seed",
+    "source_condition": "full_direct",
+    "no_outcome_based_selection": true
+  },
+  "perturbation": {
+    "family": "dense_additive_gaussian",
+    "intended_support_fraction": 1.0,
+    "runtime_mse_relative_tolerance": 0.01,
+    "trajectory_mean_mse_range_relative_to_target_limit": 0.001,
+    "trajectory_mean_support_range_limit": 0.005,
+    "confound_limit_rationale": "GPU-preflight limits fixed from all 192 CPU constructions: MSE limit 0.001 is 4.16x the observed 0.000240 range; support limit 0.005 is 5.81x the observed 0.000860 range",
+    "max_restored_to_clean_absmax_ratio": 1.02,
+    "replicate_count": 16,
+    "seed_namespace": "video-checkpoint-stability-killtest-v1|dense-additive-replicate",
+    "replicate_seeds": [
+      8826580129826054173, 1223187150612219859,
+      661859318540208238, 6329702416504811797,
+      2510745293066894326, 1720911766382986329,
+      7120946080286398962, 1007529072553322791,
+      8021280684749261382, 3303383111513071732,
+      2878627336835561621, 6995293376538335926,
+      7447484853497302614, 8302974312263247870,
+      1895940382789330237, 2404162603889979298
+    ]
+  },
+  "analysis": {
+    "primary_metric": "frame_ssim_mean",
+    "secondary_metrics": ["final_latent_mse", "video_mse"],
+    "descriptive_only_metrics": ["temporal_delta_mse", "temporal_delta_agreement", "minimum_ssim"],
+    "auxiliary_only_metrics": ["prompt_clip_score", "large_drop_rate"],
+    "decision_input_fields": [
+      "trajectory_id", "replicate_id", "frame_ssim_mean",
+      "realized_runtime_bf16_mse", "relative_mse_mismatch",
+      "realized_runtime_active_fraction"
+    ],
+    "lower_tail_count": 4,
+    "loo_lower_tail_count": 4,
+    "large_drop_threshold": 0.10,
+    "go_tail_depth_range": 0.10,
+    "go_minimum_trajectory_tail_depth": 0.10,
+    "no_go_tail_depth_range": 0.05,
+    "no_go_maximum_trajectory_tail_depth": 0.05,
+    "loo_tail_depth_range": 0.075,
+    "loo_required_count": 12,
+    "single_replicate_collapse_floor": 0.05,
+    "supporting_large_drop_rate": 0.25,
+    "decision_labels": ["GO_TO_BROADER_STABILITY_MAP", "NO_GO", "WEAK_INCONCLUSIVE"]
+  },
+  "matrix": {
+    "trajectory_count": 12,
+    "replicate_count": 16,
+    "primary_checkpoint_step": 20,
+    "primary_row_count": 192
+  },
+  "allowed_modes": ["cpu", "preflight", "smoke", "analyze-smoke"]
+}
