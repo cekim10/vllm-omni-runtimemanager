@@ -1,0 +1,120 @@
+{
+  "experiment_version": "video-bf16-single-flip-killtest-v1",
+  "output_root": "results/video_bf16_single_flip_killtest",
+  "allowed_modes": ["cpu", "preflight", "smoke", "analyze-smoke"],
+  "scientific_question": "Can a SINGLE runtime-BF16 coordinate of the anchor state, changed by exactly ONE adjacent representable BF16 value, produce deterministic downstream divergence under exact Euler resume?",
+  "trusted_v3": {
+    "root": "results/video_runtime_state_discovery_v3_corrected",
+    "raw_results_sha256": "cff182fb113677897cd69727bd99d2d665ca97125eae920dfddcb8fe8db064a0",
+    "config_file": "results/video_runtime_state_discovery_v3_corrected/preregistered_config.yaml",
+    "config_file_sha256": "12388addb6a90be52ff9baea54d565732a4ba568ecef5517f86410f301874d39",
+    "provenance_file": "results/video_runtime_state_discovery_v3_corrected/run_provenance.json",
+    "provenance_file_sha256": "39ae614a6386f6bcc21333ab4f3b20aa638986d99990ef435667ee39c287f5c0",
+    "config_hash": "6ac879a3c09fc16e1869ee1d6f19f8ae4a7f663770f9e674f964a9b2a52a5295",
+    "provenance_hash": "5f52aed2d3862e21370834e63e5c846f6669ead1810215b1236e8cbc2f949814",
+    "scheduler": "WanEulerScheduler",
+    "runtime_dtype": "torch.bfloat16",
+    "expected_raw_rows": 612
+  },
+  "validated_error_shape_source": {
+    "root": "results/video_runtime_error_shape_killtest",
+    "config_file": "experiments/video_runtime_error_shape_killtest_config.yaml",
+    "config_file_sha256": "672b8c0ee26bc275115ec14288981a98f01340936fdf3fe824bdff596e64fc56",
+    "matcher_script": "experiments/video_runtime_error_shape_killtest.py",
+    "matcher_script_sha256": "8b8621641fe20a72fdb1301e6cadc159966b60a4419e4d616571e7678625593b",
+    "reuse": "anchor reconstruction (_fp16_source_candidate), BF16 encode/decode, run_resume, metric controls; no matcher, no MSE targets"
+  },
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875,
+    "checkpoint_steps": [10, 20, 30]
+  },
+  "anchor": {
+    "prompt_id": "recovery_008",
+    "generation_seed": 9234,
+    "checkpoint_step": 10,
+    "selection_rule": "the unique non-exact trusted-v3 FP16 row, re-derived from raw_results.csv at run time; the configured identity is validated against that derivation and never substitutes for it",
+    "original_frame_ssim_mean": 0.8658326932016058,
+    "historical_delta_source": "retained v3 fp16 corruption payload for this cell, hash-verified against v3 result.json and the anchor clean hash"
+  },
+  "perturbation": {
+    "family": "single_coordinate_adjacent_bf16",
+    "eligibility_abs_threshold": 1e-05,
+    "secondary_report_abs_threshold": 0.0001,
+    "directions": ["down", "up"],
+    "adjacent_steps": 1,
+    "construction": "uint16 bit pattern of the clean runtime-BF16 value is moved to the immediately adjacent finite representable BF16 value in value order; verified against exhaustive enumeration of all finite BF16 patterns; never z +/- estimated ulp",
+    "eligible_set_rule": "all flat coordinates i with |cast_runtime_bf16(clean)_i| < eligibility_abs_threshold, ascending flat index; K is derived at run time and frozen in anchor_manifest.json, never configured"
+  },
+  "controls": {
+    "preflight_full_direct_repeats": 3,
+    "smoke_full_direct_repeats": 1,
+    "full_direct_rule": "clean anchor state resumed at the anchor step must be bit-exact in final latent and video; any failure is a GLOBAL STOP"
+  },
+  "replay": {
+    "trigger_frame_ssim_below": 0.95,
+    "total_runs_per_triggered_row": 3,
+    "deterministic_rule": "a triggered row is CATASTROPHIC_DETERMINISTIC only if every run has frame_ssim_mean below the trigger AND all runs share identical values of every replay_equality_field, each reconstructed from the persisted artifacts",
+    "replay_equality_fields": [
+      "runtime_candidate_identity_sha256_v1",
+      "recovered_final_latent_identity_sha256_v1",
+      "recovered_video_identity_sha256_v1",
+      "frame_ssim_mean",
+      "final_latent_mse",
+      "video_mse"
+    ],
+    "tensor_identity_format": "single-flip-tensor-identity-v1",
+    "tensor_identity_covers": ["format tag", "little-endian dtype", "ndim", "exact shape", "nbytes", "contiguous raw bytes"],
+    "recomputed_float_comparison": "relative tolerance 1e-12, zero must be exact; applied to realized_l2, realized_mse, realized_linf, frame_ssim_mean, final_latent_mse, video_mse",
+    "non_triggered_rows_run_once": true
+  },
+  "analysis": {
+    "primary_metric": "frame_ssim_mean",
+    "catastrophic_frame_ssim_below": 0.95,
+    "no_go_frame_ssim_at_least": 0.99,
+    "decision_input_fields": [
+      "coordinate_flat_index",
+      "direction",
+      "replay_id",
+      "frame_ssim_mean",
+      "final_latent_mse",
+      "video_mse",
+      "runtime_candidate_identity_sha256_v1",
+      "recovered_final_latent_identity_sha256_v1",
+      "recovered_video_identity_sha256_v1"
+    ],
+    "replay_equality_only_fields": ["final_latent_mse", "video_mse"],
+    "replay_equality_only_rule": "final_latent_mse and video_mse enter the decision solely as identity-of-replay equality conditions; no threshold on either can ever be applied and neither can rescue or sink a decision",
+    "descriptive_only_metrics": [
+      "video_psnr",
+      "temporal_delta_mse",
+      "temporal_delta_agreement",
+      "exact_final_latent",
+      "exact_video"
+    ],
+    "auxiliary_only_metrics": ["prompt_clip_score", "historical_fp16_support_member", "abs_clean_value"],
+    "decision_rule": "GO_TO_LOCAL_BRANCH_MAP iff controls passed and at least one row is CATASTROPHIC_DETERMINISTIC; NO_GO iff controls passed and every executed row has frame_ssim_mean >= 0.99; otherwise WEAK_INCONCLUSIVE",
+    "no_rescue_fields": "temporal metrics, CLIP, PSNR, exactness flags, historical membership, and coordinate magnitude cannot change the decision; latent MSE and video MSE act only as replay-equality conditions"
+  },
+  "prohibited_interpretations": [
+    "chaos",
+    "Jacobian instability",
+    "high-gain direction",
+    "Lyapunov instability",
+    "safe-resume certificate",
+    "universal diffusion instability"
+  ]
+}
