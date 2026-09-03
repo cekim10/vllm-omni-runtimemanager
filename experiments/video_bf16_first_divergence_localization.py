@@ -80,16 +80,32 @@ def _git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=REPO_ROOT, text=True).strip()
 
 
+SOURCE_SCOPE_PREFIXES = ("experiments/", "tests/", "vllm_omni/")
+
+
 def git_state() -> dict[str, Any]:
+    """Source-relevant git state only.
+
+    Every modification of a tracked file counts. Untracked files count only
+    under the source prefixes that can affect execution or validation, so a
+    local virtual environment or scratch file cannot change provenance or
+    block GPU work, while a stray experiment/test/runtime file still does.
+    """
     status = _git("status", "--porcelain=v1", "--untracked-files=all").splitlines()
-    allowed_prefix = "results/video_bf16_first_divergence_localization/"
-    source_dirty = [row for row in status if not row[3:].replace("\\", "/").startswith(allowed_prefix)]
+
+    def relevant(row: str) -> bool:
+        path = row[3:].replace("\\", "/")
+        if row.startswith("??"):
+            return path.startswith(SOURCE_SCOPE_PREFIXES)
+        return True
+
+    source_dirty = sorted(row for row in status if relevant(row))
     return {
         "git_commit": _git("rev-parse", "HEAD"),
-        "git_dirty": bool(status),
-        "dirty_entries": status,
+        "git_dirty": bool(source_dirty),
         "source_dirty_entries": source_dirty,
-        "dirty_allowlist": [allowed_prefix],
+        "source_scope_prefixes": list(SOURCE_SCOPE_PREFIXES),
+        "dirty_policy": "tracked modifications anywhere; untracked files only under source scope prefixes",
     }
 
 

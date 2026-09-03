@@ -511,3 +511,35 @@ def test_no_binary_search_or_expansion_modes_exist():
     source = Path("experiments/video_bf16_first_divergence_localization.py").read_text().lower()
     for word in ("bisect", "binary_search", "ulp_sweep", "chaos", "jacobian", "tie-to-even", "branch basin", "certificate"):
         assert word not in source, word
+
+
+
+def test_git_state_ignores_untracked_files_outside_source_scope(monkeypatch):
+    rows = [
+        "?? .venv-vllm-cu12/bin/python",
+        "?? scratch/notes.txt",
+        "?? results/video_bf16_first_divergence_localization/x.json",
+        "?? experiments/new_probe.py",
+        "?? tests/diffusion/test_new.py",
+        "?? vllm_omni/diffusion/models/wan2_2/extra.py",
+        " M vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
+        " M README.md",
+    ]
+    monkeypatch.setattr(killtest, "_git", lambda *args: "\n".join(rows) if args[0] == "status" else "abc123")
+    state = killtest.git_state()
+    assert state["git_dirty"] is True
+    assert state["source_dirty_entries"] == sorted([
+        " M README.md",
+        " M vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
+        "?? experiments/new_probe.py",
+        "?? tests/diffusion/test_new.py",
+        "?? vllm_omni/diffusion/models/wan2_2/extra.py",
+    ])
+    with pytest.raises(killtest.GlobalStopError, match="committed source revision"):
+        killtest.require_committed_source(state)
+    # Only venv/scratch/results untracked: clean for GPU purposes, and provenance does not carry them.
+    monkeypatch.setattr(killtest, "_git", lambda *args: "\n".join(rows[:3]) if args[0] == "status" else "abc123")
+    state = killtest.git_state()
+    assert state["git_dirty"] is False and state["source_dirty_entries"] == []
+    killtest.require_committed_source(state)
+    assert not any(".venv" in json.dumps(v) for v in state.values())
