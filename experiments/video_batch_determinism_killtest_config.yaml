@@ -1,0 +1,24 @@
+{
+  "experiment_version": "video-batch-determinism-killtest-v1",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "trusted_v3_config": "experiments/video_runtime_state_discovery_config.yaml",
+  "trusted_prompt_set": "experiments/video_recovery_prompt_set.json",
+  "trusted_single_flip_root": "results/video_bf16_single_flip_killtest",
+  "output_namespace": "results/video_batch_determinism_killtest",
+  "scheduler": {"name": "WanEulerScheduler", "sample_solver": "euler", "num_train_timesteps": 1000, "flow_shift": 12.0},
+  "generation": {"height": 480, "width": 832, "num_frames": 33, "num_inference_steps": 40, "guidance_scale": 4.0, "fps": 16.0, "boundary_ratio": 0.875},
+  "batch_modes": {"S": 1, "B4": 4, "B8": 8},
+  "target_batch_index": 0,
+  "filler_mapping_seed": 20260903,
+  "run_order_seed": 20260904,
+  "warmup_count_per_shape": 1,
+  "replay": {"total_runs_per_detected_pair": 3},
+  "analysis": {
+    "material_frame_ssim_below": 0.99,
+    "strong_frame_ssim_below": 0.95,
+    "go_min_material_targets": 3,
+    "go_min_replay_stable_material_targets": 3,
+    "decision_input_fields": ["final_latent_identity", "video_identity", "frame_ssim_mean", "video_mse", "final_latent_mse", "replay_input_identity"]
+  },
+  "allowed_modes": ["cpu", "preflight", "smoke", "analyze-smoke"]
+}

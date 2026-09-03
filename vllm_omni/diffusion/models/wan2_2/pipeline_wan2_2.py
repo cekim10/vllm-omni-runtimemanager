@@ -504,6 +504,80 @@ class Wan22Pipeline(
             "flow_shift": self._flow_shift,
         }
 
+    def _build_within_step_probe_state(
+        self,
+        req: OmniDiffusionRequest,
+        timesteps: torch.Tensor,
+    ) -> dict[str, Any] | None:
+        """Build an opt-in lossless probe for one explicitly selected update.
+
+        This is deliberately separate from the trajectory probe: it records
+        only operations that exist in the Wan T2V execution path and never
+        manufactures a transformer-raw-output boundary hidden by CFG.
+        """
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        probe_cfg = extra_args.get("within_step_probe")
+        if not isinstance(probe_cfg, dict):
+            return None
+        artifact_dir = probe_cfg.get("artifact_dir")
+        if not artifact_dir:
+            raise ValueError("within_step_probe.artifact_dir is required.")
+        selected = int(probe_cfg.get("selected_local_step", -1))
+        if not 0 <= selected < len(timesteps):
+            raise ValueError("within_step_probe selected_local_step is outside the resumed trajectory")
+        return {
+            "artifact_dir": Path(str(artifact_dir)),
+            "selected_local_step": selected,
+            "selected_absolute_step": int(probe_cfg.get("selected_absolute_step", selected)),
+            "label": str(probe_cfg.get("request_label") or req.request_id),
+            "records": [],
+            "unavailable_boundaries": ["transformer_raw_output"],
+        }
+
+    def _capture_within_step_probe(
+        self,
+        probe_state: dict[str, Any] | None,
+        *,
+        step_idx: int,
+        boundary: str,
+        value: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> None:
+        if probe_state is None or step_idx != probe_state["selected_local_step"]:
+            return
+        runtime = value.detach()
+        probe = runtime.to(device="cpu", dtype=torch.float32).contiguous()
+        probe_state["records"].append(
+            {
+                "boundary": boundary,
+                "step_idx": int(step_idx),
+                "absolute_step": int(probe_state["selected_absolute_step"]),
+                "timestep": float(torch.as_tensor(timestep).detach().float().cpu().reshape(-1)[0].item()),
+                "runtime_dtype": str(runtime.dtype),
+                "latent_shape": list(runtime.shape),
+                "probe": probe,
+            }
+        )
+
+    def _persist_within_step_probe(self, probe_state: dict[str, Any] | None) -> dict[str, Any]:
+        if probe_state is None:
+            return {}
+        artifact_dir = probe_state["artifact_dir"]
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        records: list[dict[str, Any]] = []
+        for record in probe_state["records"]:
+            path = artifact_dir / f"{probe_state['label']}_{record['boundary']}.pt"
+            torch.save(record["probe"], path)
+            records.append({key: value for key, value in record.items() if key != "probe"} | {"latent_path": str(path)})
+        return {
+            "within_step_probe": {
+                "selected_local_step": probe_state["selected_local_step"],
+                "selected_absolute_step": probe_state["selected_absolute_step"],
+                "records": records,
+                "unavailable_boundaries": probe_state["unavailable_boundaries"],
+            }
+        }
+
     def _capture_trajectory_probe_checkpoint(
         self,
         probe_state: dict[str, Any] | None,
@@ -676,6 +750,7 @@ class Wan22Pipeline(
         latent_condition: torch.Tensor | None = None,
         first_frame_mask: torch.Tensor | None = None,
         probe_state: dict[str, Any] | None = None,
+        within_step_probe_state: dict[str, Any] | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -693,6 +768,10 @@ class Wan22Pipeline(
                 self._current_timestep = t
                 set_forward_context_denoise_step_idx(step_idx)
                 step_start = time.perf_counter()
+                self._capture_within_step_probe(
+                    within_step_probe_state, step_idx=step_idx,
+                    boundary="latent_entering_step", value=latents, timestep=t,
+                )
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
@@ -738,6 +817,11 @@ class Wan22Pipeline(
                     latent_model_input = latents.to(dtype)
                     timestep = t.expand(latents.shape[0])
 
+                self._capture_within_step_probe(
+                    within_step_probe_state, step_idx=step_idx,
+                    boundary="transformer_input", value=latent_model_input, timestep=t,
+                )
+
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
                 positive_kwargs = {
                     "hidden_states": latent_model_input,
@@ -767,7 +851,20 @@ class Wan22Pipeline(
                     cfg_normalize=False,
                 )
 
+                self._capture_within_step_probe(
+                    within_step_probe_state, step_idx=step_idx,
+                    boundary="guidance_combined_output", value=noise_pred, timestep=t,
+                )
+                self._capture_within_step_probe(
+                    within_step_probe_state, step_idx=step_idx,
+                    boundary="scheduler_input", value=latents, timestep=t,
+                )
+
                 latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                self._capture_within_step_probe(
+                    within_step_probe_state, step_idx=step_idx,
+                    boundary="scheduler_output", value=latents, timestep=t,
+                )
                 if current_omni_platform.is_available():
                     current_omni_platform.synchronize()
                 step_latency_ms = (time.perf_counter() - step_start) * 1000.0
@@ -1037,8 +1134,10 @@ class Wan22Pipeline(
         if DEBUG_PERF:
             _t_denoise_start = time.perf_counter()
         probe_state = None
+        within_step_probe_state = None
         if not (self.expand_timesteps and latent_condition is not None):
             probe_state = self._build_trajectory_probe_state(req, timesteps)
+            within_step_probe_state = self._build_within_step_probe_state(req, timesteps)
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -1052,6 +1151,7 @@ class Wan22Pipeline(
             latent_condition=latent_condition,
             first_frame_mask=first_frame_mask,
             probe_state=probe_state,
+            within_step_probe_state=within_step_probe_state,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -1107,6 +1207,7 @@ class Wan22Pipeline(
                 )
 
         custom_output = self._persist_trajectory_probe(probe_state)
+        custom_output.update(self._persist_within_step_probe(within_step_probe_state))
         return DiffusionOutput(
             output=output,
             custom_output=custom_output,
