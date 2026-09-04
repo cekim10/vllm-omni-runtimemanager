@@ -3,8 +3,10 @@
 
 import math
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -954,6 +956,40 @@ class WanTransformer3DModel(nn.Module):
         """Return the dtype of the model parameters."""
         return next(self.parameters()).dtype
 
+    def _capture_phase3_block_probe(
+        self,
+        probe_state: dict[str, Any] | None,
+        *,
+        boundary: str,
+        value: torch.Tensor,
+        block_index: int | None = None,
+    ) -> None:
+        """Persist an observational copy without modifying the forward value."""
+        if probe_state is None:
+            return
+        if any(row["boundary"] == boundary for row in probe_state["records"]):
+            raise RuntimeError(f"Duplicate Phase-3 transformer boundary: {boundary}")
+        artifact_dir = Path(probe_state["artifact_dir"])
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        path = artifact_dir / f"{boundary}.npy"
+        if value.dtype != torch.bfloat16:
+            raise RuntimeError(f"Phase-3 expected BF16 at {boundary}, got {value.dtype}")
+        snapshot = value.detach().to(device="cpu").contiguous().clone()
+        np_bits = snapshot.view(torch.uint16).numpy()
+        np.save(path, np_bits, allow_pickle=False)
+        probe_state["records"].append(
+            {
+                "boundary": boundary,
+                "block_index": block_index,
+                "branch": probe_state["branch"],
+                "invocation_index": probe_state["invocation_index"],
+                "runtime_dtype": str(value.dtype),
+                "shape": [int(item) for item in value.shape],
+                "artifact_path": str(path),
+                "artifact_encoding": "bf16_bits_v1",
+            }
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -963,7 +999,26 @@ class WanTransformer3DModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        phase3_block_probe_state: dict[str, Any] | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput | IntermediateTensors:
+        if phase3_block_probe_state is not None:
+            phase3_block_probe_state["architecture"] = {
+                "model_class": f"{self.__class__.__module__}.{self.__class__.__name__}",
+                "configured_num_layers": int(self.config.num_layers),
+                "start_layer": int(self.start_layer),
+                "end_layer": int(self.end_layer),
+                "module_list_length": len(self.blocks),
+                "executed_block_order": list(range(int(self.start_layer), int(self.end_layer))),
+                "num_attention_heads": int(self.config.num_attention_heads),
+                "attention_head_dim": int(self.config.attention_head_dim),
+                "inner_dim": int(self.config.num_attention_heads) * int(self.config.attention_head_dim),
+                "patch_size": [int(item) for item in self.config.patch_size],
+            }
+        self._capture_phase3_block_probe(
+            phase3_block_probe_state,
+            boundary="transformer_entry",
+            value=hidden_states,
+        )
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         post_patch_num_frames = num_frames // p_t
@@ -1044,8 +1099,21 @@ class WanTransformer3DModel(nn.Module):
             )
 
         # Transformer blocks
-        for block in self.blocks[self.start_layer : self.end_layer]:
+        self._capture_phase3_block_probe(
+            phase3_block_probe_state,
+            boundary="pre_block_hidden_state",
+            value=hidden_states,
+        )
+        for block_index, block in enumerate(
+            self.blocks[self.start_layer : self.end_layer], start=self.start_layer
+        ):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            self._capture_phase3_block_probe(
+                phase3_block_probe_state,
+                boundary=f"after_block_{block_index:03d}",
+                value=hidden_states,
+                block_index=block_index,
+            )
 
         if not is_pipeline_last_stage():
             # Non-last PP stage: hand the token sequence to the caller via IntermediateTensors.
@@ -1061,6 +1129,11 @@ class WanTransformer3DModel(nn.Module):
             scale = scale.unsqueeze(1)
 
         hidden_states = self.norm_out(hidden_states, scale, shift).type_as(hidden_states)
+        self._capture_phase3_block_probe(
+            phase3_block_probe_state,
+            boundary="transformer_pre_output",
+            value=hidden_states,
+        )
         hidden_states = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
@@ -1068,6 +1141,11 @@ class WanTransformer3DModel(nn.Module):
         )
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         output = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        self._capture_phase3_block_probe(
+            phase3_block_probe_state,
+            boundary="raw_transformer_output",
+            value=output,
+        )
 
         if not return_dict:
             return (output,)

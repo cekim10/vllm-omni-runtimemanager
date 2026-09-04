@@ -12,6 +12,7 @@ import csv
 import hashlib
 import json
 import math
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -27,7 +28,7 @@ from experiments import video_bf16_single_flip_killtest as single_flip
 from experiments import video_runtime_state_discovery as v3
 
 GlobalStopError = single_flip.GlobalStopError
-EXPERIMENT_VERSION = "video-bf16-first-divergence-localization-v1"
+EXPERIMENT_VERSION = "video-bf16-first-divergence-localization-v2"
 EXPECTED_MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
 EXPECTED_SCHEDULER = "WanEulerScheduler"
 EXPECTED_RUNTIME_DTYPE = "torch.bfloat16"
@@ -77,6 +78,22 @@ PHASE2_AVAILABLE_BOUNDARIES = (
 )
 PHASE2_UNAVAILABLE_BOUNDARIES = ("transformer_raw_output",)
 PHASE2_REQUIRED_GATES = tuple(f"P2-G{number}" for number in range(1, 26))
+PHASE3_REQUIRED_GATES = tuple(f"P3-G{number}" for number in range(1, 32))
+PHASE3_BRANCHES = ("positive", "negative")
+PHASE3_BLOCK_COUNT = 40
+# Wan2.2-T2V-A14B transformer: 40 heads x 128 = inner dim 5120; verified at runtime against the
+# loaded model config and recorded in the trace, so a different checkpoint fails closed.
+PHASE3_NUM_HEADS = 40
+PHASE3_HEAD_DIM = 128
+PHASE3_PHASE1_COMMIT = "0742c718ed942a752be5e03ab24cd578395e9e89"
+PHASE3_PHASE2_COMMIT = "10fe61f3e986787ed0bb9cd8ecddb2cbf97043a8"
+PHASE3_FIXED_BOUNDARIES = (
+    "transformer_entry",
+    "pre_block_hidden_state",
+    *(f"after_block_{index:03d}" for index in range(PHASE3_BLOCK_COUNT)),
+    "transformer_pre_output",
+    "raw_transformer_output",
+)
 PHASE2_BOUNDARY_SEMANTICS = {
     "latent_entering_step": {
         "tensor": "latent state entering the selected resumed denoising update",
@@ -181,8 +198,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise GlobalStopError("GLOBAL STOP: frozen anchor changed")
     if int(config["controls"]["repeats_per_trajectory"]) < 3:
         raise GlobalStopError("GLOBAL STOP: at least three deterministic control repeats are required")
-    if config["phase3"] != {"enabled": False, "auto_expand": False}:
-        raise GlobalStopError("GLOBAL STOP: phase 3 must stay disabled and non-automatic")
+    validate_phase3_config(config)
     validate_phase2_config(config)
     return config
 
@@ -213,6 +229,29 @@ def validate_phase2_config(config: dict[str, Any]) -> None:
         raise GlobalStopError("GLOBAL STOP: trusted Phase-1 root changed")
 
 
+def validate_phase3_config(config: dict[str, Any]) -> None:
+    expected = {
+        "enabled": True,
+        "selected_step": 10,
+        "phase2_entry_boundary": "transformer_input",
+        "phase2_exit_boundary": "guidance_combined_output",
+        "transformer_role": "high_noise_transformer",
+        "cfg_execution": "sequential_positive_then_negative",
+        "branches": list(PHASE3_BRANCHES),
+        "expected_global_block_count": PHASE3_BLOCK_COUNT,
+        "expected_start_layer": 0,
+        "expected_end_layer": PHASE3_BLOCK_COUNT,
+        "phase4_enabled": False,
+        "auto_expand": False,
+    }
+    if config.get("phase3") != expected:
+        raise GlobalStopError("GLOBAL STOP: frozen Phase-3 target or execution structure changed")
+    if config.get("trusted_phase1_commit") != PHASE3_PHASE1_COMMIT:
+        raise GlobalStopError("GLOBAL STOP: Phase-1-producing commit changed")
+    if config.get("trusted_phase2_commit") != PHASE3_PHASE2_COMMIT:
+        raise GlobalStopError("GLOBAL STOP: Phase-2-producing commit changed")
+
+
 def validate_output_namespace(config: dict[str, Any], output_dir: Path) -> None:
     protected = ("video_runtime_state_discovery", "video_bf16_single_flip", "video_runtime_error_shape", "video_checkpoint_stability")
     if output_dir.name != Path(config["output_root"]).name or any(item in str(output_dir) for item in protected):
@@ -227,6 +266,7 @@ def provenance(config_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         "experiments/video_bf16_single_flip_killtest.py",
         "experiments/video_runtime_state_discovery.py",
         "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py",
+        "vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py",
         "vllm_omni/diffusion/models/wan2_2/scheduling_wan_euler.py",
         "experiments/run_video_bf16_first_divergence_localization_gpu0.sh",
         "tests/diffusion/test_video_bf16_first_divergence_localization.py",
@@ -279,6 +319,110 @@ def load_tensor(root: Path, record: dict[str, Any]) -> np.ndarray:
     if not np.isfinite(value).all():
         raise GlobalStopError(f"GLOBAL STOP: non-finite tensor artifact: {relative}")
     return value
+
+
+CFG_RECONSTRUCTION_RULE = (
+    "vllm_omni.diffusion.distributed.cfg_parallel.CFGParallelMixin.combine_cfg_noise with cfg_normalize=False: "
+    "comb = n + true_cfg_scale * (p - n), evaluated eagerly on bfloat16 tensors as three separate ops, "
+    "each computed in float32 op-math and rounded to bfloat16 (round-to-nearest-even): "
+    "d = bf16(p - n); m = bf16(float32(scale) * d); comb = bf16(n + m)"
+)
+
+
+def reconstruct_cfg_combined_bits(positive_bits: np.ndarray, negative_bits: np.ndarray, guidance_scale: float) -> np.ndarray:
+    """Canonical CPU emulation of the production CFG combination on BF16 tensors.
+
+    Derived from ``CFGParallelMixin.combine_cfg_noise`` (sequential path used by
+    Wan2.2 T2V with ``cfg_normalize=False``)::
+
+        comb = n + true_cfg_scale * (p - n)
+
+    PyTorch evaluates this eagerly as three elementwise kernels on bfloat16
+    tensors; every kernel upcasts its bfloat16 inputs to float32 op-math and
+    rounds its result to bfloat16 (RNE). A Python float scale does not promote
+    the dtype. The emulation below therefore rounds after each of the three
+    operations, in the same order, with float32 intermediate arithmetic. The
+    result is returned as BF16 bit patterns for bit-exact comparison.
+    """
+    if positive_bits.shape != negative_bits.shape:
+        raise GlobalStopError("GLOBAL STOP: CFG operand shapes differ")
+    p = single_flip.bf16_bits_to_float32(np.ascontiguousarray(positive_bits, dtype=np.uint16)).reshape(positive_bits.shape)
+    n = single_flip.bf16_bits_to_float32(np.ascontiguousarray(negative_bits, dtype=np.uint16)).reshape(negative_bits.shape)
+    cast = single_flip.base.cast_runtime_bf16
+    difference = cast((p - n).astype(np.float32))
+    scaled = cast((np.float32(guidance_scale) * difference).astype(np.float32))
+    combined = cast((n + scaled).astype(np.float32))
+    return single_flip.float32_to_bf16_bits(combined).reshape(positive_bits.shape)
+
+
+def phase3_cfg_guidance_scale(config: dict[str, Any]) -> float:
+    """The guidance scale bound to the traced invocation: the high-noise (transformer) stage uses guidance_low,
+    which for a scalar request guidance equals config generation.guidance_scale."""
+    scale = config["generation"]["guidance_scale"]
+    if isinstance(scale, (list, tuple)):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 is frozen for a scalar guidance scale")
+    return float(scale)
+
+
+def phase3_runtime_identity(bits: np.ndarray, shape: list[int]) -> str:
+    bits = np.ascontiguousarray(bits, dtype=np.uint16)
+    header = canonical_json(
+        {
+            "version": "phase3-runtime-tensor-identity-v1",
+            "runtime_dtype": EXPECTED_RUNTIME_DTYPE,
+            "shape": [int(item) for item in shape],
+        }
+    )
+    return sha256_bytes(header + b"\0" + bits.tobytes(order="C"))
+
+
+def phase3_artifact_record(root: Path, path: Path, *, shape: list[int]) -> dict[str, Any]:
+    path = path.resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 artifact is outside the result root")
+    bits = np.load(path, allow_pickle=False)
+    if bits.dtype != np.uint16 or bits.size != math.prod(shape):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 BF16 artifact encoding/shape is invalid")
+    bits = np.ascontiguousarray(bits.reshape(shape))
+    widened = single_flip.bf16_bits_to_float32(bits).reshape(shape)
+    return {
+        "relative_path": relative_path(root, path),
+        "file_sha256": sha256_file(path),
+        "artifact_encoding": "bf16_bits_v1",
+        "runtime_dtype": EXPECTED_RUNTIME_DTYPE,
+        "shape": [int(item) for item in shape],
+        "runtime_canonical_identity": phase3_runtime_identity(bits, shape),
+        "comparison_canonical_identity": identity(widened),
+        "nbytes": int(bits.nbytes),
+    }
+
+
+def load_phase3_artifact(root: Path, record: dict[str, Any]) -> np.ndarray:
+    relative = Path(record["relative_path"])
+    if relative.is_absolute() or ".." in relative.parts:
+        raise GlobalStopError("GLOBAL STOP: Phase-3 artifact path is not a safe relative path")
+    path = root / relative
+    if not path.exists() or sha256_file(path) != record.get("file_sha256"):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 artifact file validation failed")
+    bits = np.load(path, allow_pickle=False)
+    shape = [int(item) for item in record.get("shape", [])]
+    if (
+        bits.dtype != np.uint16
+        or bits.size != math.prod(shape)
+        or record.get("artifact_encoding") != "bf16_bits_v1"
+        or record.get("runtime_dtype") != EXPECTED_RUNTIME_DTYPE
+    ):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 artifact dtype/shape semantics changed")
+    bits = np.ascontiguousarray(bits.reshape(shape))
+    widened = single_flip.bf16_bits_to_float32(bits).reshape(shape)
+    if (
+        phase3_runtime_identity(bits, shape) != record.get("runtime_canonical_identity")
+        or identity(widened) != record.get("comparison_canonical_identity")
+        or int(bits.nbytes) != int(record.get("nbytes", -1))
+        or not np.isfinite(widened).all()
+    ):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 artifact canonical identity validation failed")
+    return widened
 
 
 def boundary_keys(remaining: int) -> list[str]:
@@ -420,6 +564,55 @@ def trusted_array_record(path: Path, *, source_path: Path) -> dict[str, Any]:
     }
 
 
+def exact_historical_invariants(historical: dict[str, Any]) -> dict[str, Any]:
+    """Cross-host-stable identity of the historical FP16 delta: bits, coordinates, hashes; no float reductions."""
+    return {
+        "changed_coordinate_count": historical.get("changed_coordinate_count"),
+        "coordinates": [
+            {
+                "coordinate_flat_index": row.get("coordinate_flat_index"),
+                "clean_bf16_bits_hex": row.get("clean_bf16_bits_hex"),
+                "perturbed_bf16_bits_hex": row.get("perturbed_bf16_bits_hex"),
+                "adjacent_steps": row.get("adjacent_steps"),
+                "direction": row.get("direction"),
+            }
+            for row in historical.get("changed_coordinates", [])
+        ],
+        "clean_runtime_sha256": historical.get("clean_runtime_sha256"),
+        "probe_runtime_sha256": historical.get("probe_runtime_sha256"),
+    }
+
+
+def exact_construction_invariants(construction: dict[str, Any]) -> dict[str, Any]:
+    """Cross-host-stable identity of the PLUS1 construction; float accounting values stay descriptive."""
+    keys = (
+        "condition_id", "perturbation_family", "coordinate_flat_index", "direction", "clean_bf16_bits_hex",
+        "perturbed_bf16_bits_hex", "changed_coordinate_count", "realized_nonzero_elements", "total_elements",
+        "runtime_input_hash", "state_fp32_sha256", "expected_candidate_tensor_identity_sha256_v1",
+        "expected_candidate_shape", "expected_candidate_dtype", "expected_candidate_raw_bf16_bytes_sha256",
+        "expected_changed_flat_index", "expected_clean_bf16_bits", "expected_perturbed_bf16_bits",
+    )
+    return {key: construction.get(key) for key in keys}
+
+
+def exact_pair_invariants(lhs: np.ndarray, rhs: np.ndarray) -> dict[str, Any]:
+    """Cross-host-stable pair binding; intentionally contains no reductions."""
+    if lhs.shape != rhs.shape or lhs.dtype != rhs.dtype:
+        raise GlobalStopError("GLOBAL STOP: exact pair tensors differ in shape or dtype")
+    lhs = np.ascontiguousarray(lhs)
+    rhs = np.ascontiguousarray(rhs)
+    differing = int(np.count_nonzero(lhs.view(np.uint32) != rhs.view(np.uint32)))
+    return {
+        "lhs_canonical_identity": identity(lhs),
+        "rhs_canonical_identity": identity(rhs),
+        "shape": [int(item) for item in lhs.shape],
+        "storage_dtype": np.dtype(lhs.dtype).newbyteorder("<").str,
+        "nbytes": int(lhs.nbytes),
+        "differing_element_count": differing,
+        "bit_exact": differing == 0,
+    }
+
+
 def derive_trusted_phase1(config: dict[str, Any]) -> dict[str, Any]:
     root = (REPO_ROOT / config["trusted_phase1_root"]).resolve()
     trace_path = root / "phase1/trace_manifest.json"
@@ -455,15 +648,15 @@ def derive_trusted_phase1(config: dict[str, Any]) -> dict[str, Any]:
             "exit_artifact": rows["after_step_001"]["artifact"],
             "exit_identity": identity(exit_state),
         }
-    input_clean_plus = metrics(
+    input_clean_plus = exact_pair_invariants(
         load_tensor(root, frozen["CLEAN"]["entry_artifact"]),
         load_tensor(root, frozen["PLUS1"]["entry_artifact"]),
     )
-    exit_clean_plus = metrics(
+    exit_clean_plus = exact_pair_invariants(
         load_tensor(root, frozen["CLEAN"]["exit_artifact"]),
         load_tensor(root, frozen["PLUS1"]["exit_artifact"]),
     )
-    exit_plus_historical = metrics(
+    exit_plus_historical = exact_pair_invariants(
         load_tensor(root, frozen["PLUS1"]["exit_artifact"]),
         load_tensor(root, frozen["HISTORICAL_PLUS14"]["exit_artifact"]),
     )
@@ -476,7 +669,6 @@ def derive_trusted_phase1(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "source_root_relative_path": str(root.relative_to(REPO_ROOT)),
         "trace_manifest_sha256": sha256_file(trace_path),
-        "phase1_analysis_sha256": sha256_file(analysis_path),
         "source_provenance_hash": trace.get("provenance_hash"),
         "source_manifest_sha256": trace.get("manifest_sha256"),
         "entry_boundary": "input",
@@ -485,6 +677,147 @@ def derive_trusted_phase1(config: dict[str, Any]) -> dict[str, Any]:
         "trusted_input_clean_vs_plus1": input_clean_plus,
         "trusted_exit_clean_vs_plus1": exit_clean_plus,
         "trusted_exit_plus1_vs_historical": exit_plus_historical,
+    }
+
+
+def float64_bit_pattern(value: float) -> str:
+    return struct.pack(">d", float(value)).hex()
+
+
+def derive_trusted_phase2(config: dict[str, Any]) -> dict[str, Any]:
+    root = (REPO_ROOT / config["trusted_phase1_root"]).resolve()
+    provenance_path = root / "provenance.json"
+    phase2_manifest_path = root / "phase2/phase2_manifest.json"
+    phase2_analysis_path = root / "phase2/phase2_analysis.json"
+    phase2_gates_path = root / "phase2/phase2_gates.json"
+    for path in (provenance_path, phase2_manifest_path, phase2_analysis_path, phase2_gates_path):
+        if not path.exists():
+            raise GlobalStopError(f"GLOBAL STOP: trusted Phase-2 artifact is missing: {path}")
+    source_provenance = json.loads(provenance_path.read_text())
+    if source_provenance.get("git_commit") != PHASE3_PHASE2_COMMIT or source_provenance.get("git_dirty"):
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-2 producing revision is not the frozen clean commit")
+    phase2_manifest = json.loads(phase2_manifest_path.read_text())
+    phase2_analysis = json.loads(phase2_analysis_path.read_text())
+    gate_rows = json.loads(phase2_gates_path.read_text()).get("gates", [])
+    if (
+        [row.get("name") for row in gate_rows] != list(PHASE2_REQUIRED_GATES)
+        or any(row.get("required") is not True or row.get("status") != "PASS" for row in gate_rows)
+    ):
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-2 gate set is not 25/25 PASS")
+    if phase2_manifest.get("selected_step") != 10:
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-2 selected step changed")
+    mapping = phase2_manifest.get("selection_mapping", {})
+    timestep = mapping.get("selected_scheduler_timestep")
+    if (
+        mapping.get("phase1_entry_boundary") != "input"
+        or mapping.get("phase1_exit_boundary") != "after_step_001"
+        or float64_bit_pattern(timestep) != float64_bit_pattern(single_flip.scheduler_timesteps_numpy(config)[10])
+    ):
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-2 mapping changed")
+    if phase2_analysis.get("plus1_historical_exact_merge", {}).get("classification") != "MERGED_AT_GUIDANCE_OUTPUT":
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-2 exact classification changed")
+
+    trajectories: dict[str, Any] = {}
+    exact_rows: list[dict[str, Any]] = []
+    for name in TRAJECTORIES:
+        rows = {row["boundary"]: row for row in phase2_manifest["traces"][name]}
+        if set(rows) != set(PHASE2_AVAILABLE_BOUNDARIES):
+            raise GlobalStopError("GLOBAL STOP: trusted Phase-2 boundary set changed")
+        entry = load_tensor(root, rows["transformer_input"]["artifact"])
+        exit_state = load_tensor(root, rows["guidance_combined_output"]["artifact"])
+        final_latent = load_tensor(root, phase2_manifest["final_latents"][name])
+        final_video = load_tensor(root, phase2_manifest["final_videos"][name])
+        trajectories[name] = {
+            "entry_artifact": rows["transformer_input"]["artifact"],
+            "entry_identity": identity(entry),
+            "entry_shape": [int(item) for item in entry.shape],
+            "entry_storage_dtype": np.dtype(entry.dtype).newbyteorder("<").str,
+            "exit_artifact": rows["guidance_combined_output"]["artifact"],
+            "exit_identity": identity(exit_state),
+            "exit_shape": [int(item) for item in exit_state.shape],
+            "exit_storage_dtype": np.dtype(exit_state.dtype).newbyteorder("<").str,
+            "final_latent_identity": identity(final_latent),
+            "final_video_identity": identity(final_video),
+        }
+    for boundary in PHASE2_AVAILABLE_BOUNDARIES:
+        left_row = next(row for row in phase2_manifest["traces"]["PLUS1"] if row["boundary"] == boundary)
+        right_row = next(row for row in phase2_manifest["traces"]["HISTORICAL_PLUS14"] if row["boundary"] == boundary)
+        exact_rows.append({
+            "boundary": boundary,
+            "pair": "PLUS1_VS_HISTORICAL_PLUS14",
+            **exact_pair_invariants(
+                load_tensor(root, left_row["artifact"]),
+                load_tensor(root, right_row["artifact"]),
+            ),
+        })
+    recomputed_event = _phase2_merge_event(exact_rows)
+    if recomputed_event["classification"] != "MERGED_AT_GUIDANCE_OUTPUT":
+        raise GlobalStopError("GLOBAL STOP: Phase-2 exact event does not reproduce from artifacts")
+    return {
+        "source_root_relative_path": str(root.relative_to(REPO_ROOT)),
+        "producing_commit": PHASE3_PHASE2_COMMIT,
+        "source_provenance_hash": phase2_manifest.get("provenance_hash"),
+        "phase2_manifest_sha256": sha256_file(phase2_manifest_path),
+        "selected_step": 10,
+        "selected_scheduler_timestep_bits": float64_bit_pattern(timestep),
+        "entry_boundary": "transformer_input",
+        "exit_boundary": "guidance_combined_output",
+        "exact_classification": recomputed_event["classification"],
+        "trajectories": trajectories,
+    }
+
+
+def phase3_freeze(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selected_step": 10,
+        "selected_scheduler_timestep_bits": float64_bit_pattern(single_flip.scheduler_timesteps_numpy(config)[10]),
+        "phase2_entry_boundary": "transformer_input",
+        "phase2_exit_boundary": "guidance_combined_output",
+        "transformer_role": "high_noise_transformer",
+        "cfg_execution": "sequential_positive_then_negative",
+        "branches": list(PHASE3_BRANCHES),
+        "global_block_count": PHASE3_BLOCK_COUNT,
+        "start_layer": 0,
+        "end_layer": PHASE3_BLOCK_COUNT,
+        "block_order": list(range(PHASE3_BLOCK_COUNT)),
+        "branch_boundaries": list(PHASE3_FIXED_BOUNDARIES),
+        "expected_shapes": _phase3_expected_shapes(config),
+        "same_semantics_support_boundaries": [
+            "pre_block_hidden_state",
+            *(f"after_block_{index:03d}" for index in range(PHASE3_BLOCK_COUNT)),
+        ],
+        "expected_architecture": {
+            "model_class": "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer.WanTransformer3DModel",
+            "configured_num_layers": PHASE3_BLOCK_COUNT,
+            "start_layer": 0,
+            "end_layer": PHASE3_BLOCK_COUNT,
+            "module_list_length": PHASE3_BLOCK_COUNT,
+            "executed_block_order": list(range(PHASE3_BLOCK_COUNT)),
+            "num_attention_heads": PHASE3_NUM_HEADS,
+            "attention_head_dim": PHASE3_HEAD_DIM,
+            "inner_dim": PHASE3_NUM_HEADS * PHASE3_HEAD_DIM,
+            "patch_size": [1, 2, 2],
+        },
+        "expected_artifact_budget": _phase3_artifact_budget(config),
+        "cfg_guidance_scale": phase3_cfg_guidance_scale(config),
+        "cfg_guidance_scale_bits": float64_bit_pattern(phase3_cfg_guidance_scale(config)),
+        "cfg_reconstruction_rule": CFG_RECONSTRUCTION_RULE,
+        "intermediate_authentication_limit": (
+            "Block-boundary tensors between transformer_entry and raw_transformer_output have no CPU-side external "
+            "reference. Their authenticity rests on the committed production write path of the same run, the frozen "
+            "block order, the traced-final-equals-trusted-final controls, the Phase-2 entry/exit identity controls, and "
+            "the raw-operand CFG reconstruction gate that binds both raw branch outputs to the persisted combined output."
+        ),
+        "architecture": {
+            "pre_block_processing": "patch_embedding -> flatten/transpose -> SP shard point -> condition embedding",
+            "block_loop": "self.blocks[self.start_layer:self.end_layer], each exactly once in ascending global index",
+            "post_block_processing": "norm_out -> proj_out -> reshape/permute/unpatchify",
+            "block_output_aliasing": "no in-place loop assignment observed; each returned hidden_states becomes the next block input",
+        },
+        "phase4_enabled": False,
+        "auto_expand": False,
+        "phase1_producing_commit": PHASE3_PHASE1_COMMIT,
+        "phase2_producing_commit": PHASE3_PHASE2_COMMIT,
     }
 
 
@@ -532,7 +865,18 @@ def derive_anchor(config: dict[str, Any]) -> dict[str, Any]:
         "PLUS1": {"final_latent": plus_latent, "video": plus_video},
         "HISTORICAL_PLUS14": {"final_latent": historical_latent, "video": historical_video},
     }
-    return {"source": source, "clean": source.clean, "plus1": plus1, "historical": historical, "plus_record": plus_record, "historical_delta": historical_delta, "trusted_config": trusted_cfg, "trusted_finals": trusted_finals, "trusted_phase1": derive_trusted_phase1(config)}
+    return {
+        "source": source,
+        "clean": source.clean,
+        "plus1": plus1,
+        "historical": historical,
+        "plus_record": plus_record,
+        "historical_delta": historical_delta,
+        "trusted_config": trusted_cfg,
+        "trusted_finals": trusted_finals,
+        "trusted_phase1": derive_trusted_phase1(config),
+        "trusted_phase2": derive_trusted_phase2(config),
+    }
 
 
 def anchor_manifest(root: Path, config: dict[str, Any], data: dict[str, Any], prov: dict[str, Any]) -> dict[str, Any]:
@@ -565,11 +909,13 @@ def anchor_manifest(root: Path, config: dict[str, Any], data: dict[str, Any], pr
         "trajectories": {"CLEAN": artifacts["CLEAN"], "PLUS1": {**artifacts["PLUS1"], "construction": data["plus_record"]}, "HISTORICAL_PLUS14": {**artifacts["HISTORICAL_PLUS14"], "historical_delta": data["historical_delta"]}},
         "trusted_final_identities": data["trusted_finals"],
         "trusted_phase1": data["trusted_phase1"],
+        "trusted_phase2": data["trusted_phase2"],
         "expected_boundaries": [row["boundary"] for row in boundary_specs],
         "boundary_specifications": boundary_specs,
         "early_late_cutoff": early_late_cutoff(len(boundary_specs)),
         "timestep_match_policy": timestep_match_policy(),
         "phase2_freeze": phase2_freeze(config),
+        "phase3_freeze": phase3_freeze(config),
     }
     manifest["manifest_sha256"] = sha256_bytes(canonical_json(manifest))
     return manifest
@@ -714,6 +1060,7 @@ def run_cpu(config: dict[str, Any], config_path: Path, root: Path) -> dict[str, 
 
 
 def require_cpu(root: Path, config_path: Path, config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    validate_phase3_config(config)
     validate_phase2_config(config)
     manifest_path, gate_path = root / "anchor_manifest.json", root / "cpu_gates.json"
     if not manifest_path.exists() or not gate_path.exists():
@@ -767,19 +1114,23 @@ def require_cpu(root: Path, config_path: Path, config: dict[str, Any]) -> tuple[
         if not np.array_equal(actual_state, expected_state) or record.get("canonical_identity") != identity(expected_state):
             raise GlobalStopError(f"GLOBAL STOP: manifest {name} input differs from frozen construction")
     historical = manifest["trajectories"]["HISTORICAL_PLUS14"].get("historical_delta", {})
-    if historical.get("changed_coordinate_count") != 6 or historical != data["historical_delta"]:
+    if historical.get("changed_coordinate_count") != 6 or exact_historical_invariants(historical) != exact_historical_invariants(data["historical_delta"]):
         raise GlobalStopError("GLOBAL STOP: manifest historical support differs from frozen construction")
     construction = manifest["trajectories"]["PLUS1"].get("construction", {})
-    if construction != data["plus_record"]:
+    if exact_construction_invariants(construction) != exact_construction_invariants(data["plus_record"]):
         raise GlobalStopError("GLOBAL STOP: manifest PLUS1 construction differs from frozen construction")
     if manifest.get("trusted_final_identities") != data["trusted_finals"]:
         raise GlobalStopError("GLOBAL STOP: manifest trusted final identities differ from frozen artifacts")
     if manifest.get("trusted_phase1") != data["trusted_phase1"]:
         raise GlobalStopError("GLOBAL STOP: manifest trusted Phase-1 binding differs from preserved artifacts")
+    if manifest.get("trusted_phase2") != data["trusted_phase2"]:
+        raise GlobalStopError("GLOBAL STOP: manifest trusted Phase-2 binding differs from preserved artifacts")
     if manifest.get("phase2_freeze") != phase2_freeze(config):
         raise GlobalStopError("GLOBAL STOP: manifest Phase-2 freeze differs from config/scheduler")
     if not config_phase2_is_frozen(manifest):
         raise GlobalStopError("GLOBAL STOP: manifest Phase-2 freeze differs from the preregistered configuration")
+    if manifest.get("phase3_freeze") != phase3_freeze(config):
+        raise GlobalStopError("GLOBAL STOP: manifest Phase-3 freeze differs from config/source architecture")
     expected_mapping = phase2_selection_mapping(config, manifest, 10)
     if manifest["phase2_freeze"].get("selected_scheduler_timestep") != expected_mapping["selected_scheduler_timestep"]:
         raise GlobalStopError("GLOBAL STOP: manifest Phase-2 scheduler timestep changed")
@@ -893,10 +1244,14 @@ def run_preflight(config: dict[str, Any], config_path: Path, root: Path, args: a
         for name, state in candidates.items():
             for replay in range(int(config["controls"]["repeats_per_trajectory"])):
                 result = single_flip.base.run_resume(omni, config, source, state, step_index=source.checkpoint_step, label=f"{name.lower()}_control_{replay}", directory=root / "preflight" / name / f"repeat_{replay}")
-                latent = np.load(result["recovered_final_latent_artifact"]["path"], allow_pickle=False)
-                video = np.load(result["recovered_video_artifact"]["path"], allow_pickle=False)
+                latent_record = tensor_record_from_file(root, Path(result["recovered_final_latent_artifact"]["path"]))
+                video_record = tensor_record_from_file(root, Path(result["recovered_video_artifact"]["path"]), runtime_semantics="uint8 decoded video")
+                latent = load_tensor(root, latent_record)
+                video = load_tensor(root, video_record)
                 controls[name].append({
+                    "repeat_id": replay,
                     "final_latent_identity": identity(latent), "video_identity": identity(video),
+                    "final_latent_artifact": latent_record, "video_artifact": video_record,
                     "exact_vs_clean": bool(np.array_equal(latent, source.final_latent) and np.array_equal(video, source.video)),
                 })
         doc = _preflight_document(root, manifest, prov, controls, source)
@@ -905,7 +1260,57 @@ def run_preflight(config: dict[str, Any], config_path: Path, root: Path, args: a
         single_flip._shutdown(omni)
 
 
+def tensor_record_from_file(root: Path, path: Path, *, runtime_semantics: str = EXPECTED_RUNTIME_DTYPE) -> dict[str, Any]:
+    """Root-relative, identity-bearing record for an array already persisted under ``root`` by trusted base code."""
+    path = path.resolve()
+    if not path.is_relative_to(root.resolve()):
+        raise GlobalStopError(f"GLOBAL STOP: preflight artifact is outside the result root: {path}")
+    value = np.load(path, allow_pickle=False)
+    return {
+        "relative_path": relative_path(root, path), "file_sha256": sha256_file(path),
+        "canonical_identity": identity(value), "storage_dtype": np.dtype(value.dtype).newbyteorder("<").str,
+        "shape": [int(x) for x in value.shape], "nbytes": int(value.nbytes),
+        "runtime_dtype_semantics": runtime_semantics,
+    }
+
+
+def rederive_preflight_controls(root: Path, manifest: dict[str, Any], document: dict[str, Any]) -> dict[str, Any]:
+    """Re-derive every preflight scientific fact from the persisted repeat artifacts; PASS booleans are not trusted."""
+    repeats = 3
+    controls = document.get("controls")
+    if not isinstance(controls, dict) or set(controls) != set(TRAJECTORIES):
+        raise GlobalStopError("GLOBAL STOP: preflight controls do not cover exactly the three trajectories")
+    identities: dict[str, list[tuple[str, str]]] = {}
+    for name in TRAJECTORIES:
+        rows = controls[name]
+        if not isinstance(rows, list) or sorted(int(row.get("repeat_id", -1)) for row in rows) != list(range(repeats)):
+            raise GlobalStopError(f"GLOBAL STOP: preflight {name} repeat key set is not exactly repeats 0..{repeats - 1}")
+        identities[name] = []
+        for row in sorted(rows, key=lambda item: int(item["repeat_id"])):
+            latent = load_tensor(root, row["final_latent_artifact"])
+            video = load_tensor(root, row["video_artifact"])
+            identities[name].append((identity(latent), identity(video)))
+    trusted = {name: _trusted_final_pair(manifest, name) for name in TRAJECTORIES}
+    facts = {
+        "G11 CLEAN repeated final determinism": len(set(identities["CLEAN"])) == 1,
+        "G12 PLUS1 repeated final determinism": len(set(identities["PLUS1"])) == 1,
+        "G13 historical repeated final determinism": len(set(identities["HISTORICAL_PLUS14"])) == 1,
+        "G14 PLUS1 final == historical final": identities["PLUS1"][0] == identities["HISTORICAL_PLUS14"][0],
+        "G15 CLEAN final != PLUS1 final": identities["CLEAN"][0][0] != identities["PLUS1"][0][0] and identities["CLEAN"][0][1] != identities["PLUS1"][0][1],
+        "G15a CLEAN final equals trusted clean": identities["CLEAN"][0] == trusted["CLEAN"],
+        "G15b PLUS1 final equals trusted PLUS1": identities["PLUS1"][0] == trusted["PLUS1"],
+        "G15c historical final equals trusted historical": identities["HISTORICAL_PLUS14"][0] == trusted["HISTORICAL_PLUS14"],
+    }
+    if set(facts) != set(PREFLIGHT_REQUIRED_GATES):
+        raise GlobalStopError("GLOBAL STOP: preflight fact set does not match the required gate set")
+    failed = [name for name, passed in facts.items() if not passed]
+    if failed:
+        raise GlobalStopError(f"GLOBAL STOP: preflight controls re-derived from artifacts fail: {failed}")
+    return {"identities": identities, "facts": facts}
+
+
 def require_preflight(root: Path, manifest: dict[str, Any], prov: dict[str, Any]) -> None:
+    """Authorize GPU science only from persisted repeat artifacts bound to the current provenance and manifest."""
     path = root / "preflight" / "preflight_gates.json"
     if not path.exists():
         raise GlobalStopError("GLOBAL STOP: preflight gates are missing")
@@ -914,6 +1319,10 @@ def require_preflight(root: Path, manifest: dict[str, Any], prov: dict[str, Any]
         value, PREFLIGHT_REQUIRED_GATES,
         provenance_hash=prov["provenance_hash"], manifest_sha256=manifest["manifest_sha256"],
     )
+    rederived = rederive_preflight_controls(root, manifest, value)
+    declared = {row["name"]: row.get("status") == "PASS" for row in value["gates"]}
+    if any(declared.get(name) is not True for name in rederived["facts"]):
+        raise GlobalStopError("GLOBAL STOP: preflight gate document disagrees with re-derived artifact facts")
 
 
 def run_phase1(config: dict[str, Any], config_path: Path, root: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -1200,10 +1609,9 @@ def _clean_plus_spread(pairwise_rows: list[dict[str, Any]]) -> tuple[list[dict[s
 def _load_trusted_phase1_boundary(root: Path, manifest: dict[str, Any], name: str, which: str) -> np.ndarray:
     trusted = manifest["trusted_phase1"]
     trace_path = root / "phase1/trace_manifest.json"
-    analysis_path = root / "phase1/phase1_analysis.json"
-    if not trace_path.exists() or not analysis_path.exists():
-        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 files are missing from the result root")
-    if sha256_file(trace_path) != trusted["trace_manifest_sha256"] or sha256_file(analysis_path) != trusted["phase1_analysis_sha256"]:
+    if not trace_path.exists():
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 trace is missing from the result root")
+    if sha256_file(trace_path) != trusted["trace_manifest_sha256"]:
         raise GlobalStopError("GLOBAL STOP: trusted Phase-1 source file hash changed")
     return load_tensor(root, trusted["trajectories"][name][f"{which}_artifact"])
 
@@ -1380,7 +1788,7 @@ def analyze_phase2_artifacts(root: Path, config: dict[str, Any], manifest: dict[
         _p2_gate(20, "PLUS1 scheduler_output equals HISTORICAL scheduler_output", plus_hist_output["bit_exact"], plus_hist_output),
         _p2_gate(21, "no NaN/Inf", finite, None),
         _p2_gate(22, "relocation/path resolution valid", relative_paths, None),
-        _p2_gate(23, "Phase3 not automatically triggered", config["phase3"] == {"enabled": False, "auto_expand": False}, config["phase3"]),
+        _p2_gate(23, "Phase3 not automatically triggered", config["phase3"]["auto_expand"] is False, config["phase3"]),
         _p2_gate(24, "no forbidden expansion modes", tuple(config["allowed_modes"]) == MODES and "fp32-search" not in MODES, list(MODES)),
         _p2_gate(25, "provenance/config/manifest/selected-step binding valid", trace["provenance_hash"] == prov["provenance_hash"] and trace["manifest_sha256"] == manifest["manifest_sha256"] and trace["selection_mapping"] == mapping, mapping),
     ]
@@ -1415,6 +1823,586 @@ def run_analyze_phase2(config: dict[str, Any], config_path: Path, root: Path) ->
     return {"mode": "analyze-phase2", "selected_step": result["selected_step"], "pairwise_rows": len(result["pairwise_rows"]), "classification": result["plus1_historical_exact_merge"]["classification"]}
 
 
+def _phase3_expected_shapes(config: dict[str, Any]) -> dict[str, list[int]]:
+    generation = config["generation"]
+    latent_shape = [
+        1,
+        16,
+        math.ceil(int(generation["num_frames"]) / 4),
+        math.ceil(int(generation["height"]) / 8),
+        math.ceil(int(generation["width"]) / 8),
+    ]
+    token_count = latent_shape[2] * (latent_shape[3] // 2) * (latent_shape[4] // 2)
+    return {
+        "latent": latent_shape,
+        "block_hidden": [1, token_count, PHASE3_NUM_HEADS * PHASE3_HEAD_DIM],
+    }
+
+
+def _phase3_artifact_budget(config: dict[str, Any]) -> dict[str, Any]:
+    """Frozen, bounded artifact volume: every persisted tensor is enumerated up front."""
+    shapes = _phase3_expected_shapes(config)
+    hidden_bytes = 2 * math.prod(shapes["block_hidden"])
+    latent_bytes = 2 * math.prod(shapes["latent"])
+    hidden_boundaries = len(PHASE3_FIXED_BOUNDARIES) - 2  # all but transformer_entry / raw_transformer_output
+    per_branch = hidden_boundaries * hidden_bytes + 2 * latent_bytes
+    per_trajectory = len(PHASE3_BRANCHES) * per_branch + latent_bytes  # + cfg_combined_output
+    return {
+        "hidden_tensor_bytes_bf16": hidden_bytes,
+        "latent_tensor_bytes_bf16": latent_bytes,
+        "tensors_per_branch": len(PHASE3_FIXED_BOUNDARIES),
+        "bytes_per_trajectory": per_trajectory,
+        "bytes_total_three_trajectories": len(TRAJECTORIES) * per_trajectory,
+        "note": "block tensors persisted as raw BF16 bit patterns (lossless, 2 bytes/element); no decoded videos except the three final controls",
+    }
+
+
+def _run_phase3_trace(
+    omni: Any,
+    config: dict[str, Any],
+    source: Any,
+    state: np.ndarray,
+    name: str,
+    root: Path,
+) -> dict[str, Any]:
+    import torch
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    selected_step = 10
+    local_step = selected_step - int(source.checkpoint_step)
+    generation = config["generation"]
+    sampling = OmniDiffusionSamplingParams(
+        height=int(generation["height"]),
+        width=int(generation["width"]),
+        num_frames=int(generation["num_frames"]),
+        num_inference_steps=int(generation["num_inference_steps"]),
+        guidance_scale=float(generation["guidance_scale"]),
+        fps=float(generation["fps"]),
+        seed=source.seed,
+        generator=torch.Generator(device="cpu").manual_seed(source.seed),
+    )
+    sampling.latents = torch.from_numpy(np.ascontiguousarray(state))
+    sampling.step_index = int(source.checkpoint_step)
+    sampling.extra_args = {
+        "flow_shift": float(config["scheduler"]["flow_shift"]),
+        "sample_solver": "euler",
+        "trajectory_probe": {
+            "artifact_dir": str(root / "phase3" / name.lower() / "final_probe"),
+            "request_label": name.lower(),
+            "capture_steps": [0, int(generation["num_inference_steps"]) - int(source.checkpoint_step)],
+            "save_latents": True,
+            "save_decoded": False,
+            "save_mp4": False,
+        },
+        "phase3_block_probe": {
+            "artifact_dir": str(root / "phase3" / name.lower() / "block_probe"),
+            "request_label": name.lower(),
+            "selected_local_step": local_step,
+            "selected_absolute_step": selected_step,
+        },
+    }
+    outputs = omni.generate({"prompt": source.prompt}, sampling)
+    video, output = v3.normalize_video(outputs)
+    probe = output.custom_output.get("phase3_block_probe")
+    if not isinstance(probe, dict):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 block probe output is missing")
+    if (
+        int(probe.get("selected_local_step", -1)) != local_step
+        or int(probe.get("selected_absolute_step", -1)) != selected_step
+        or probe.get("cfg_execution") != "sequential_positive_then_negative"
+        or int(probe.get("pipeline_parallel_world_size", -1)) != 1
+        or int(probe.get("cfg_parallel_world_size", -1)) != 1
+    ):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 transformer invocation is not the frozen single-GPU sequential CFG path")
+    expected_architecture = phase3_freeze(config)["expected_architecture"]
+    branches: dict[str, Any] = {}
+    for invocation_index, branch in enumerate(PHASE3_BRANCHES):
+        branch_probe = probe.get("branches", {}).get(branch)
+        if not isinstance(branch_probe, dict):
+            raise GlobalStopError(f"GLOBAL STOP: Phase-3 {branch} branch trace is missing")
+        architecture = branch_probe.get("architecture", {})
+        if any(architecture.get(key) != value for key, value in expected_architecture.items()):
+            raise GlobalStopError("GLOBAL STOP: actual Wan transformer architecture differs from the frozen Phase-3 architecture")
+        records = branch_probe.get("records", [])
+        if [row.get("boundary") for row in records] != list(PHASE3_FIXED_BOUNDARIES):
+            raise GlobalStopError(f"GLOBAL STOP: Phase-3 {branch} block boundary order changed")
+        converted = []
+        for row in records:
+            if row.get("branch") != branch or int(row.get("invocation_index", -1)) != invocation_index:
+                raise GlobalStopError("GLOBAL STOP: Phase-3 CFG branch identity/order changed")
+            if row.get("runtime_dtype") != EXPECTED_RUNTIME_DTYPE or row.get("artifact_encoding") != "bf16_bits_v1":
+                raise GlobalStopError("GLOBAL STOP: Phase-3 runtime dtype or artifact encoding changed")
+            converted.append({
+                "boundary": row["boundary"],
+                "block_index": row.get("block_index"),
+                "branch": branch,
+                "invocation_index": invocation_index,
+                "runtime_dtype": row["runtime_dtype"],
+                "shape": [int(item) for item in row["shape"]],
+                "artifact": phase3_artifact_record(root, Path(row["artifact_path"]), shape=row["shape"]),
+            })
+        branches[branch] = {"architecture": architecture, "records": converted}
+    cfg = probe.get("cfg_combined_output")
+    if not isinstance(cfg, dict) or cfg.get("runtime_dtype") != EXPECTED_RUNTIME_DTYPE:
+        raise GlobalStopError("GLOBAL STOP: Phase-3 CFG-combined output is missing or has wrong dtype")
+    frozen_scale = phase3_cfg_guidance_scale(config)
+    if float64_bit_pattern(cfg.get("guidance_scale", float("nan"))) != float64_bit_pattern(frozen_scale) or cfg.get("cfg_normalize") is not False:
+        raise GlobalStopError("GLOBAL STOP: runtime CFG guidance scale/normalization differs from the frozen Phase-3 configuration")
+    cfg_record = {
+        "boundary": "cfg_combined_output",
+        "absolute_step": int(cfg["absolute_step"]),
+        "local_step": int(cfg["local_step"]),
+        "timestep_bits": float64_bit_pattern(cfg["timestep"]),
+        "runtime_dtype": cfg["runtime_dtype"],
+        "shape": [int(item) for item in cfg["shape"]],
+        "guidance_scale": frozen_scale,
+        "guidance_scale_bits": float64_bit_pattern(frozen_scale),
+        "cfg_normalize": False,
+        "artifact": phase3_artifact_record(root, Path(cfg["artifact_path"]), shape=cfg["shape"]),
+    }
+    # Fail fast on the GPU host: the persisted raw branch outputs must reconstruct the persisted combined output.
+    raw_bits = {}
+    for branch in PHASE3_BRANCHES:
+        raw_row = next(row for row in branches[branch]["records"] if row["boundary"] == "raw_transformer_output")
+        raw_bits[branch] = np.load(root / raw_row["artifact"]["relative_path"], allow_pickle=False).reshape(cfg_record["shape"])
+    persisted_cfg_bits = np.load(root / cfg_record["artifact"]["relative_path"], allow_pickle=False).reshape(cfg_record["shape"])
+    if not np.array_equal(reconstruct_cfg_combined_bits(raw_bits["positive"], raw_bits["negative"], frozen_scale), persisted_cfg_bits):
+        raise GlobalStopError(f"GLOBAL STOP: CFG_OPERAND_RECONSTRUCTION_MISMATCH for {name} at trace time")
+    trajectory_probe = output.custom_output.get("trajectory_probe_metadata")
+    if not isinstance(trajectory_probe, dict):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 final-latent trajectory probe is missing")
+    final_step_index = int(generation["num_inference_steps"]) - int(source.checkpoint_step)
+    final_rows = [row for row in trajectory_probe.get("records", []) if int(row.get("step_index", -1)) == final_step_index]
+    if len(final_rows) != 1 or not final_rows[0].get("latent_path"):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 final latent is missing or ambiguous")
+    final_latent = torch.load(Path(final_rows[0]["latent_path"]), map_location="cpu").detach().cpu().float().numpy()
+    return {
+        "trajectory": name,
+        "branches": branches,
+        "cfg_combined_output": cfg_record,
+        "final_latent": save_tensor(root, f"phase3/artifacts/{name}/final_latent.npy", final_latent),
+        "final_video": save_tensor(root, f"phase3/artifacts/{name}/final_video.npy", video, runtime_semantics="uint8 decoded video"),
+    }
+
+
+def run_phase3(config: dict[str, Any], config_path: Path, root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    validate_phase3_config(config)
+    manifest, prov = require_cpu(root, config_path, config)
+    require_preflight(root, manifest, prov)
+    require_committed_source(prov)
+    data = derive_anchor(config)
+    omni = _build_omni(config, args)
+    try:
+        results = {
+            name: _run_phase3_trace(omni, config, data["source"], state, name, root)
+            for name, state in {
+                "CLEAN": data["clean"],
+                "PLUS1": data["plus1"],
+                "HISTORICAL_PLUS14": data["historical"],
+            }.items()
+        }
+        document = {
+            "provenance_hash": prov["provenance_hash"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "selected_step": 10,
+            "selected_scheduler_timestep_bits": float64_bit_pattern(single_flip.scheduler_timesteps_numpy(config)[10]),
+            "phase3_freeze": manifest["phase3_freeze"],
+            "trajectories": results,
+        }
+        atomic_json(root / "phase3" / "phase3_manifest.json", document)
+        return {"mode": "phase3", "trajectory_count": len(results), "selected_step": 10}
+    finally:
+        single_flip._shutdown(omni)
+
+
+def _load_trusted_phase2_boundary(root: Path, manifest: dict[str, Any], name: str, which: str) -> np.ndarray:
+    trusted = manifest["trusted_phase2"]
+    source_root = (REPO_ROOT / trusted["source_root_relative_path"]).resolve()
+    path = source_root / "phase2/phase2_manifest.json"
+    if not path.exists() or sha256_file(path) != trusted["phase2_manifest_sha256"]:
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-2 manifest is missing or changed")
+    return load_tensor(source_root, trusted["trajectories"][name][f"{which}_artifact"])
+
+
+def _p3_gate(number: int, description: str, passed: bool, evidence: Any) -> dict[str, Any]:
+    return gate(f"P3-G{number}", passed, evidence, required=True)
+
+
+def _persistent_merge_event(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    exact = [bool(row["bit_exact"]) for row in rows]
+    transient = [
+        rows[index]["boundary"]
+        for index, is_exact in enumerate(exact)
+        if is_exact and not all(exact[index:])
+    ]
+    persistent = next(
+        (index for index, is_exact in enumerate(exact) if is_exact and all(exact[index:])),
+        None,
+    )
+    if persistent is None:
+        classification = "TRANSIENT_EXACT_EQUALITY" if transient else "NO_INTERNAL_EXACT_MERGE"
+        boundary = None
+    else:
+        boundary = rows[persistent]["boundary"]
+        if boundary == "transformer_entry":
+            classification = "MERGED_AT_TRANSFORMER_ENTRY"
+        elif boundary == "pre_block_hidden_state":
+            classification = "MERGED_BEFORE_BLOCK_000"
+        elif boundary.startswith("after_block_"):
+            classification = f"MERGED_AFTER_BLOCK_{int(boundary.rsplit('_', 1)[1]):03d}"
+        elif boundary == "transformer_pre_output":
+            classification = "MERGED_AT_TRANSFORMER_PRE_OUTPUT"
+        elif boundary == "raw_transformer_output":
+            classification = "MERGED_AT_RAW_TRANSFORMER_OUTPUT"
+        else:
+            raise GlobalStopError(f"GLOBAL STOP: unavailable Phase-3 merge boundary: {boundary}")
+    return {
+        "classification": classification,
+        "first_persistent_exact_boundary": boundary,
+        "transient_exact_boundaries": transient,
+        "exact_boundaries": [row["boundary"] for row in rows if row["bit_exact"]],
+    }
+
+
+def _phase3_spread(
+    pairwise_rows: list[dict[str, Any]],
+    branch: str,
+    same_semantics: list[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    source = {
+        row["boundary"]: row
+        for row in pairwise_rows
+        if row["branch"] == branch and row["pair"] == "CLEAN_VS_PLUS1"
+    }
+    progression: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for boundary in PHASE3_FIXED_BOUNDARIES:
+        row = source[boundary]
+        item = {key: row[key] for key in (
+            "branch", "boundary", "differing_element_count", "differing_fraction",
+            "max_abs_diff", "mean_abs_diff", "mse", "l2", "relative_l2",
+            "lhs_canonical_identity", "rhs_canonical_identity",
+        )}
+        if boundary not in same_semantics or previous is None:
+            item.update({
+                "delta_differing_element_count": None,
+                "ratio_differing_element_count": None,
+                "delta_relative_l2": None,
+                "ratio_relative_l2": None,
+            })
+        else:
+            item.update({
+                "delta_differing_element_count": row["differing_element_count"] - previous["differing_element_count"],
+                "ratio_differing_element_count": row["differing_element_count"] / previous["differing_element_count"] if previous["differing_element_count"] else None,
+                "delta_relative_l2": row["relative_l2"] - previous["relative_l2"],
+                "ratio_relative_l2": row["relative_l2"] / previous["relative_l2"] if previous["relative_l2"] else None,
+            })
+        progression.append(item)
+        previous = row if boundary in same_semantics else None
+    comparable = [row for row in progression if row["delta_differing_element_count"] is not None]
+    largest = max(row["delta_differing_element_count"] for row in comparable)
+    return progression, {
+        "statistic": "largest absolute increase in differing_element_count between consecutive comparable block-hidden boundaries",
+        "largest_increase": largest,
+        "boundaries": [row["boundary"] for row in comparable if row["delta_differing_element_count"] == largest],
+        "comparable_boundaries": same_semantics,
+        "descriptive_only": True,
+    }
+
+
+def _binding_contains_float_reduction(value: Any, key: str = "") -> bool:
+    forbidden = ("relative_l2", "mse", "mean_abs", "max_abs", "l2")
+    if any(item in key.lower() for item in forbidden):
+        return True
+    if isinstance(value, dict):
+        return any(_binding_contains_float_reduction(item, str(name)) for name, item in value.items())
+    if isinstance(value, list):
+        return any(_binding_contains_float_reduction(item, key) for item in value)
+    return False
+
+
+def _phase3_cfg_classification(raw_exact: dict[str, bool]) -> str:
+    """Where the PLUS1/HISTORICAL exact merge sits relative to CFG combination.
+
+    Uses only exact equality of the persisted raw branch outputs and of the
+    persisted CFG-combined output (the latter is required to be exact).
+    """
+    positive, negative = bool(raw_exact["positive"]), bool(raw_exact["negative"])
+    if positive and negative:
+        return "MERGED_WITHIN_BOTH_TRANSFORMER_BRANCHES"
+    if positive and not negative:
+        return "MERGED_WITHIN_POSITIVE_BRANCH_ONLY_CFG_COMBINATION_EXACT"
+    if negative and not positive:
+        return "MERGED_WITHIN_NEGATIVE_BRANCH_ONLY_CFG_COMBINATION_EXACT"
+    return "MERGED_AT_CFG_COMBINATION"
+
+
+def analyze_phase3_artifacts(
+    root: Path,
+    config: dict[str, Any],
+    manifest: dict[str, Any],
+    prov: dict[str, Any],
+    trace: dict[str, Any],
+) -> dict[str, Any]:
+    """Recompute every Phase-3 quantity from persisted artifacts.
+
+    Memory discipline: block-hidden tensors are ~144 MB in BF16 and ~288 MB
+    widened; the three trajectories of one boundary are held at a time and
+    released before the next boundary. Only identities, exact flags and
+    descriptive metrics are retained.
+    """
+    validate_phase3_config(config)
+    require_committed_source(prov)
+    freeze = phase3_freeze(config)
+    if (
+        trace.get("provenance_hash") != prov["provenance_hash"]
+        or trace.get("manifest_sha256") != manifest["manifest_sha256"]
+        or trace.get("selected_step") != 10
+        or trace.get("selected_scheduler_timestep_bits") != freeze["selected_scheduler_timestep_bits"]
+        or trace.get("phase3_freeze") != freeze
+    ):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 provenance/target binding mismatch")
+    trajectories = trace.get("trajectories")
+    if not isinstance(trajectories, dict) or set(trajectories) != set(TRAJECTORIES):
+        raise GlobalStopError("GLOBAL STOP: Phase-3 trajectory set is incomplete or unexpected")
+
+    expected_shapes = freeze["expected_shapes"]
+    expected_boundaries = list(PHASE3_FIXED_BOUNDARIES)
+    same_semantics = freeze["same_semantics_support_boundaries"]
+    expected_architecture = freeze["expected_architecture"]
+    normalized: dict[str, Any] = {}
+    architecture_valid = True
+    branch_valid = True
+    relative_paths = True
+    # ---- structural validation of every record before any tensor is loaded
+    for name in TRAJECTORIES:
+        result = trajectories[name]
+        if set(result.get("branches", {})) != set(PHASE3_BRANCHES):
+            raise GlobalStopError("GLOBAL STOP: Phase-3 CFG branch set changed")
+        normalized[name] = {"branches": {}}
+        for invocation_index, branch in enumerate(PHASE3_BRANCHES):
+            branch_result = result["branches"][branch]
+            architecture = branch_result.get("architecture", {})
+            architecture_valid &= all(architecture.get(key) == value for key, value in expected_architecture.items())
+            rows = branch_result.get("records", [])
+            names = [row.get("boundary") for row in rows]
+            if set(names) != set(expected_boundaries) or len(names) != len(set(names)):
+                raise GlobalStopError("GLOBAL STOP: Phase-3 block boundary set is missing, duplicate, or unexpected")
+            by_boundary = {row["boundary"]: row for row in rows}
+            ordered = [by_boundary[boundary] for boundary in expected_boundaries]
+            for boundary, row in zip(expected_boundaries, ordered, strict=True):
+                expected_block_index = int(boundary.rsplit("_", 1)[1]) if boundary.startswith("after_block_") else None
+                branch_valid &= row.get("branch") == branch and row.get("invocation_index") == invocation_index
+                if row.get("block_index") != expected_block_index:
+                    raise GlobalStopError("GLOBAL STOP: Phase-3 block execution order/index changed")
+                relative_paths &= not Path(row["artifact"]["relative_path"]).is_absolute()
+            normalized[name]["branches"][branch] = {"architecture": architecture, "records": ordered}
+        cfg_row = result.get("cfg_combined_output", {})
+        if (
+            cfg_row.get("boundary") != "cfg_combined_output"
+            or cfg_row.get("absolute_step") != 10
+            or cfg_row.get("local_step") != 0
+            or cfg_row.get("timestep_bits") != freeze["selected_scheduler_timestep_bits"]
+            or cfg_row.get("runtime_dtype") != EXPECTED_RUNTIME_DTYPE
+            or cfg_row.get("shape") != expected_shapes["latent"]
+        ):
+            raise GlobalStopError("GLOBAL STOP: Phase-3 CFG output metadata changed")
+        relative_paths &= not Path(cfg_row["artifact"]["relative_path"]).is_absolute()
+        normalized[name]["cfg_combined_output"] = cfg_row
+        relative_paths &= (
+            not Path(trajectories[name]["final_latent"]["relative_path"]).is_absolute()
+            and not Path(trajectories[name]["final_video"]["relative_path"]).is_absolute()
+        )
+
+    # ---- trusted Phase-2 boundaries and traced finals (small tensors)
+    trusted_entry_identity = {name: identity(_load_trusted_phase2_boundary(root, manifest, name, "entry")) for name in TRAJECTORIES}
+    trusted_exit_identity = {name: identity(_load_trusted_phase2_boundary(root, manifest, name, "exit")) for name in TRAJECTORIES}
+    cfg_loaded = {name: load_phase3_artifact(root, normalized[name]["cfg_combined_output"]["artifact"]) for name in TRAJECTORIES}
+    phase2_exit_matches = {name: identity(cfg_loaded[name]) == trusted_exit_identity[name] for name in TRAJECTORIES}
+    final_matches: dict[str, dict[str, bool]] = {}
+    for name in TRAJECTORIES:
+        final_latent = load_tensor(root, trajectories[name]["final_latent"])
+        final_video = load_tensor(root, trajectories[name]["final_video"])
+        trusted_latent, trusted_video = _trusted_final_pair(manifest, name)
+        final_matches[name] = {"latent": identity(final_latent) == trusted_latent, "video": identity(final_video) == trusted_video}
+
+    # ---- streamed pairwise recomputation, one boundary (three trajectories) at a time
+    pairings = (("CLEAN", "PLUS1"), ("CLEAN", "HISTORICAL_PLUS14"), ("PLUS1", "HISTORICAL_PLUS14"))
+    pairwise_rows: list[dict[str, Any]] = []
+    artifact_valid = True
+    shape_dtype_valid = True
+    phase2_entry_matches: dict[str, dict[str, bool]] = {name: {} for name in TRAJECTORIES}
+    for branch in PHASE3_BRANCHES:
+        for boundary in expected_boundaries:
+            expected_shape = expected_shapes["latent"] if boundary in ("transformer_entry", "raw_transformer_output") else expected_shapes["block_hidden"]
+            loaded: dict[str, np.ndarray] = {}
+            for name in TRAJECTORIES:
+                row = normalized[name]["branches"][branch]["records"][expected_boundaries.index(boundary)]
+                value = load_phase3_artifact(root, row["artifact"])
+                shape_dtype_valid &= (
+                    row.get("runtime_dtype") == EXPECTED_RUNTIME_DTYPE
+                    and row.get("shape") == expected_shape
+                    and list(value.shape) == expected_shape
+                )
+                artifact_valid &= row["artifact"]["comparison_canonical_identity"] == identity(value)
+                if boundary == "transformer_entry":
+                    phase2_entry_matches[name][branch] = identity(value) == trusted_entry_identity[name]
+                loaded[name] = value
+            for left, right in pairings:
+                pairwise_rows.append({"branch": branch, "boundary": boundary, "pair": f"{left}_VS_{right}", **metrics(loaded[left], loaded[right])})
+            del loaded
+    cfg_pairwise_rows = [
+        {"branch": "cfg_combined", "boundary": "cfg_combined_output", "pair": f"{left}_VS_{right}", **metrics(cfg_loaded[left], cfg_loaded[right])}
+        for left, right in pairings
+    ]
+    del cfg_loaded
+
+    if not all(all(value.values()) for value in phase2_entry_matches.values()) or not all(phase2_exit_matches.values()):
+        failure = {"classification": "PHASE2_PHASE3_BOUNDARY_MISMATCH", "entry": phase2_entry_matches, "exit": phase2_exit_matches}
+        atomic_json(root / "phase3/phase2_phase3_boundary_mismatch.json", failure)
+        raise GlobalStopError("GLOBAL STOP: PHASE2_PHASE3_BOUNDARY_MISMATCH")
+    if not all(all(value.values()) for value in final_matches.values()):
+        failure = {"classification": "PHASE3_TRACE_ALTERS_EXECUTION", "final_matches": final_matches}
+        atomic_json(root / "phase3/phase3_trace_alters_execution.json", failure)
+        raise GlobalStopError("GLOBAL STOP: PHASE3_TRACE_ALTERS_EXECUTION")
+
+    def row_of(branch: str, boundary: str, pair: str) -> dict[str, Any]:
+        return next(row for row in pairwise_rows if row["branch"] == branch and row["boundary"] == boundary and row["pair"] == pair)
+
+    entry_one_difference = {branch: row_of(branch, "transformer_entry", "CLEAN_VS_PLUS1")["differing_element_count"] == 1 for branch in PHASE3_BRANCHES}
+    branch_events: dict[str, Any] = {}
+    propagation: dict[str, Any] = {}
+    largest_support: dict[str, Any] = {}
+    for branch in PHASE3_BRANCHES:
+        plus_hist = [row for row in pairwise_rows if row["branch"] == branch and row["pair"] == "PLUS1_VS_HISTORICAL_PLUS14"]
+        branch_events[branch] = _persistent_merge_event(plus_hist)
+        propagation[branch], largest_support[branch] = _phase3_spread(pairwise_rows, branch, same_semantics)
+    cfg_plus_hist = next(row for row in cfg_pairwise_rows if row["pair"] == "PLUS1_VS_HISTORICAL_PLUS14")
+    raw_exact = {branch: bool(row_of(branch, "raw_transformer_output", "PLUS1_VS_HISTORICAL_PLUS14")["bit_exact"]) for branch in PHASE3_BRANCHES}
+    if not cfg_plus_hist["bit_exact"]:
+        raise GlobalStopError("GLOBAL STOP: Phase-3 CFG output contradicts trusted Phase-2 exact merge")
+    # ---- M1 hard gate: persisted raw branch outputs must reconstruct the persisted combined output bit-exactly.
+    frozen_scale = phase3_cfg_guidance_scale(config)
+    reconstruction: dict[str, Any] = {}
+    for name in TRAJECTORIES:
+        cfg_row = normalized[name]["cfg_combined_output"]
+        if (
+            float64_bit_pattern(cfg_row.get("guidance_scale", float("nan"))) != freeze["cfg_guidance_scale_bits"]
+            or cfg_row.get("guidance_scale_bits") != freeze["cfg_guidance_scale_bits"]
+            or cfg_row.get("cfg_normalize") is not False
+        ):
+            raise GlobalStopError(f"GLOBAL STOP: CFG_OPERAND_RECONSTRUCTION_MISMATCH: guidance scale/normalization binding differs for {name}")
+        raw_bits = {}
+        for branch in PHASE3_BRANCHES:
+            row = normalized[name]["branches"][branch]["records"][expected_boundaries.index("raw_transformer_output")]
+            widened = load_phase3_artifact(root, row["artifact"])
+            raw_bits[branch] = single_flip.float32_to_bf16_bits(widened).reshape(widened.shape)
+        cfg_widened = load_phase3_artifact(root, cfg_row["artifact"])
+        persisted_bits = single_flip.float32_to_bf16_bits(cfg_widened).reshape(cfg_widened.shape)
+        reconstructed_bits = reconstruct_cfg_combined_bits(raw_bits["positive"], raw_bits["negative"], frozen_scale)
+        swapped_bits = reconstruct_cfg_combined_bits(raw_bits["negative"], raw_bits["positive"], frozen_scale)
+        reconstruction[name] = {
+            "bit_exact": bool(np.array_equal(reconstructed_bits, persisted_bits)),
+            "differing_element_count": int(np.count_nonzero(reconstructed_bits != persisted_bits)),
+            "swapped_operands_bit_exact": bool(np.array_equal(swapped_bits, persisted_bits)),
+            "positive_equals_negative": bool(np.array_equal(raw_bits["positive"], raw_bits["negative"])),
+            "reconstructed_identity": phase3_runtime_identity(reconstructed_bits, list(reconstructed_bits.shape)),
+            "persisted_identity": phase3_runtime_identity(persisted_bits, list(persisted_bits.shape)),
+            "guidance_scale_bits": freeze["cfg_guidance_scale_bits"],
+            "rule": CFG_RECONSTRUCTION_RULE,
+        }
+        del raw_bits, cfg_widened
+    if not all(row["bit_exact"] for row in reconstruction.values()):
+        failure = {"classification": "CFG_OPERAND_RECONSTRUCTION_MISMATCH", "reconstruction": reconstruction}
+        atomic_json(root / "phase3/cfg_operand_reconstruction_mismatch.json", failure)
+        raise GlobalStopError(f"GLOBAL STOP: CFG_OPERAND_RECONSTRUCTION_MISMATCH: {[n for n, r in reconstruction.items() if not r['bit_exact']]}")
+    # Branch semantics are established by the arithmetic relationship, not by labels: a swap must not also reconstruct
+    # unless the two raw outputs are identical (in which case the branch distinction is vacuous and reported as such).
+    branch_semantics_bound = all(r["positive_equals_negative"] or not r["swapped_operands_bit_exact"] for r in reconstruction.values())
+    cfg_classification = _phase3_cfg_classification(raw_exact)
+    cross_event = {
+        branch: {
+            "first_persistent_merge_boundary": branch_events[branch]["first_persistent_exact_boundary"],
+            "largest_support_increase_boundaries": largest_support[branch]["boundaries"],
+            "same_boundary": branch_events[branch]["first_persistent_exact_boundary"] in largest_support[branch]["boundaries"],
+            "descriptive_only": True,
+        }
+        for branch in PHASE3_BRANCHES
+    }
+    finite = all(
+        np.isfinite(float(row[key]))
+        for row in [*pairwise_rows, *cfg_pairwise_rows]
+        for key in ("differing_fraction", "max_abs_diff", "mean_abs_diff", "mse", "l2", "relative_l2")
+    )
+    pairwise_valid = len(pairwise_rows) == len(PHASE3_BRANCHES) * len(expected_boundaries) * len(pairings)
+    no_float_binding = not _binding_contains_float_reduction(manifest["trusted_phase1"]) and not _binding_contains_float_reduction(manifest["trusted_phase2"])
+    gates = [
+        _p3_gate(1, "committed source / clean provenance", not prov.get("source_dirty_entries"), prov),
+        _p3_gate(2, "selected_step exactly 10", trace["selected_step"] == 10, trace["selected_step"]),
+        _p3_gate(3, "selected transformer invocation uniquely identified", branch_valid and architecture_valid and set(PHASE3_BRANCHES) == {"positive", "negative"}, {"branches": list(PHASE3_BRANCHES), "cfg": freeze["cfg_execution"], "architecture": expected_architecture}),
+        _p3_gate(4, "exact scheduler timestep", trace["selected_scheduler_timestep_bits"] == freeze["selected_scheduler_timestep_bits"], trace["selected_scheduler_timestep_bits"]),
+        *[_p3_gate(5 + index, f"Phase3 {name} entry equals Phase2 transformer_input", all(phase2_entry_matches[name].values()), phase2_entry_matches[name]) for index, name in enumerate(TRAJECTORIES)],
+        *[_p3_gate(8 + index, f"Phase3 {name} exit equals Phase2 guidance_combined_output", phase2_exit_matches[name], phase2_exit_matches[name]) for index, name in enumerate(TRAJECTORIES)],
+        _p3_gate(11, "exact block count/order matches frozen manifest", architecture_valid, expected_architecture),
+        _p3_gate(12, "no missing expected block boundary", True, expected_boundaries),
+        _p3_gate(13, "no duplicate block boundary", True, expected_boundaries),
+        _p3_gate(14, "no unexpected block boundary", True, expected_boundaries),
+        _p3_gate(15, "CFG branch identity valid", branch_valid, list(PHASE3_BRANCHES)),
+        _p3_gate(16, "tensor shape/dtype semantics valid", shape_dtype_valid, expected_shapes),
+        _p3_gate(17, "canonical artifact identities valid", artifact_valid, "all Phase-3 artifacts independently loaded and re-identified"),
+        _p3_gate(18, "pairwise metrics recomputed from artifacts", pairwise_valid, {"rows": len(pairwise_rows)}),
+        *[_p3_gate(19 + index, f"{name} traced final equals trusted final", all(final_matches[name].values()), final_matches[name]) for index, name in enumerate(TRAJECTORIES)],
+        _p3_gate(22, "PLUS1/HIST Phase3 exit bit-exact", cfg_plus_hist["bit_exact"], cfg_plus_hist),
+        _p3_gate(23, "CLEAN/PLUS1 Phase3 entry exactly one differing coordinate", all(entry_one_difference.values()), entry_one_difference),
+        _p3_gate(24, "no NaN/Inf", finite, None),
+        _p3_gate(25, "relocation/path resolution valid", relative_paths, None),
+        _p3_gate(26, "no float-derived metric in provenance binding", no_float_binding, {"trusted_phase1_keys": sorted(manifest["trusted_phase1"]), "trusted_phase2_keys": sorted(manifest["trusted_phase2"])}),
+        _p3_gate(27, "Phase4 disabled", not freeze["phase4_enabled"], freeze["phase4_enabled"]),
+        _p3_gate(28, "no forbidden expansion mode", not freeze["auto_expand"] and tuple(config["allowed_modes"]) == MODES, list(MODES)),
+        _p3_gate(29, "Phase1-producing commit frozen", freeze["phase1_producing_commit"] == PHASE3_PHASE1_COMMIT, freeze["phase1_producing_commit"]),
+        _p3_gate(30, "Phase2-producing commit frozen", freeze["phase2_producing_commit"] == PHASE3_PHASE2_COMMIT, freeze["phase2_producing_commit"]),
+        _p3_gate(31, "raw CFG operands reconstruct combined output bit-exactly (per trajectory, branch-ordered)", all(row["bit_exact"] for row in reconstruction.values()) and branch_semantics_bound, reconstruction),
+    ]
+    gate_document = {"gates": gates, "provenance_hash": prov["provenance_hash"], "manifest_sha256": manifest["manifest_sha256"]}
+    atomic_json(root / "phase3/phase3_gates.json", gate_document)
+    validate_gate_document(gate_document, PHASE3_REQUIRED_GATES, provenance_hash=prov["provenance_hash"], manifest_sha256=manifest["manifest_sha256"])
+    return {
+        "selected_step": 10,
+        "selected_scheduler_timestep_bits": freeze["selected_scheduler_timestep_bits"],
+        "architecture": freeze["architecture"],
+        "observed_architecture": {name: {branch: normalized[name]["branches"][branch]["architecture"] for branch in PHASE3_BRANCHES} for name in TRAJECTORIES},
+        "cfg_execution": freeze["cfg_execution"],
+        "branch_events": branch_events,
+        "cfg_event": {"classification": cfg_classification, "raw_branch_outputs_bit_exact": raw_exact, "cfg_combined_bit_exact": True},
+        "cfg_operand_reconstruction": reconstruction,
+        "intermediate_authentication_limit": freeze["intermediate_authentication_limit"],
+        "pairwise_rows": pairwise_rows,
+        "cfg_pairwise_rows": cfg_pairwise_rows,
+        "clean_plus1_propagation": propagation,
+        "largest_support_increase": largest_support,
+        "cross_event_observation": cross_event,
+        "phase2_phase3_crosscheck": {"entry": phase2_entry_matches, "exit": phase2_exit_matches},
+        "traced_vs_trusted_final_controls": final_matches,
+        "gates": gates,
+    }
+
+
+def run_analyze_phase3(config: dict[str, Any], config_path: Path, root: Path) -> dict[str, Any]:
+    manifest, prov = require_cpu(root, config_path, config)
+    require_preflight(root, manifest, prov)
+    path = root / "phase3/phase3_manifest.json"
+    if not path.exists():
+        raise GlobalStopError("GLOBAL STOP: Phase-3 trace manifest is missing")
+    result = analyze_phase3_artifacts(root, config, manifest, prov, json.loads(path.read_text()))
+    atomic_json(root / "phase3/phase3_analysis.json", result)
+    return {
+        "mode": "analyze-phase3",
+        "selected_step": 10,
+        "branch_events": result["branch_events"],
+        "cfg_event": result["cfg_event"],
+    }
+
+
 def unavailable_gpu(mode: str) -> None:
     raise GlobalStopError(f"GLOBAL STOP: {mode} requires optional instrumentation that is intentionally not auto-enabled.")
 
@@ -1440,8 +2428,10 @@ def main() -> None:
         print(json.dumps(run_phase2(config, args.config, args.output_dir, args), indent=2, sort_keys=True)); return
     if args.mode == "analyze-phase2":
         print(json.dumps(run_analyze_phase2(config, args.config, args.output_dir), indent=2, sort_keys=True)); return
-    if args.mode in ("phase3", "analyze-phase3") and not config["phase3"]["enabled"]:
-        raise GlobalStopError("GLOBAL STOP: phase 3 is disabled; no automatic block expansion is permitted")
+    if args.mode == "phase3":
+        print(json.dumps(run_phase3(config, args.config, args.output_dir, args), indent=2, sort_keys=True)); return
+    if args.mode == "analyze-phase3":
+        print(json.dumps(run_analyze_phase3(config, args.config, args.output_dir), indent=2, sort_keys=True)); return
     unavailable_gpu(args.mode)
 
 

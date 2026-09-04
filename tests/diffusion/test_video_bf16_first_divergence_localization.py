@@ -20,12 +20,43 @@ def _config():
     return killtest.load_config(CONFIG_PATH)
 
 
-def _valid_preflight(root, manifest, provenance):
+_TRUSTED_ARRAY_CACHE: dict = {}
+
+
+def _trusted_arrays(config, manifest):
+    """Actual trusted final arrays (CLEAN from the v3 trajectory, PLUS1/HIST from preserved artifacts)."""
+    if "arrays" not in _TRUSTED_ARRAY_CACHE:
+        source = killtest.derive_anchor(config)["source"]
+        trusted = manifest["trusted_final_identities"]
+        arrays = {"CLEAN": (source.final_latent, source.video)}
+        for name in ("PLUS1", "HISTORICAL_PLUS14"):
+            arrays[name] = (
+                np.load(killtest.REPO_ROOT / trusted[name]["final_latent"]["artifact_relative_path"], allow_pickle=False),
+                np.load(killtest.REPO_ROOT / trusted[name]["video"]["artifact_relative_path"], allow_pickle=False),
+            )
+        _TRUSTED_ARRAY_CACHE["arrays"] = arrays
+    return _TRUSTED_ARRAY_CACHE["arrays"]
+
+
+def _valid_preflight(root, manifest, provenance, *, config=None, with_artifacts=True):
+    """A preflight document whose controls point at persisted repeat artifacts equal to the trusted finals."""
+    controls = {}
+    if with_artifacts:
+        arrays = _trusted_arrays(config or _config(), manifest)
+        for name in killtest.TRAJECTORIES:
+            latent, video = arrays[name]
+            latent_record = killtest.save_tensor(root, f"preflight/{name}/repeat_0/recovered_final_latent.npy", latent)
+            video_record = killtest.save_tensor(root, f"preflight/{name}/repeat_0/recovered_video.npy", video, runtime_semantics="uint8 decoded video")
+            controls[name] = [
+                {"repeat_id": repeat, "final_latent_identity": latent_record["canonical_identity"], "video_identity": video_record["canonical_identity"],
+                 "final_latent_artifact": latent_record, "video_artifact": video_record, "exact_vs_clean": name == "CLEAN"}
+                for repeat in range(3)
+            ]
     gates = [killtest.gate(name, True, "synthetic validated evidence", required=True) for name in killtest.PREFLIGHT_REQUIRED_GATES]
     document = {
         "gpu_all_passed": True,
         "gates": gates,
-        "controls": {},
+        "controls": controls,
         "provenance_hash": provenance["provenance_hash"],
         "manifest_sha256": manifest["manifest_sha256"],
     }
@@ -352,7 +383,9 @@ def test_phase2_requires_frozen_step_through_production_path(tmp_path):
     config = _config(); config.pop("phase2")
     with pytest.raises(killtest.GlobalStopError, match="configuration is absent"):
         killtest.run_phase2(config, CONFIG_PATH, tmp_path, object())
-    assert config["phase3"] == {"enabled": False, "auto_expand": False}
+    assert config["phase3"]["enabled"] is True
+    assert config["phase3"]["phase4_enabled"] is False
+    assert config["phase3"]["auto_expand"] is False
 
 
 def test_phase2_selection_maps_absolute_step_to_frozen_phase1_boundary(tmp_path):
@@ -395,7 +428,7 @@ def test_preflight_gate_set_fails_closed_despite_forged_boolean(tmp_path, mutati
     config = _config(); config["output_root"] = "localization"
     root = tmp_path / "localization"; killtest.run_cpu(config, CONFIG_PATH, root)
     manifest, provenance = killtest.require_cpu(root, CONFIG_PATH, config)
-    document = _valid_preflight(root, manifest, provenance)
+    document = _valid_preflight(root, manifest, provenance, config=config)
     if mutation == "missing":
         document["gates"].pop()
     elif mutation == "duplicate":
@@ -623,7 +656,9 @@ def test_phase2_unavailable_boundary_not_fabricated_and_no_expansion_modes():
     config = _config()
     assert "transformer_raw_output" not in killtest.PHASE2_AVAILABLE_BOUNDARIES
     assert killtest.PHASE2_UNAVAILABLE_BOUNDARIES == ("transformer_raw_output",)
-    assert config["phase3"] == {"enabled": False, "auto_expand": False}
+    assert config["phase3"]["enabled"] is True
+    assert config["phase3"]["phase4_enabled"] is False
+    assert config["phase3"]["auto_expand"] is False
     assert all("fp32" not in mode and "search" not in mode for mode in killtest.MODES)
 
 
@@ -857,3 +892,809 @@ def test_timestep_match_policy_is_frozen_and_unambiguous():
     assert not killtest.timestep_matches(None, schedule[0], schedule)
     manifest_policy = killtest.timestep_match_policy()
     assert manifest_policy["abs_tol"] == killtest.TIMESTEP_MATCH_ABS_TOL and "nearest" in manifest_policy["rule"]
+
+
+# ----------------------------------------------------------------------------- Phase-3 hostile CPU contracts
+
+_PHASE3_TEST_SHAPES = {"latent": [1, 1, 1, 1, 2], "block_hidden": [1, 2, 2]}
+_PHASE3_MODEL_CLASS = (
+    "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer."
+    "WanTransformer3DModel"
+)
+
+
+def _phase3_value(shape, scalar):
+    return killtest.single_flip.base.cast_runtime_bf16(
+        np.full(shape, scalar, dtype=np.float32)
+    )
+
+
+def _save_phase3_value(root, relative, value):
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    bits = killtest.single_flip.float32_to_bf16_bits(value)
+    np.save(path, np.ascontiguousarray(bits, dtype=np.uint16), allow_pickle=False)
+    return killtest.phase3_artifact_record(root, path, shape=list(value.shape))
+
+
+def _find_cfg_only_merge_pair():
+    """Two (positive, negative) BF16 scalar pairs that differ in both branches yet combine identically under the
+    production rule; found by search so the test does not hard-code arithmetic assumptions."""
+    rng = np.random.default_rng(11)
+    bf = lambda x: float(killtest.single_flip.base.cast_runtime_bf16(np.array([x], dtype=np.float32))[0])
+    bits = lambda x: killtest.single_flip.float32_to_bf16_bits(np.array([x], dtype=np.float32))
+    for _ in range(20000):
+        p1 = bf(rng.uniform(0.5, 2.0)); n1 = bf(-rng.uniform(500.0, 2000.0))
+        p2 = bf(p1 + rng.choice([2 ** -7, -(2 ** -7)])); n2 = bf(n1 + rng.choice([4.0, -4.0, 8.0, -8.0]))
+        if p1 == p2 or n1 == n2:
+            continue
+        if np.array_equal(killtest.reconstruct_cfg_combined_bits(bits(p1), bits(n1), 4.0), killtest.reconstruct_cfg_combined_bits(bits(p2), bits(n2), 4.0)):
+            return {"positive": (p1, p2), "negative": (n1, n2)}
+    raise AssertionError("no cfg-only merge pair found")
+
+
+def _synthetic_phase3(tmp_path, monkeypatch, *, merge_at="after_block_002"):
+    config = _config()
+    config["output_root"] = tmp_path.name
+    monkeypatch.setattr(
+        killtest,
+        "_phase3_expected_shapes",
+        lambda _config: copy.deepcopy(_PHASE3_TEST_SHAPES),
+    )
+    freeze = killtest.phase3_freeze(config)
+    provenance = {
+        "provenance_hash": "synthetic-phase3-provenance",
+        "source_dirty_entries": [],
+    }
+    latent_shape = _PHASE3_TEST_SHAPES["latent"]
+    block_shape = _PHASE3_TEST_SHAPES["block_hidden"]
+    entry = {
+        "CLEAN": _phase3_value(latent_shape, 0),
+        "PLUS1": _phase3_value(latent_shape, 0),
+        "HISTORICAL_PLUS14": _phase3_value(latent_shape, 0),
+    }
+    entry["PLUS1"].reshape(-1)[0] = 1
+    entry["HISTORICAL_PLUS14"].reshape(-1)[0] = 2
+    cfg = {}  # filled from the raw branch outputs via the production reconstruction rule (see below)
+    final_latents = {
+        "CLEAN": _phase3_value(latent_shape, 0),
+        "PLUS1": _phase3_value(latent_shape, 8),
+        "HISTORICAL_PLUS14": _phase3_value(latent_shape, 8),
+    }
+    final_videos = {
+        "CLEAN": np.zeros((1, 1, 1, 3), dtype=np.uint8),
+        "PLUS1": np.ones((1, 1, 1, 3), dtype=np.uint8),
+        "HISTORICAL_PLUS14": np.ones((1, 1, 1, 3), dtype=np.uint8),
+    }
+    boundary_index = {name: index for index, name in enumerate(killtest.PHASE3_FIXED_BOUNDARIES)}
+
+    def pair_values(boundary, branch):
+        shape = latent_shape if boundary in ("transformer_entry", "raw_transformer_output") else block_shape
+        if boundary == "transformer_entry":
+            return {name: value.copy() for name, value in entry.items()}
+        offset = 0.0 if branch == "positive" else 0.5  # negative branch carries distinct values
+        plus = _phase3_value(shape, 3 + offset)
+        historical = _phase3_value(shape, 4 + offset)
+        if merge_at == "transient":
+            if boundary == "after_block_000":
+                historical = plus.copy()
+        elif merge_at in boundary_index and boundary_index[boundary] >= boundary_index[merge_at]:
+            historical = plus.copy()
+        if merge_at in (None, "transient") and boundary == "raw_transformer_output" and cfg_only_pair is not None:
+            # raw outputs differ in BOTH branches while the production CFG combination is identical
+            plus_val, hist_val = cfg_only_pair[branch]
+            plus = _phase3_value(shape, plus_val); historical = _phase3_value(shape, hist_val)
+        return {
+            "CLEAN": _phase3_value(shape, 1 + offset),  # non-zero so single-bit operand attacks are not absorbed
+            "PLUS1": plus,
+            "HISTORICAL_PLUS14": historical,
+        }
+
+    cfg_only_pair = _find_cfg_only_merge_pair() if merge_at in (None, "transient") else None
+    values_by_boundary = {
+        (boundary, branch): pair_values(boundary, branch)
+        for boundary in killtest.PHASE3_FIXED_BOUNDARIES for branch in killtest.PHASE3_BRANCHES
+    }
+    for name in killtest.TRAJECTORIES:
+        pos = killtest.single_flip.float32_to_bf16_bits(values_by_boundary[("raw_transformer_output", "positive")][name])
+        neg = killtest.single_flip.float32_to_bf16_bits(values_by_boundary[("raw_transformer_output", "negative")][name])
+        cfg[name] = killtest.single_flip.bf16_bits_to_float32(killtest.reconstruct_cfg_combined_bits(pos, neg, 4.0)).reshape(latent_shape)
+    trajectories = {}
+    architecture = copy.deepcopy(freeze["expected_architecture"])
+    assert architecture["model_class"] == _PHASE3_MODEL_CLASS and architecture["inner_dim"] == 5120
+    for trajectory in killtest.TRAJECTORIES:
+        branches = {}
+        for invocation_index, branch in enumerate(killtest.PHASE3_BRANCHES):
+            records = []
+            for boundary in killtest.PHASE3_FIXED_BOUNDARIES:
+                value = values_by_boundary[(boundary, branch)][trajectory]
+                artifact = _save_phase3_value(
+                    tmp_path,
+                    f"phase3/artifacts/{trajectory}/{branch}/{boundary}.npy",
+                    value,
+                )
+                records.append(
+                    {
+                        "boundary": boundary,
+                        "block_index": (
+                            int(boundary.rsplit("_", 1)[1])
+                            if boundary.startswith("after_block_")
+                            else None
+                        ),
+                        "branch": branch,
+                        "invocation_index": invocation_index,
+                        "runtime_dtype": killtest.EXPECTED_RUNTIME_DTYPE,
+                        "shape": list(value.shape),
+                        "artifact": artifact,
+                    }
+                )
+            branches[branch] = {
+                "architecture": copy.deepcopy(architecture),
+                "records": records,
+            }
+        cfg_artifact = _save_phase3_value(
+            tmp_path,
+            f"phase3/artifacts/{trajectory}/cfg.npy",
+            cfg[trajectory],
+        )
+        trajectories[trajectory] = {
+            "trajectory": trajectory,
+            "branches": branches,
+            "cfg_combined_output": {
+                "boundary": "cfg_combined_output",
+                "absolute_step": 10,
+                "local_step": 0,
+                "timestep_bits": freeze["selected_scheduler_timestep_bits"],
+                "runtime_dtype": killtest.EXPECTED_RUNTIME_DTYPE,
+                "shape": latent_shape,
+                "guidance_scale": 4.0,
+                "guidance_scale_bits": killtest.float64_bit_pattern(4.0),
+                "cfg_normalize": False,
+                "artifact": cfg_artifact,
+            },
+            "final_latent": killtest.save_tensor(
+                tmp_path,
+                f"phase3/artifacts/{trajectory}/final_latent.npy",
+                final_latents[trajectory],
+            ),
+            "final_video": killtest.save_tensor(
+                tmp_path,
+                f"phase3/artifacts/{trajectory}/final_video.npy",
+                final_videos[trajectory],
+                runtime_semantics="uint8 decoded video",
+            ),
+        }
+    manifest = {
+        "manifest_sha256": "synthetic-phase3-manifest",
+        "trusted_phase1": {"exact_only": True},
+        "trusted_phase2": {
+            "source_root_relative_path": "synthetic",
+            "phase2_manifest_sha256": "synthetic",
+            "trajectories": {},
+        },
+        "trusted_final_identities": {
+            "CLEAN": {
+                "final_latent_identity": killtest.identity(final_latents["CLEAN"]),
+                "video_identity": killtest.identity(final_videos["CLEAN"]),
+            },
+            "PLUS1": {
+                "final_latent": {"canonical_identity": killtest.identity(final_latents["PLUS1"])},
+                "video": {"canonical_identity": killtest.identity(final_videos["PLUS1"])},
+            },
+            "HISTORICAL_PLUS14": {
+                "final_latent": {"canonical_identity": killtest.identity(final_latents["HISTORICAL_PLUS14"])},
+                "video": {"canonical_identity": killtest.identity(final_videos["HISTORICAL_PLUS14"])},
+            },
+        },
+    }
+    trusted_phase2 = {
+        name: {"entry": entry[name], "exit": cfg[name]}
+        for name in killtest.TRAJECTORIES
+    }
+    monkeypatch.setattr(
+        killtest,
+        "_load_trusted_phase2_boundary",
+        lambda _root, _manifest, name, which: trusted_phase2[name][which],
+    )
+    trace = {
+        "provenance_hash": provenance["provenance_hash"],
+        "manifest_sha256": manifest["manifest_sha256"],
+        "selected_step": 10,
+        "selected_scheduler_timestep_bits": freeze["selected_scheduler_timestep_bits"],
+        "phase3_freeze": freeze,
+        "trajectories": trajectories,
+    }
+    return config, manifest, provenance, trace
+
+
+def _analyze_phase3(bundle, root):
+    config, manifest, provenance, trace = bundle
+    return killtest.analyze_phase3_artifacts(
+        root, config, manifest, provenance, trace
+    )
+
+
+def _replace_phase3_artifact(root, row, value):
+    suffix = killtest.sha256_bytes(np.ascontiguousarray(value).tobytes())[:10]
+    artifact = _save_phase3_value(root, f"phase3/mutations/{suffix}.npy", value)
+    row["shape"] = list(value.shape)
+    row["artifact"] = artifact
+
+
+@pytest.mark.parametrize("selected", [9, 11, None])
+def test_phase3_selected_step_is_explicitly_frozen(selected):
+    config = _config()
+    if selected is None:
+        config["phase3"].pop("selected_step")
+    else:
+        config["phase3"]["selected_step"] = selected
+    with pytest.raises(killtest.GlobalStopError, match="Phase-3 target"):
+        killtest.validate_phase3_config(config)
+
+
+def test_phase3_valid_artifacts_emit_exact_gate_set_and_events(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    result = _analyze_phase3(bundle, tmp_path)
+    assert [row["name"] for row in result["gates"]] == list(killtest.PHASE3_REQUIRED_GATES)
+    assert all(row["required"] and row["status"] == "PASS" for row in result["gates"])
+    assert result["branch_events"]["positive"]["classification"] == "MERGED_AFTER_BLOCK_002"
+    assert result["branch_events"]["negative"]["classification"] == "MERGED_AFTER_BLOCK_002"
+    assert result["cfg_event"]["classification"] == "MERGED_WITHIN_BOTH_TRANSFORMER_BRANCHES"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["timestep", "invocation", "block_count", "block_order", "branch_label", "branch_swap", "shape", "dtype"],
+)
+def test_phase3_execution_identity_mutations_fail_closed(tmp_path, monkeypatch, mutation):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    config, manifest, provenance, trace = bundle
+    row = trace["trajectories"]["CLEAN"]["branches"]["positive"]["records"][0]
+    if mutation == "timestep":
+        trace["selected_scheduler_timestep_bits"] = "00" * 8
+    elif mutation == "invocation":
+        row["invocation_index"] = 1
+    elif mutation == "block_count":
+        trace["trajectories"]["CLEAN"]["branches"]["positive"]["architecture"]["configured_num_layers"] = 39
+    elif mutation == "block_order":
+        order = trace["trajectories"]["CLEAN"]["branches"]["positive"]["architecture"]["executed_block_order"]
+        order[0], order[1] = order[1], order[0]
+    elif mutation == "branch_label":
+        row["branch"] = "unconditional"
+    elif mutation == "branch_swap":
+        branches = trace["trajectories"]["CLEAN"]["branches"]
+        branches["positive"], branches["negative"] = branches["negative"], branches["positive"]
+    elif mutation == "shape":
+        wrong = _phase3_value([1, 1, 1, 2, 1], 0)
+        _replace_phase3_artifact(tmp_path, row, wrong)
+    else:
+        row["runtime_dtype"] = "torch.float16"
+    with pytest.raises(killtest.GlobalStopError):
+        killtest.analyze_phase3_artifacts(tmp_path, config, manifest, provenance, trace)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "unexpected"])
+def test_phase3_boundary_key_set_fails_closed(tmp_path, monkeypatch, mutation):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    rows = bundle[3]["trajectories"]["CLEAN"]["branches"]["positive"]["records"]
+    if mutation == "missing":
+        rows.pop()
+    elif mutation == "duplicate":
+        rows[-1] = copy.deepcopy(rows[0])
+    else:
+        rows[-1]["boundary"] = "attention_internal"
+    with pytest.raises(killtest.GlobalStopError, match="block boundary set"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+@pytest.mark.parametrize("trajectory", killtest.TRAJECTORIES)
+def test_phase3_entry_must_equal_phase2_transformer_input(tmp_path, monkeypatch, trajectory):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    row = bundle[3]["trajectories"][trajectory]["branches"]["positive"]["records"][0]
+    _replace_phase3_artifact(tmp_path, row, _phase3_value(_PHASE3_TEST_SHAPES["latent"], 9))
+    with pytest.raises(killtest.GlobalStopError, match="PHASE2_PHASE3_BOUNDARY_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+@pytest.mark.parametrize("trajectory", killtest.TRAJECTORIES)
+def test_phase3_exit_must_equal_phase2_guidance_output(tmp_path, monkeypatch, trajectory):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    row = bundle[3]["trajectories"][trajectory]["cfg_combined_output"]
+    _replace_phase3_artifact(tmp_path, row, _phase3_value(_PHASE3_TEST_SHAPES["latent"], 9))
+    with pytest.raises(killtest.GlobalStopError, match="PHASE2_PHASE3_BOUNDARY_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+@pytest.mark.parametrize("trajectory", killtest.TRAJECTORIES)
+def test_phase3_traced_final_mutation_is_global_stop(tmp_path, monkeypatch, trajectory):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    bundle[3]["trajectories"][trajectory]["final_latent"] = killtest.save_tensor(
+        tmp_path,
+        f"phase3/mutations/{trajectory}_final.npy",
+        _phase3_value(_PHASE3_TEST_SHAPES["latent"], 99),
+    )
+    with pytest.raises(killtest.GlobalStopError, match="PHASE3_TRACE_ALTERS_EXECUTION"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+def test_phase3_declared_metrics_are_ignored_and_recomputed(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    baseline = _analyze_phase3(copy.deepcopy(bundle), tmp_path)
+    for trajectory in bundle[3]["trajectories"].values():
+        for branch in trajectory["branches"].values():
+            for row in branch["records"]:
+                row.update({"bit_exact": True, "differing_element_count": 0, "mse": 1e99, "relative_l2": 1e99})
+    attacked = _analyze_phase3(bundle, tmp_path)
+    assert attacked["pairwise_rows"] == baseline["pairwise_rows"]
+    assert attacked["branch_events"] == baseline["branch_events"]
+
+
+def test_phase3_float_descriptions_are_not_in_provenance_binding():
+    exact = {
+        "canonical_identity": "abc",
+        "differing_element_count": 1,
+        "bit_exact": False,
+    }
+    changed_description = {"relative_l2": np.nextafter(1.0, 2.0)}
+    assert killtest.canonical_json(exact) == killtest.canonical_json(copy.deepcopy(exact))
+    assert not killtest._binding_contains_float_reduction(exact)
+    assert killtest._binding_contains_float_reduction(changed_description)
+    exact["differing_element_count"] = 2
+    assert killtest.canonical_json(exact) != killtest.canonical_json({
+        "canonical_identity": "abc", "differing_element_count": 1, "bit_exact": False,
+    })
+
+
+def test_phase3_artifact_identity_mutation_is_rejected(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    row = bundle[3]["trajectories"]["PLUS1"]["branches"]["positive"]["records"][3]
+    row["artifact"]["runtime_canonical_identity"] = "forged"
+    with pytest.raises(killtest.GlobalStopError, match="canonical identity"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "merge_at,expected",
+    [
+        ("transient", "TRANSIENT_EXACT_EQUALITY"),
+        ("after_block_017", "MERGED_AFTER_BLOCK_017"),
+        ("raw_transformer_output", "MERGED_AT_RAW_TRANSFORMER_OUTPUT"),
+        (None, "NO_INTERNAL_EXACT_MERGE"),
+    ],
+)
+def test_phase3_persistent_merge_classification(tmp_path, monkeypatch, merge_at, expected):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch, merge_at=merge_at)
+    result = _analyze_phase3(bundle, tmp_path)
+    assert result["branch_events"]["positive"]["classification"] == expected
+    if merge_at is None:
+        assert result["cfg_event"]["classification"] == "MERGED_AT_CFG_COMBINATION"
+
+
+def test_phase3_row_shuffle_and_relocation_preserve_analysis(tmp_path, monkeypatch):
+    original = tmp_path / "original"
+    bundle = _synthetic_phase3(original, monkeypatch)
+    baseline = _analyze_phase3(copy.deepcopy(bundle), original)
+    for trajectory in bundle[3]["trajectories"].values():
+        for branch in trajectory["branches"].values():
+            branch["records"].reverse()
+    relocated = tmp_path / "relocated"
+    shutil.copytree(original, relocated)
+    result = _analyze_phase3(bundle, relocated)
+    assert result["branch_events"] == baseline["branch_events"]
+    assert result["pairwise_rows"] == baseline["pairwise_rows"]
+
+
+def test_phase3_missing_relocated_artifact_is_rejected(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    record = bundle[3]["trajectories"]["CLEAN"]["branches"]["negative"]["records"][5]["artifact"]
+    (tmp_path / record["relative_path"]).unlink()
+    with pytest.raises(killtest.GlobalStopError, match="artifact file validation"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+@pytest.mark.parametrize("mutation", ["phase4", "internal", "expansion"])
+def test_phase3_forbidden_followup_modes_are_rejected(mutation):
+    config = _config()
+    if mutation == "phase4":
+        config["phase3"]["phase4_enabled"] = True
+    elif mutation == "internal":
+        config["phase3"]["trace_attention"] = True
+    else:
+        config["phase3"]["auto_expand"] = True
+    with pytest.raises(killtest.GlobalStopError, match="Phase-3 target"):
+        killtest.validate_phase3_config(config)
+
+
+
+# ----------------------------------------------------------------------------- Phase-3 additions (Claude)
+
+
+def test_phase3_cfg_classification_distinguishes_branches(tmp_path, monkeypatch):
+    assert killtest._phase3_cfg_classification({"positive": True, "negative": True}) == "MERGED_WITHIN_BOTH_TRANSFORMER_BRANCHES"
+    assert killtest._phase3_cfg_classification({"positive": True, "negative": False}) == "MERGED_WITHIN_POSITIVE_BRANCH_ONLY_CFG_COMBINATION_EXACT"
+    assert killtest._phase3_cfg_classification({"positive": False, "negative": True}) == "MERGED_WITHIN_NEGATIVE_BRANCH_ONLY_CFG_COMBINATION_EXACT"
+    assert killtest._phase3_cfg_classification({"positive": False, "negative": False}) == "MERGED_AT_CFG_COMBINATION"
+    # Production path: negative branch never merges (raw outputs differ) while positive merges and CFG output is exact.
+    bundle = _synthetic_phase3(tmp_path, monkeypatch, merge_at="after_block_005")
+    config, manifest, provenance, trace = bundle
+    latent_shape = _PHASE3_TEST_SHAPES["latent"]
+    bits = lambda arr: killtest.single_flip.float32_to_bf16_bits(arr)
+    plus_pos = killtest.load_phase3_artifact(tmp_path, _raw_row(trace, "PLUS1", "positive")["artifact"])
+    plus_neg = killtest.load_phase3_artifact(tmp_path, _raw_row(trace, "PLUS1", "negative")["artifact"])
+    rng = np.random.default_rng(2); hist_neg = None
+    for _ in range(20000):  # search a distinct negative raw output whose combine with the same positive is identical
+        cand = _phase3_value(latent_shape, float(killtest.single_flip.base.cast_runtime_bf16(np.array([plus_neg.reshape(-1)[0] + rng.choice([-8.0, -4.0, 4.0, 8.0]) * rng.integers(1, 4)], np.float32))[0]))
+        if not np.array_equal(cand, plus_neg) and np.array_equal(killtest.reconstruct_cfg_combined_bits(bits(plus_pos), bits(cand), 4.0), killtest.reconstruct_cfg_combined_bits(bits(plus_pos), bits(plus_neg), 4.0)):
+            hist_neg = cand; break
+    if hist_neg is None:
+        big = _phase3_value(latent_shape, -1000.0); big2 = _phase3_value(latent_shape, -1004.0); one = _phase3_value(latent_shape, 1.0)
+        for trajectory in ("PLUS1", "HISTORICAL_PLUS14"):
+            _replace_phase3_artifact(tmp_path, _raw_row(trace, trajectory, "positive"), one)
+        _replace_phase3_artifact(tmp_path, _raw_row(trace, "PLUS1", "negative"), big); plus_pos, plus_neg, hist_neg = one, big, big2
+        assert np.array_equal(killtest.reconstruct_cfg_combined_bits(bits(one), bits(big), 4.0), killtest.reconstruct_cfg_combined_bits(bits(one), bits(big2), 4.0))
+    for row in trace["trajectories"]["HISTORICAL_PLUS14"]["branches"]["negative"]["records"]:
+        if row["boundary"] == "raw_transformer_output":
+            _replace_phase3_artifact(tmp_path, row, hist_neg)
+        elif row["boundary"] != "transformer_entry":
+            _replace_phase3_artifact(tmp_path, row, _phase3_value(row["shape"], 11))
+    combined = killtest.single_flip.bf16_bits_to_float32(killtest.reconstruct_cfg_combined_bits(bits(plus_pos), bits(plus_neg), 4.0)).reshape(latent_shape)
+    for trajectory in ("PLUS1", "HISTORICAL_PLUS14"):
+        _replace_phase3_artifact(tmp_path, trace["trajectories"][trajectory]["cfg_combined_output"], combined)
+    trusted = killtest._load_trusted_phase2_boundary
+    monkeypatch.setattr(killtest, "_load_trusted_phase2_boundary", lambda r, m, name, which: combined if (which == "exit" and name != "CLEAN") else trusted(r, m, name, which))
+    result = killtest.analyze_phase3_artifacts(tmp_path, config, manifest, provenance, trace)
+    assert result["branch_events"]["positive"]["classification"] == "MERGED_AFTER_BLOCK_005"
+    assert result["branch_events"]["negative"]["classification"] == "NO_INTERNAL_EXACT_MERGE"
+    assert result["cfg_event"]["classification"] == "MERGED_WITHIN_POSITIVE_BRANCH_ONLY_CFG_COMBINATION_EXACT"
+
+
+def test_phase3_architecture_heads_or_patch_mismatch_fails_closed(tmp_path, monkeypatch):
+    for key, value in (("num_attention_heads", 32), ("attention_head_dim", 64), ("inner_dim", 4096), ("patch_size", [1, 1, 1]), ("model_class", "other.Model")):
+        bundle = _synthetic_phase3(tmp_path / key, monkeypatch)
+        config, manifest, provenance, trace = bundle
+        trace["trajectories"]["PLUS1"]["branches"]["negative"]["architecture"][key] = value
+        with pytest.raises(killtest.GlobalStopError, match="required gate"):
+            killtest.analyze_phase3_artifacts(tmp_path / key, config, manifest, provenance, trace)
+        gates = json.loads((tmp_path / key / "phase3/phase3_gates.json").read_text())["gates"]
+        assert {g["name"] for g in gates if g["status"] == "FAIL"} == {"P3-G3", "P3-G11"}
+
+
+@pytest.mark.parametrize("trajectory", killtest.TRAJECTORIES)
+def test_phase3_traced_final_video_mutation_is_global_stop(tmp_path, monkeypatch, trajectory):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    bundle[3]["trajectories"][trajectory]["final_video"] = killtest.save_tensor(
+        tmp_path, f"phase3/mutations/{trajectory}_video.npy", np.full((1, 1, 1, 3), 5, dtype=np.uint8), runtime_semantics="uint8 decoded video"
+    )
+    with pytest.raises(killtest.GlobalStopError, match="PHASE3_TRACE_ALTERS_EXECUTION"):
+        _analyze_phase3(bundle, tmp_path)
+    assert not (tmp_path / "phase3/phase3_analysis.json").exists()
+
+
+def test_phase3_bf16_bit_artifacts_match_torch_runtime_encoding(tmp_path):
+    torch = pytest.importorskip("torch")
+    runtime = torch.randn(2, 3, 4).to(torch.bfloat16)
+    bits = runtime.view(torch.uint16).numpy()  # exactly what the production probe persists
+    path = tmp_path / "x.npy"; np.save(path, np.ascontiguousarray(bits), allow_pickle=False)
+    record = killtest.phase3_artifact_record(tmp_path, path, shape=list(runtime.shape))
+    widened = killtest.load_phase3_artifact(tmp_path, record)
+    assert np.array_equal(widened, runtime.float().numpy()) and widened.dtype == np.float32
+    assert record["runtime_dtype"] == "torch.bfloat16" and record["artifact_encoding"] == "bf16_bits_v1" and record["nbytes"] == bits.nbytes
+    # Same bytes reinterpreted with another shape must produce another identity and be rejected against the record.
+    other = np.save(tmp_path / "y.npy", np.ascontiguousarray(bits.reshape(4, 3, 2)), allow_pickle=False)
+    other_record = killtest.phase3_artifact_record(tmp_path, tmp_path / "y.npy", shape=[4, 3, 2])
+    assert other_record["runtime_canonical_identity"] != record["runtime_canonical_identity"]
+    forged = dict(record, shape=[4, 3, 2])
+    with pytest.raises(killtest.GlobalStopError):
+        killtest.load_phase3_artifact(tmp_path, forged)
+
+
+needs_trusted_phases = pytest.mark.skipif(
+    not Path("results/video_bf16_first_divergence_localization/phase2/phase2_manifest.json").exists(),
+    reason="trusted Phase-1/Phase-2 artifacts absent",
+)
+
+
+@needs_trusted_phases
+def test_provenance_binding_is_invariant_to_last_bit_float_metric_differences(monkeypatch):
+    """Cross-host reproducibility: only exact invariants enter the binding."""
+    config = _config()
+    baseline1 = killtest.derive_trusted_phase1(config)
+    baseline2 = killtest.derive_trusted_phase2(config)
+    assert not killtest._binding_contains_float_reduction(baseline1) and not killtest._binding_contains_float_reduction(baseline2)
+    original_metrics = killtest.metrics
+
+    def perturbed_metrics(lhs, rhs):
+        row = original_metrics(lhs, rhs)
+        for key in ("relative_l2", "mse", "mean_abs_diff", "max_abs_diff", "l2"):
+            if row[key] != 0.0:
+                row[key] = float(np.nextafter(row[key], np.inf))  # emulate another host's reduction order
+        return row
+
+    monkeypatch.setattr(killtest, "metrics", perturbed_metrics)
+    assert killtest.derive_trusted_phase1(config) == baseline1
+    assert killtest.derive_trusted_phase2(config) == baseline2
+    # The same perturbation still changes the descriptive analysis rows, proving the monkeypatch is live.
+    a = original_metrics(np.ones(4, np.float32), np.zeros(4, np.float32)); b = perturbed_metrics(np.ones(4, np.float32), np.zeros(4, np.float32))
+    assert a != b and a["differing_element_count"] == b["differing_element_count"]
+
+
+@needs_trusted_phases
+def test_require_cpu_rejects_trusted_phase2_identity_or_integer_mutation(tmp_path):
+    config = _config(); config["output_root"] = "video_bf16_first_divergence_localization_phase3"
+    root = tmp_path / "video_bf16_first_divergence_localization_phase3"
+    killtest.run_cpu(config, CONFIG_PATH, root)
+    manifest_path, gates_path = root / "anchor_manifest.json", root / "cpu_gates.json"
+    genuine_manifest, genuine_gates = manifest_path.read_text(), gates_path.read_text()
+
+    def resign(mutate):
+        manifest = json.loads(genuine_manifest); mutate(manifest)
+        unhashed = dict(manifest); unhashed.pop("manifest_sha256")
+        manifest["manifest_sha256"] = killtest.sha256_bytes(killtest.canonical_json(unhashed))
+        manifest_path.write_text(json.dumps(manifest))
+        gates = json.loads(genuine_gates); gates["manifest_sha256"] = manifest["manifest_sha256"]; gates_path.write_text(json.dumps(gates))
+
+    resign(lambda m: m["trusted_phase2"]["trajectories"]["CLEAN"].__setitem__("exit_identity", "0" * 64))
+    with pytest.raises(killtest.GlobalStopError, match="trusted Phase-2 binding"):
+        killtest.require_cpu(root, CONFIG_PATH, config)
+    resign(lambda m: m["trusted_phase1"]["trusted_exit_clean_vs_plus1"].__setitem__("differing_element_count", 41640))
+    with pytest.raises(killtest.GlobalStopError, match="trusted Phase-1 binding"):
+        killtest.require_cpu(root, CONFIG_PATH, config)
+    resign(lambda m: m["phase3_freeze"]["expected_architecture"].__setitem__("inner_dim", 4096))
+    with pytest.raises(killtest.GlobalStopError, match="Phase-3 freeze"):
+        killtest.require_cpu(root, CONFIG_PATH, config)
+    manifest_path.write_text(genuine_manifest); gates_path.write_text(genuine_gates)
+    manifest, _ = killtest.require_cpu(root, CONFIG_PATH, config)
+    assert not killtest._binding_contains_float_reduction(manifest["trusted_phase1"])
+    assert not killtest._binding_contains_float_reduction(manifest["trusted_phase2"])
+    assert manifest["phase3_freeze"]["expected_artifact_budget"]["bytes_total_three_trajectories"] > 30e9
+
+
+
+# ----------------------------------------------------------------------------- M1: CFG operand reconstruction (production path)
+
+
+def _raw_row(trace, trajectory, branch):
+    return next(r for r in trace["trajectories"][trajectory]["branches"][branch]["records"] if r["boundary"] == "raw_transformer_output")
+
+
+def _flip_one_bf16_bit(root, row, flat=0, mask=0x0080):
+    """Flip one BF16 bit of one element. Default flips the top mantissa bit (a finite, non-absorbable change):
+    an LSB flip of a tiny value can be absorbed by the (non-injective) BF16 combine and an exponent flip can
+    produce Inf, so neither is a meaningful reconstruction attack."""
+    path = root / row["artifact"]["relative_path"]
+    bits = np.load(path, allow_pickle=False).copy(); bits.reshape(-1)[flat] ^= np.uint16(mask)
+    np.save(path, bits, allow_pickle=False)
+    row["artifact"] = killtest.phase3_artifact_record(root, path, shape=row["shape"])
+
+
+def test_cfg_reconstruction_rule_matches_torch_eager_bf16_semantics():
+    torch = pytest.importorskip("torch")
+    g = torch.Generator().manual_seed(3)
+    for scale in (4.0, 3.5, 7.25):
+        p = (torch.randn(3, 16, 9, 20, 24, generator=g) * 3).to(torch.bfloat16)
+        n = (torch.randn(3, 16, 9, 20, 24, generator=g) * 3).to(torch.bfloat16)
+        torch_comb = (n + scale * (p - n)).view(torch.uint16).numpy()  # exact production expression, eager bf16 ops
+        ours = killtest.reconstruct_cfg_combined_bits(p.view(torch.uint16).numpy(), n.view(torch.uint16).numpy(), scale)
+        assert np.array_equal(ours, torch_comb), scale
+        swapped = killtest.reconstruct_cfg_combined_bits(n.view(torch.uint16).numpy(), p.view(torch.uint16).numpy(), scale)
+        assert not np.array_equal(swapped, torch_comb)
+    assert "bf16(p - n)" in killtest.CFG_RECONSTRUCTION_RULE and "cfg_normalize=False" in killtest.CFG_RECONSTRUCTION_RULE
+
+
+def test_m1_A_correct_raw_operands_pass_and_gate_31_is_required(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    result = _analyze_phase3(bundle, tmp_path)
+    assert "P3-G31" in killtest.PHASE3_REQUIRED_GATES and [g["name"] for g in result["gates"]][-1] == "P3-G31"
+    assert all(g["status"] == "PASS" for g in result["gates"])
+    assert all(r["bit_exact"] and not r["swapped_operands_bit_exact"] for r in result["cfg_operand_reconstruction"].values())
+    assert result["cfg_operand_reconstruction"]["CLEAN"]["guidance_scale_bits"] == killtest.float64_bit_pattern(4.0)
+
+
+def test_m1_B_swapped_branch_artifact_contents_with_intact_labels_rejected(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    trace = bundle[3]
+    pos, neg = trace["trajectories"]["PLUS1"]["branches"]["positive"]["records"], trace["trajectories"]["PLUS1"]["branches"]["negative"]["records"]
+    for a, c in zip(pos, neg):
+        a["artifact"], c["artifact"] = c["artifact"], a["artifact"]
+    with pytest.raises(killtest.GlobalStopError, match="CFG_OPERAND_RECONSTRUCTION_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+    failure = json.loads((tmp_path / "phase3/cfg_operand_reconstruction_mismatch.json").read_text())
+    assert failure["reconstruction"]["PLUS1"]["bit_exact"] is False and failure["reconstruction"]["PLUS1"]["swapped_operands_bit_exact"] is True
+    assert not (tmp_path / "phase3/phase3_analysis.json").exists()
+
+
+@pytest.mark.parametrize("target", ["positive", "negative", "cfg"])
+@pytest.mark.parametrize("trajectory", killtest.TRAJECTORIES)
+def test_m1_CDE_single_bf16_bit_mutation_rejected(tmp_path, monkeypatch, target, trajectory):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    trace = bundle[3]
+    row = trace["trajectories"][trajectory]["cfg_combined_output"] if target == "cfg" else _raw_row(trace, trajectory, target)
+    _flip_one_bf16_bit(tmp_path, row)
+    with pytest.raises(killtest.GlobalStopError, match="CFG_OPERAND_RECONSTRUCTION_MISMATCH|PHASE2_PHASE3_BOUNDARY_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+def test_m1_F_wrong_guidance_scale_rejected(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    config, manifest, provenance, trace = bundle
+    row = trace["trajectories"]["CLEAN"]["cfg_combined_output"]
+    row["guidance_scale"] = 3.5; row["guidance_scale_bits"] = killtest.float64_bit_pattern(3.5)
+    with pytest.raises(killtest.GlobalStopError, match="CFG_OPERAND_RECONSTRUCTION_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+    # config-level scale change is rejected before any analysis (frozen generation configuration)
+    row["guidance_scale"] = 4.0; row["guidance_scale_bits"] = killtest.float64_bit_pattern(4.0)
+    bad = copy.deepcopy(config); bad["generation"]["guidance_scale"] = 3.5
+    with pytest.raises(killtest.GlobalStopError, match="binding mismatch"):
+        killtest.analyze_phase3_artifacts(tmp_path, bad, manifest, provenance, trace)
+
+
+def test_m1_G_arbitrary_cfg_tensor_with_correct_shape_dtype_rejected(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    trace = bundle[3]
+    for trajectory in killtest.TRAJECTORIES:
+        row = trace["trajectories"][trajectory]["cfg_combined_output"]
+        _replace_phase3_artifact(tmp_path, row, _phase3_value(_PHASE3_TEST_SHAPES["latent"], 7.0))
+    # PLUS1/HIST cfg are still equal (both 7), so the only guard that can fire is reconstruction or the Phase-2 exit binding.
+    with pytest.raises(killtest.GlobalStopError, match="PHASE2_PHASE3_BOUNDARY_MISMATCH|CFG_OPERAND_RECONSTRUCTION_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+def test_m1_H_forged_reconstruction_pass_in_rows_is_ignored(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    trace = bundle[3]
+    _flip_one_bf16_bit(tmp_path, _raw_row(trace, "HISTORICAL_PLUS14", "negative"))
+    for trajectory in trace["trajectories"].values():
+        trajectory["cfg_combined_output"].update({"reconstruction_bit_exact": True, "P3-G31": "PASS"})
+        trajectory["cfg_operand_reconstruction"] = {"bit_exact": True}
+    with pytest.raises(killtest.GlobalStopError, match="CFG_OPERAND_RECONSTRUCTION_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+def test_m1_I_wrong_branch_labels_rejected_structurally(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    trace = bundle[3]
+    for row in trace["trajectories"]["CLEAN"]["branches"]["positive"]["records"]:
+        row["branch"] = "negative"
+    with pytest.raises(killtest.GlobalStopError, match="required gate"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+def test_m1_J_float32_reconstruction_is_not_the_production_path(tmp_path, monkeypatch):
+    """A cfg tensor produced by single-rounding float32 arithmetic must be rejected where it differs from the
+    three-step BF16 emulation, proving the validator uses the canonical path."""
+    bf = killtest.single_flip.base.cast_runtime_bf16
+    rng = np.random.default_rng(5)
+    p = bf(rng.normal(scale=3, size=(1, 1, 1, 1, 2)).astype(np.float32)); n = bf(rng.normal(scale=3, size=(1, 1, 1, 1, 2)).astype(np.float32))
+    for _ in range(5000):
+        approx = bf((n + np.float32(4.0) * (p - n)).astype(np.float32))
+        exact = killtest.single_flip.bf16_bits_to_float32(killtest.reconstruct_cfg_combined_bits(killtest.single_flip.float32_to_bf16_bits(p), killtest.single_flip.float32_to_bf16_bits(n), 4.0)).reshape(p.shape)
+        if not np.array_equal(approx, exact):
+            break
+        p = bf(rng.normal(scale=3, size=p.shape).astype(np.float32)); n = bf(rng.normal(scale=3, size=p.shape).astype(np.float32))
+    else:
+        pytest.skip("no float32-vs-BF16-path divergence found")
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    trace = bundle[3]
+    for trajectory in killtest.TRAJECTORIES:
+        _replace_phase3_artifact(tmp_path, _raw_row(trace, trajectory, "positive"), p)
+        _replace_phase3_artifact(tmp_path, _raw_row(trace, trajectory, "negative"), n)
+        _replace_phase3_artifact(tmp_path, trace["trajectories"][trajectory]["cfg_combined_output"], approx)
+    with pytest.raises(killtest.GlobalStopError, match="CFG_OPERAND_RECONSTRUCTION_MISMATCH|PHASE2_PHASE3_BOUNDARY_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+    for trajectory in killtest.TRAJECTORIES:
+        _replace_phase3_artifact(tmp_path, trace["trajectories"][trajectory]["cfg_combined_output"], exact)
+    # with the exact BF16 path the only remaining guard is the Phase-2 exit identity (synthetic exit differs)
+    with pytest.raises(killtest.GlobalStopError, match="PHASE2_PHASE3_BOUNDARY_MISMATCH"):
+        _analyze_phase3(bundle, tmp_path)
+
+
+# ----------------------------------------------------------------------------- M2: preflight authentication (production require_preflight)
+
+
+@needs_trusted_phases
+def test_m2_fabricated_all_pass_preflight_without_artifacts_rejected(tmp_path):
+    config = _config(); config["output_root"] = "video_bf16_first_divergence_localization_phase3"
+    root = tmp_path / "video_bf16_first_divergence_localization_phase3"
+    killtest.run_cpu(config, CONFIG_PATH, root)
+    manifest, provenance = killtest.require_cpu(root, CONFIG_PATH, config)
+    _valid_preflight(root, manifest, provenance, config=config, with_artifacts=False)
+    with pytest.raises(killtest.GlobalStopError, match="three trajectories"):
+        killtest.require_preflight(root, manifest, provenance)
+    # names/PASS/hashes all correct, controls present but artifacts deleted
+    _valid_preflight(root, manifest, provenance, config=config)
+    killtest.require_preflight(root, manifest, provenance)  # genuine passes
+    shutil.rmtree(root / "preflight/PLUS1")
+    with pytest.raises(killtest.GlobalStopError, match="artifact file validation"):
+        killtest.require_preflight(root, manifest, provenance)
+
+
+@needs_trusted_phases
+def test_m2_mutated_repeat_artifact_with_resigned_document_rejected(tmp_path):
+    config = _config(); config["output_root"] = "video_bf16_first_divergence_localization_phase3"
+    root = tmp_path / "video_bf16_first_divergence_localization_phase3"
+    killtest.run_cpu(config, CONFIG_PATH, root)
+    manifest, provenance = killtest.require_cpu(root, CONFIG_PATH, config)
+    document = _valid_preflight(root, manifest, provenance, config=config)
+    latent = killtest.load_tensor(root, document["controls"]["HISTORICAL_PLUS14"][0]["final_latent_artifact"]).copy()
+    latent.reshape(-1)[0] += np.float32(1e-3)
+    record = killtest.save_tensor(root, "preflight/HISTORICAL_PLUS14/repeat_0/recovered_final_latent.npy", latent)
+    for row in document["controls"]["HISTORICAL_PLUS14"]:
+        row["final_latent_artifact"] = record; row["final_latent_identity"] = record["canonical_identity"]
+    killtest.atomic_json(root / "preflight/preflight_gates.json", document)  # all gates still declared PASS
+    with pytest.raises(killtest.GlobalStopError, match="re-derived from artifacts fail"):
+        killtest.require_preflight(root, manifest, provenance)
+    # repeat key set violations
+    document = _valid_preflight(root, manifest, provenance, config=config)
+    document["controls"]["CLEAN"].pop(); killtest.atomic_json(root / "preflight/preflight_gates.json", document)
+    with pytest.raises(killtest.GlobalStopError, match="repeat key set"):
+        killtest.require_preflight(root, manifest, provenance)
+    document = _valid_preflight(root, manifest, provenance, config=config)
+    document["controls"]["CLEAN"][2]["repeat_id"] = 0; killtest.atomic_json(root / "preflight/preflight_gates.json", document)
+    with pytest.raises(killtest.GlobalStopError, match="repeat key set"):
+        killtest.require_preflight(root, manifest, provenance)
+    # a declared FAIL contradicting artifacts, or a gate document from the trusted Phase-1/2 root, are rejected
+    document = _valid_preflight(root, manifest, provenance, config=config)
+    document["gates"][0]["status"] = "FAIL"; killtest.atomic_json(root / "preflight/preflight_gates.json", document)
+    with pytest.raises(killtest.GlobalStopError):
+        killtest.require_preflight(root, manifest, provenance)
+    old = json.loads(Path("results/video_bf16_first_divergence_localization/preflight/preflight_gates.json").read_text())
+    killtest.atomic_json(root / "preflight/preflight_gates.json", old)
+    with pytest.raises(killtest.GlobalStopError, match="binding mismatch"):
+        killtest.require_preflight(root, manifest, provenance)
+
+
+# ----------------------------------------------------------------------------- M3: require_cpu validates the Phase-3 config
+
+
+@needs_trusted_phases
+@pytest.mark.parametrize("mutate", [
+    lambda c: c["phase3"].__setitem__("selected_step", 9),
+    lambda c: c["phase3"].__setitem__("selected_step", 11),
+    lambda c: c["phase3"].pop("selected_step"),
+    lambda c: c["phase3"].__setitem__("trace_attention", True),
+    lambda c: c["phase3"].__setitem__("phase4_enabled", True),
+    lambda c: c["phase3"].__setitem__("auto_expand", True),
+])
+def test_m3_require_cpu_rejects_mutated_loaded_config(tmp_path, mutate):
+    config = _config(); config["output_root"] = "video_bf16_first_divergence_localization_phase3"
+    root = tmp_path / "video_bf16_first_divergence_localization_phase3"
+    killtest.run_cpu(config, CONFIG_PATH, root)
+    mutated = copy.deepcopy(config); mutate(mutated)
+    with pytest.raises(killtest.GlobalStopError, match="Phase-3 target"):
+        killtest.require_cpu(root, CONFIG_PATH, mutated)
+
+
+# ----------------------------------------------------------------------------- portability: exact invariants only
+
+
+@needs_trusted_phases
+def test_portability_float_last_bit_in_manifest_does_not_affect_authorization(tmp_path):
+    config = _config(); config["output_root"] = "video_bf16_first_divergence_localization_phase3"
+    root = tmp_path / "video_bf16_first_divergence_localization_phase3"
+    killtest.run_cpu(config, CONFIG_PATH, root)
+    manifest_path, gates_path = root / "anchor_manifest.json", root / "cpu_gates.json"
+    genuine_manifest, genuine_gates = manifest_path.read_text(), gates_path.read_text()
+
+    def resign(mutate):
+        manifest = json.loads(genuine_manifest); mutate(manifest)
+        unhashed = dict(manifest); unhashed.pop("manifest_sha256")
+        manifest["manifest_sha256"] = killtest.sha256_bytes(killtest.canonical_json(unhashed))
+        manifest_path.write_text(json.dumps(manifest))
+        gates = json.loads(genuine_gates); gates["manifest_sha256"] = manifest["manifest_sha256"]; gates_path.write_text(json.dumps(gates))
+
+    hist = "trajectories"; up = lambda x: float(np.nextafter(x, np.inf))
+    resign(lambda m: m[hist]["HISTORICAL_PLUS14"]["historical_delta"].__setitem__("delta_l2", up(m[hist]["HISTORICAL_PLUS14"]["historical_delta"]["delta_l2"])))
+    killtest.require_cpu(root, CONFIG_PATH, config)  # descriptive float: authorization unchanged
+    resign(lambda m: m[hist]["PLUS1"]["construction"].__setitem__("realized_mse", up(m[hist]["PLUS1"]["construction"]["realized_mse"])))
+    killtest.require_cpu(root, CONFIG_PATH, config)
+    resign(lambda m: m[hist]["HISTORICAL_PLUS14"]["historical_delta"]["changed_coordinates"][2].__setitem__("perturbed_bf16_bits_hex", "0xb4a1"))
+    with pytest.raises(killtest.GlobalStopError, match="historical support"):
+        killtest.require_cpu(root, CONFIG_PATH, config)
+    resign(lambda m: m[hist]["PLUS1"]["construction"].__setitem__("expected_perturbed_bf16_bits", 0xb4ac))
+    with pytest.raises(killtest.GlobalStopError, match="PLUS1 construction"):
+        killtest.require_cpu(root, CONFIG_PATH, config)
+    resign(lambda m: m[hist]["HISTORICAL_PLUS14"]["historical_delta"].__setitem__("changed_coordinate_count", 5))
+    with pytest.raises(killtest.GlobalStopError, match="historical support"):
+        killtest.require_cpu(root, CONFIG_PATH, config)
+    manifest_path.write_text(genuine_manifest); gates_path.write_text(genuine_gates)
+    killtest.require_cpu(root, CONFIG_PATH, config)

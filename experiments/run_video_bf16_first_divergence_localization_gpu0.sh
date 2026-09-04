@@ -6,7 +6,7 @@ if [ $# -lt 1 ]; then
   exit 2
 fi
 MODE="$1"
-OUT="${2:-results/video_bf16_first_divergence_localization}"
+OUT="${2:-results/video_bf16_first_divergence_localization_phase3}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 python experiments/video_bf16_first_divergence_localization.py \

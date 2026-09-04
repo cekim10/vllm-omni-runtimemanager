@@ -25,6 +25,10 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.pipeline_parallel import AsyncLatents, PipelineParallelMixin
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+    get_pipeline_parallel_world_size,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step_idx
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -578,6 +582,88 @@ class Wan22Pipeline(
             }
         }
 
+    def _build_phase3_block_probe_state(
+        self,
+        req: OmniDiffusionRequest,
+        timesteps: torch.Tensor,
+    ) -> dict[str, Any] | None:
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        config = extra_args.get("phase3_block_probe")
+        if not isinstance(config, dict):
+            return None
+        artifact_dir = config.get("artifact_dir")
+        if not artifact_dir:
+            raise ValueError("phase3_block_probe.artifact_dir is required")
+        selected = int(config.get("selected_local_step", -1))
+        if not 0 <= selected < len(timesteps):
+            raise ValueError("phase3_block_probe selected_local_step is outside the resumed trajectory")
+        root = Path(str(artifact_dir))
+        return {
+            "artifact_dir": root,
+            "selected_local_step": selected,
+            "selected_absolute_step": int(config.get("selected_absolute_step", -1)),
+            "request_label": str(config.get("request_label") or req.request_id),
+            "branches": {
+                branch: {
+                    "artifact_dir": str(root / branch),
+                    "branch": branch,
+                    "invocation_index": invocation_index,
+                    "records": [],
+                }
+                for invocation_index, branch in enumerate(("positive", "negative"))
+            },
+            "cfg_combined_output": None,
+        }
+
+    def _capture_phase3_cfg_output(
+        self,
+        probe_state: dict[str, Any] | None,
+        *,
+        step_idx: int,
+        value: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance_scale: float,
+        cfg_normalize: bool,
+    ) -> None:
+        if probe_state is None or step_idx != probe_state["selected_local_step"]:
+            return
+        if probe_state["cfg_combined_output"] is not None:
+            raise RuntimeError("Duplicate Phase-3 CFG-combined output")
+        path = probe_state["artifact_dir"] / "cfg_combined_output.npy"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if value.dtype != torch.bfloat16:
+            raise RuntimeError(f"Phase-3 expected BF16 CFG output, got {value.dtype}")
+        snapshot = value.detach().to(device="cpu").contiguous().clone()
+        np.save(path, snapshot.view(torch.uint16).numpy(), allow_pickle=False)
+        probe_state["cfg_combined_output"] = {
+            "boundary": "cfg_combined_output",
+            "absolute_step": probe_state["selected_absolute_step"],
+            "local_step": step_idx,
+            "timestep": float(torch.as_tensor(timestep).detach().float().cpu().reshape(-1)[0].item()),
+            "runtime_dtype": str(value.dtype),
+            "shape": [int(item) for item in value.shape],
+            "artifact_path": str(path),
+            "artifact_encoding": "bf16_bits_v1",
+            # Metadata only: identifies the scalar and normalization flag the production combine used.
+            "guidance_scale": float(guidance_scale),
+            "cfg_normalize": bool(cfg_normalize),
+        }
+
+    def _persist_phase3_block_probe(self, probe_state: dict[str, Any] | None) -> dict[str, Any]:
+        if probe_state is None:
+            return {}
+        return {
+            "phase3_block_probe": {
+                "selected_local_step": probe_state["selected_local_step"],
+                "selected_absolute_step": probe_state["selected_absolute_step"],
+                "cfg_execution": "sequential_positive_then_negative",
+                "pipeline_parallel_world_size": get_pipeline_parallel_world_size(),
+                "cfg_parallel_world_size": get_classifier_free_guidance_world_size(),
+                "branches": probe_state["branches"],
+                "cfg_combined_output": probe_state["cfg_combined_output"],
+            }
+        }
+
     def _capture_trajectory_probe_checkpoint(
         self,
         probe_state: dict[str, Any] | None,
@@ -751,6 +837,7 @@ class Wan22Pipeline(
         first_frame_mask: torch.Tensor | None = None,
         probe_state: dict[str, Any] | None = None,
         within_step_probe_state: dict[str, Any] | None = None,
+        phase3_block_probe_state: dict[str, Any] | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -843,11 +930,39 @@ class Wan22Pipeline(
                 else:
                     negative_kwargs = None
 
+                phase3_active = (
+                    phase3_block_probe_state is not None
+                    and step_idx == phase3_block_probe_state["selected_local_step"]
+                )
+                if phase3_active:
+                    if (
+                        get_pipeline_parallel_world_size() != 1
+                        or get_classifier_free_guidance_world_size() != 1
+                        or not do_true_cfg
+                        or current_model is not self.transformer
+                    ):
+                        raise RuntimeError(
+                            "Phase-3 requires single-GPU sequential CFG through the high-noise transformer"
+                        )
+                    positive_kwargs["phase3_block_probe_state"] = phase3_block_probe_state["branches"]["positive"]
+                    if negative_kwargs is None:
+                        raise RuntimeError("Phase-3 negative CFG invocation is missing")
+                    negative_kwargs["phase3_block_probe_state"] = phase3_block_probe_state["branches"]["negative"]
+
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=do_true_cfg,
                     true_cfg_scale=current_guidance_scale,
                     positive_kwargs=positive_kwargs,
                     negative_kwargs=negative_kwargs,
+                    cfg_normalize=False,
+                )
+
+                self._capture_phase3_cfg_output(
+                    phase3_block_probe_state,
+                    step_idx=step_idx,
+                    value=noise_pred,
+                    timestep=t,
+                    guidance_scale=current_guidance_scale,
                     cfg_normalize=False,
                 )
 
@@ -1135,9 +1250,11 @@ class Wan22Pipeline(
             _t_denoise_start = time.perf_counter()
         probe_state = None
         within_step_probe_state = None
+        phase3_block_probe_state = None
         if not (self.expand_timesteps and latent_condition is not None):
             probe_state = self._build_trajectory_probe_state(req, timesteps)
             within_step_probe_state = self._build_within_step_probe_state(req, timesteps)
+            phase3_block_probe_state = self._build_phase3_block_probe_state(req, timesteps)
         latents = self.diffuse(
             latents=latents,
             timesteps=timesteps,
@@ -1152,6 +1269,7 @@ class Wan22Pipeline(
             first_frame_mask=first_frame_mask,
             probe_state=probe_state,
             within_step_probe_state=within_step_probe_state,
+            phase3_block_probe_state=phase3_block_probe_state,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -1208,6 +1326,7 @@ class Wan22Pipeline(
 
         custom_output = self._persist_trajectory_probe(probe_state)
         custom_output.update(self._persist_within_step_probe(within_step_probe_state))
+        custom_output.update(self._persist_phase3_block_probe(phase3_block_probe_state))
         return DiffusionOutput(
             output=output,
             custom_output=custom_output,
