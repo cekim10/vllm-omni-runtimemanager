@@ -14,6 +14,39 @@ from .module_collector import ModuleDiscovery
 
 logger = init_logger(__name__)
 
+# Append-only record of every sequential-offload swap performed in this process.
+# Consumers (resource-lifetime probes) call drain_offload_events(); recording never
+# changes offload behaviour.
+_OFFLOAD_EVENTS: list[dict] = []
+_OFFLOAD_EVENTS_LIMIT = 100_000
+_RECORDING_ENABLED = False  # production default: no accounting, no logging, no accumulation
+
+
+def enable_offload_event_recording() -> None:
+    """Opt-in: start recording swap events (resource-lifetime probes only)."""
+    global _RECORDING_ENABLED
+    _OFFLOAD_EVENTS.clear()
+    _RECORDING_ENABLED = True
+
+
+def disable_offload_event_recording() -> None:
+    global _RECORDING_ENABLED
+    _RECORDING_ENABLED = False
+
+
+def _module_bytes(module: nn.Module, device: torch.device | None = None) -> int:
+    total = 0
+    for tensor in list(module.parameters()) + list(module.buffers()):
+        if device is None or tensor.device == device:
+            total += tensor.numel() * tensor.element_size()
+    return total
+
+
+def drain_offload_events() -> list[dict]:
+    events = list(_OFFLOAD_EVENTS)
+    _OFFLOAD_EVENTS.clear()
+    return events
+
 
 class SequentialOffloadHook(ModelHook):
     """Hook for sequential offloading with mutual exclusion on encoder and DiT modules.
@@ -98,6 +131,15 @@ class SequentialOffloadHook(ModelHook):
         self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
+        recording = _RECORDING_ENABLED
+        if recording:
+            import time as _time
+
+            # accounting happens BEFORE the timed window so swap durations measure only the moves
+            bytes_to_cpu = sum(_module_bytes(target, self.device) for target in self.offload_targets)
+            offloaded = [target.__class__.__name__ for target in self.offload_targets if _module_bytes(target, self.device) > 0]
+            bytes_to_gpu = _module_bytes(module) - _module_bytes(module, self.device)
+            started = _time.perf_counter()
         # Offload target modules to CPU
         for target in self.offload_targets:
             self._to_cpu(target)
@@ -105,6 +147,18 @@ class SequentialOffloadHook(ModelHook):
         # Load current module to GPU
         self._to_gpu(module)
         current_omni_platform.synchronize()
+        if recording and (bytes_to_cpu or bytes_to_gpu) and len(_OFFLOAD_EVENTS) < _OFFLOAD_EVENTS_LIMIT:
+            _OFFLOAD_EVENTS.append(
+                {
+                    "module": module.__class__.__name__,
+                    "module_id": id(module),
+                    "offloaded_modules": offloaded,
+                    "bytes_to_cpu": int(bytes_to_cpu),
+                    "bytes_to_gpu": int(bytes_to_gpu),
+                    "t_start": started,
+                    "t_end": _time.perf_counter(),
+                }
+            )
 
         logger.debug(
             "Swapped: %s -> CPU, %s -> %s, free memory: %.4f GB",

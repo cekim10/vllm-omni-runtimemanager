@@ -469,6 +469,101 @@ class Wan22Pipeline(
             raise ValueError("skip_vae_decode must be a boolean")
         return True
 
+    # ------------------------------------------------------------------ resource-lifetime probe
+    _RESOURCE_COMPONENTS = ("text_encoder", "transformer", "transformer_2", "vae")
+
+    def _build_resource_lifetime_probe_state(self, req: OmniDiffusionRequest) -> dict[str, Any] | None:
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        config = extra_args.get("resource_lifetime_probe")
+        if not isinstance(config, dict):
+            return None
+        artifact_dir = config.get("artifact_dir")
+        if not artifact_dir:
+            raise ValueError("resource_lifetime_probe.artifact_dir is required")
+        try:
+            from vllm_omni.diffusion.offloader.sequential_backend import enable_offload_event_recording
+
+            enable_offload_event_recording()  # clears earlier events; recording stays off when no probe is attached
+        except Exception:  # pragma: no cover - offloader unavailable on some platforms
+            pass
+        static_bytes = {}
+        for name in self._RESOURCE_COMPONENTS:
+            module = getattr(self, name, None)
+            static_bytes[name] = self._module_total_bytes(module) if isinstance(module, nn.Module) else None
+        return {
+            "artifact_dir": Path(str(artifact_dir)),
+            "label": str(config.get("request_label") or req.request_id),
+            "events": [],
+            "static_component_bytes": static_bytes,
+            "t0": time.perf_counter(),
+        }
+
+    @staticmethod
+    def _module_total_bytes(module: nn.Module, device: torch.device | None = None) -> int:
+        total = 0
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            if device is None or tensor.device == device:
+                total += tensor.numel() * tensor.element_size()
+        return int(total)
+
+    def _capture_resource_event(self, probe_state: dict[str, Any] | None, event: str, **fields: Any) -> None:
+        if probe_state is None:
+            return
+        if current_omni_platform.is_available():
+            current_omni_platform.synchronize()
+        now = time.perf_counter()
+        record: dict[str, Any] = {"event": event, "t": now, "t_rel_ms": (now - probe_state["t0"]) * 1000.0, **fields}
+        device = self.device if isinstance(self.device, torch.device) else torch.device(str(self.device))
+        resident = {}
+        for name in self._RESOURCE_COMPONENTS:
+            module = getattr(self, name, None)
+            resident[name] = self._module_total_bytes(module, device) if isinstance(module, nn.Module) else None
+        record["resident_component_bytes"] = resident
+        if current_omni_platform.is_available():
+            try:
+                record["memory_allocated"] = int(torch.cuda.memory_allocated(device))
+                record["memory_reserved"] = int(torch.cuda.memory_reserved(device))
+                record["max_memory_allocated_since_last_event"] = int(torch.cuda.max_memory_allocated(device))
+                record["max_memory_reserved_since_last_event"] = int(torch.cuda.max_memory_reserved(device))
+                torch.cuda.reset_peak_memory_stats(device)
+                record["free_gpu_bytes"] = int(current_omni_platform.get_free_memory(device))
+            except Exception as exc:  # pragma: no cover - platform specific
+                record["memory_error"] = repr(exc)
+        probe_state["events"].append(record)
+
+    def _persist_resource_lifetime_probe(self, probe_state: dict[str, Any] | None) -> dict[str, Any]:
+        if probe_state is None:
+            return {}
+        offload_events: list[dict[str, Any]] = []
+        try:
+            from vllm_omni.diffusion.offloader.sequential_backend import disable_offload_event_recording, drain_offload_events
+
+            offload_events = drain_offload_events()
+            disable_offload_event_recording()
+        except Exception:  # pragma: no cover
+            pass
+        device_info: dict[str, Any] = {}
+        if current_omni_platform.is_available():
+            try:
+                props = torch.cuda.get_device_properties(self.device)
+                device_info = {"name": props.name, "total_memory_bytes": int(props.total_memory)}
+            except Exception as exc:  # pragma: no cover
+                device_info = {"error": repr(exc)}
+        document = {
+            "label": probe_state["label"],
+            "t0": probe_state["t0"],
+            "static_component_bytes": probe_state["static_component_bytes"],
+            "component_loaded": {name: isinstance(getattr(self, name, None), nn.Module) for name in self._RESOURCE_COMPONENTS},
+            "device": device_info,
+            "events": probe_state["events"],
+            "offload_events": offload_events,
+        }
+        artifact_dir = probe_state["artifact_dir"]
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        path = artifact_dir / f"{probe_state['label']}_resource_lifetime.json"
+        path.write_text(json.dumps(document, indent=1, sort_keys=True, default=str))
+        return {"resource_lifetime_probe_path": str(path), "resource_lifetime_event_count": len(probe_state["events"])}
+
     def _build_trajectory_probe_state(
         self,
         req: OmniDiffusionRequest,
@@ -861,10 +956,12 @@ class Wan22Pipeline(
         probe_state: dict[str, Any] | None = None,
         within_step_probe_state: dict[str, Any] | None = None,
         phase3_block_probe_state: dict[str, Any] | None = None,
+        resource_probe_state: dict[str, Any] | None = None,
     ) -> torch.Tensor | AsyncLatents:
         if attention_kwargs is None:
             attention_kwargs = {}
         cumulative_dit_ms = 0.0
+        self._capture_resource_event(resource_probe_state, "denoise_start", num_steps=int(len(timesteps)))
         self._capture_trajectory_probe_checkpoint(
             probe_state,
             step_index=0,
@@ -1007,6 +1104,15 @@ class Wan22Pipeline(
                     current_omni_platform.synchronize()
                 step_latency_ms = (time.perf_counter() - step_start) * 1000.0
                 cumulative_dit_ms += step_latency_ms
+                self._capture_resource_event(
+                    resource_probe_state,
+                    "step_end",
+                    step_index=int(step_idx),
+                    component="transformer_2" if current_model is self.transformer_2 else "transformer",
+                    timestep=float(torch.as_tensor(t).detach().float().cpu().reshape(-1)[0].item()),
+                    step_latency_ms=float(step_latency_ms),
+                    cfg_branches=2 if do_true_cfg else 1,
+                )
                 self._capture_trajectory_probe_checkpoint(
                     probe_state,
                     step_index=step_idx + 1,
@@ -1017,9 +1123,30 @@ class Wan22Pipeline(
                 )
                 pbar.update()
 
+        self._capture_resource_event(resource_probe_state, "denoise_end")
         return latents
 
-    def forward(
+    def forward(self, req: OmniDiffusionRequest, *args: Any, **kwargs: Any) -> DiffusionOutput:
+        """Production entry point; identical to the implementation below except that the
+        opt-in resource-lifetime recorder is always released, even when generation raises."""
+        try:
+            return self._forward_impl(req, *args, **kwargs)
+        finally:
+            self._release_resource_recorder()
+
+    @staticmethod
+    def _release_resource_recorder() -> None:
+        """Idempotent: disable and clear the process-global swap recorder if a probe left it on."""
+        try:
+            from vllm_omni.diffusion.offloader import sequential_backend as _sb
+
+            if _sb._RECORDING_ENABLED:
+                _sb.drain_offload_events()
+                _sb.disable_offload_event_recording()
+        except Exception:  # pragma: no cover - offloader unavailable on some platforms
+            pass
+
+    def _forward_impl(
         self,
         req: OmniDiffusionRequest,
         prompt: str | None = None,
@@ -1118,6 +1245,8 @@ class Wan22Pipeline(
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
+        resource_probe_state = self._build_resource_lifetime_probe_state(req)
+        self._capture_resource_event(resource_probe_state, "request_start", num_inference_steps=int(num_steps))
         if DEBUG_PERF:
             # Sync GPU before timing to ensure accurate measurements
             current_omni_platform.synchronize()
@@ -1141,6 +1270,7 @@ class Wan22Pipeline(
                 raise ValueError(
                     "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
                 )
+        self._capture_resource_event(resource_probe_state, "text_encode_end")
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
@@ -1299,6 +1429,7 @@ class Wan22Pipeline(
             probe_state=probe_state,
             within_step_probe_state=within_step_probe_state,
             phase3_block_probe_state=phase3_block_probe_state,
+            resource_probe_state=resource_probe_state,
         )
 
         # Wan2.2 is prone to out of memory errors when predicting large videos
@@ -1314,6 +1445,7 @@ class Wan22Pipeline(
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
+        self._capture_resource_event(resource_probe_state, "decode_start")
         if DEBUG_PERF:
             _t_decode_start = time.perf_counter()
         if output_type == "latent":
@@ -1335,6 +1467,7 @@ class Wan22Pipeline(
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
+        self._capture_resource_event(resource_probe_state, "decode_end", decode_skipped=bool(skip_vae_decode or output_type == "latent"))
         if DEBUG_PERF:
             current_omni_platform.synchronize()
             _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
@@ -1360,6 +1493,8 @@ class Wan22Pipeline(
         custom_output = self._persist_trajectory_probe(probe_state)
         custom_output.update(self._persist_within_step_probe(within_step_probe_state))
         custom_output.update(self._persist_phase3_block_probe(phase3_block_probe_state))
+        self._capture_resource_event(resource_probe_state, "request_end")
+        custom_output.update(self._persist_resource_lifetime_probe(resource_probe_state))
         if execution_step_limit is not None or skip_vae_decode:
             custom_output["execution_control"] = {
                 "execution_step_limit": execution_step_limit,

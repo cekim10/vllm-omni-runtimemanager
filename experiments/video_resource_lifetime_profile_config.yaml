@@ -1,0 +1,127 @@
+{
+  "experiment_version": "video-resource-lifetime-profile-v1",
+  "output_root": "results/video_resource_lifetime_profile",
+  "allowed_modes": [
+    "cpu",
+    "profile",
+    "analyze"
+  ],
+  "scientific_question": "Within a single Wan2.2 T2V request, do the dominant GPU resources (text encoder, high-noise expert, low-noise expert, VAE) have distinct, mutually exclusive lifetimes large enough that request-centric resource ownership leaves exploitable time or memory slack?",
+  "broken_assumption_candidate": "A request does not continuously need its entire model stack; its dominant resources have distinct lifetimes within the request.",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875
+  },
+  "request": {
+    "prompt_id": "recovery_008",
+    "generation_seed": 9234,
+    "prompt": "Several cyclists crossing a city intersection while pedestrians weave along the sidewalks.",
+    "prompt_sha256": "cb1f235bd11f1c09431d46355ef20c1c83ba9c47dad132e3745443f8f853ccd3",
+    "source": "trusted v3 corrected trajectory recovery_008_9234",
+    "trusted_final_latent_tensor_sha256": "93480201103056bac58660ca63ee42ed071e85e41d5f9d41122bea3de81553ec",
+    "trusted_final_latent_file_sha256": "447318225997f1c3b00b03fc837fea19d7b96c8a22ed5589a880b50fa8ab3fde",
+    "trusted_final_latent_path": "results/video_runtime_state_discovery_v3_corrected/run/trajectories/recovery_008_9234/clean_recovery_008_9234_step040_latents.pt",
+    "v3_manifest_config_hash": "6ac879a3c09fc16e1869ee1d6f19f8ae4a7f663770f9e674f964a9b2a52a5295",
+    "v3_manifest_provenance_hash": "5f52aed2d3862e21370834e63e5c846f6669ead1810215b1236e8cbc2f949814"
+  },
+  "runs_per_mode": {
+    "warmup": 1,
+    "plain": 1,
+    "measured": 1,
+    "reported": "measured (instrumented) run only; warmup discarded; plain (uninstrumented) run is the probe-overhead control"
+  },
+  "offload_modes": [
+    "on",
+    "off"
+  ],
+  "offload_semantics": "on = sequential model-level offload (mutual exclusion between {text_encoder, vae} and {transformer, transformer_2}, and between the two DiTs); off = no offload; if off cannot be initialised on the GPU, that is recorded as INFEASIBLE and is itself a finding",
+  "components": [
+    "text_encoder",
+    "transformer",
+    "transformer_2",
+    "vae"
+  ],
+  "expected_step_split": {
+    "boundary_ratio": 0.875,
+    "num_inference_steps": 40,
+    "transformer_steps": 26,
+    "transformer_2_steps": 14
+  },
+  "time_decomposition": [
+    "text_encode",
+    "text_encoder_swap",
+    "transformer_load_swap",
+    "transformer_compute",
+    "transformer_to_transformer_2_swap",
+    "transformer_2_compute",
+    "vae_load_swap",
+    "vae_decode",
+    "other"
+  ],
+  "memory_decomposition": [
+    "static_component_bytes",
+    "resident_component_bytes_per_event",
+    "memory_allocated",
+    "memory_reserved",
+    "max_memory_allocated_since_last_event",
+    "activation_estimate",
+    "live_bytes_estimate"
+  ],
+  "upper_bounds": {
+    "ub1_time_overlap_absolute": "1 - (transformer_compute + transformer_2_compute) / wall; the latency saving if every non-core interval (text encode, swaps, VAE decode, loop overhead) were removed or hidden; DECISION quantity",
+    "ub1_actionable_swap_share": "total sequential-offload swap time / wall; the part of UB1 that consists of pure transfers; descriptive",
+    "ub2_residency_remaining": "1 - ideal_live_set_peak / actual_peak_allocated of the offload=on run; ideal live set = executing component weights + activation estimate; DECISION quantity. Measures headroom remaining AFTER sequential offload; the saving sequential offload already realises is reported as residency_already_captured_by_runtime and never counts as opportunity",
+    "offload_off_baseline": "descriptive characterization only (feasibility, residency of the full stack); never enters the decision"
+  },
+  "kill_rules": {
+    "ub1_stop_below": 0.1,
+    "ub2_stop_below": 0.2,
+    "ub2_threshold_status": "FROZEN (remaining-headroom definition)",
+    "decision": "STOP_ALL if UB1 < 0.10 and UB2_remaining < 0.20; RESIDENCY_ONLY_TO_OFFLINE_ORACLE if only UB1 < 0.10; TIME_OVERLAP_ONLY_TO_OFFLINE_ORACLE if only UB2_remaining < 0.20; JOINT_OFFLINE_ORACLE if both survive. Any offline oracle must show >= 15-20% before any GPU system work. STOP_ALL closes the diffusion resource-management direction; no further characterization is authorised by that outcome."
+  },
+  "controls": {
+    "final_latent_bit_exact_with_trusted_v3": "the measured request's final latent must be bit-exact with the trusted v3 recovery_008_9234 step-40 latent, proving the profiled workload is the validated generation",
+    "step_split_matches_schedule": true,
+    "decode_not_skipped": true
+  },
+  "descriptive_only": [
+    "cfg positive/negative sequential execution share",
+    "warmup run",
+    "per-step latency series"
+  ],
+  "excluded": [
+    "scheduler implementation",
+    "concurrent or interleaved requests",
+    "component pipeline implementation",
+    "approximation or perturbation",
+    "multi-GPU placement experiments (offline oracle only, later, if authorised)"
+  ],
+  "prohibited_interpretations": [
+    "chaos",
+    "Jacobian instability",
+    "high-gain direction",
+    "Lyapunov instability",
+    "safe-resume certificate",
+    "universal diffusion instability"
+  ],
+  "probe_overhead_control": {
+    "definition": "(measured_client_wall - plain_client_wall) / plain_client_wall for the same offload mode",
+    "valid_below": 0.01,
+    "invalid_above": 0.05,
+    "between": "UB1 recomputed with the plain wall time (core compute from the instrumented run)",
+    "above": "MEASUREMENT INVALID"
+  }
+}
