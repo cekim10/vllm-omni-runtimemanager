@@ -289,7 +289,7 @@ def run_profile(config: dict[str, Any], config_path: Path, root: Path, args: arg
     mode_dir.mkdir(parents=True, exist_ok=True)
     args.enable_cpu_offload = mode == "on"
     request = manifest["request"]
-    document: dict[str, Any] = {"offload_mode": mode, "provenance_hash": prov["provenance_hash"], "manifest_sha256": manifest["manifest_sha256"], "runs": {}, "feasible": None}
+    document: dict[str, Any] = {"offload_mode": mode, "provenance_hash": prov["provenance_hash"], "manifest_sha256": manifest["manifest_sha256"], "runs": {}, "run_order": [], "feasible": None}
     omni = None
     try:
         started = time.perf_counter()
@@ -324,6 +324,7 @@ def run_profile(config: dict[str, Any], config_path: Path, root: Path, args: arg
                 run_record["resource_lifetime_probe_path"] = str(Path(probe_path).relative_to(root)) if Path(probe_path).is_relative_to(root) else str(probe_path)
                 run_record["resource_lifetime_probe_sha256"] = sha256_file(Path(probe_path))
             document["runs"][run_name] = run_record
+            document["run_order"].append(run_name)
         document["feasible"] = True
     except Exception as exc:  # noqa: BLE001 - a failed run is a recorded finding, not a crash; classified below
         document["feasible"] = False
@@ -578,6 +579,20 @@ def analyze_events(profile: dict[str, Any], manifest: dict[str, Any]) -> dict[st
     }
 
 
+def validate_run_plan(document: dict[str, Any], mode: str) -> None:
+    """The frozen run plan is warmup, plain, measured. Persisted JSON is canonical (sorted keys), so the
+    set of runs and the explicitly recorded execution order are checked, never dict key order."""
+    runs = document.get("runs", {})
+    if set(runs) != set(RUN_ORDER):
+        raise GlobalStopError(f"GLOBAL STOP: offload_{mode} runs are not exactly warmup, plain, measured (found {sorted(runs)})")
+    order = document.get("run_order")
+    if order is not None and list(order) != list(RUN_ORDER):
+        raise GlobalStopError(f"GLOBAL STOP: offload_{mode} recorded execution order {order} is not warmup, plain, measured")
+    for run_name in RUN_ORDER:
+        if bool(runs[run_name].get("instrumented")) != (run_name == "measured"):
+            raise GlobalStopError(f"GLOBAL STOP: offload_{mode}/{run_name} instrumentation flag inconsistent with the frozen plan")
+
+
 def offload_on_identity(measured: dict[str, Any]) -> dict[str, Any]:
     """Primary decision-identity gate for the offload=on run.
 
@@ -665,8 +680,7 @@ def run_analyze(config: dict[str, Any], config_path: Path, root: Path) -> dict[s
                              "interpretation": "full model-stack residency does not fit this GPU" if feasibility[mode] == "INFEASIBLE" else "run failed for a non-memory reason; no residency-baseline statement may be made"}
             continue
         feasibility[mode] = "FEASIBLE"
-        if tuple(document["runs"]) != RUN_ORDER:
-            raise GlobalStopError(f"GLOBAL STOP: offload_{mode} run order is not warmup, plain, measured")
+        validate_run_plan(document, mode)
         finals = {}
         for run_name in RUN_ORDER:
             run = document["runs"][run_name]

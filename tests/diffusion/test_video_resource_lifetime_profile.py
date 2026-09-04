@@ -329,3 +329,25 @@ def test_forward_wrapper_releases_recorder_on_exception(monkeypatch):
     with pytest.raises(_Boom):
         Wan22Pipeline.forward(pipeline, object())
     assert sb._RECORDING_ENABLED is False and sb._OFFLOAD_EVENTS == []
+
+
+def test_run_plan_validation_survives_canonical_json_key_order(tmp_path):
+    document = {"runs": {}, "run_order": []}
+    for name in rl.RUN_ORDER:  # executed order: warmup, plain, measured
+        document["runs"][name] = {"instrumented": name == "measured"}
+        document["run_order"].append(name)
+    path = tmp_path / "profile_result.json"
+    rl.atomic_json(path, document)  # canonical JSON sorts keys -> measured, plain, warmup
+    loaded = json.loads(path.read_text())
+    assert list(loaded["runs"]) == ["measured", "plain", "warmup"]
+    rl.validate_run_plan(loaded, "on")  # must not raise
+    legacy = {"runs": loaded["runs"]}  # documents without run_order are validated on set + flags
+    rl.validate_run_plan(legacy, "on")
+    with pytest.raises(rl.GlobalStopError, match="recorded execution order"):
+        rl.validate_run_plan({**loaded, "run_order": ["plain", "warmup", "measured"]}, "on")
+    with pytest.raises(rl.GlobalStopError, match="not exactly"):
+        rl.validate_run_plan({"runs": {"warmup": {}, "measured": {"instrumented": True}}}, "on")
+    bad = json.loads(path.read_text())
+    bad["runs"]["plain"]["instrumented"] = True
+    with pytest.raises(rl.GlobalStopError, match="instrumentation flag"):
+        rl.validate_run_plan(bad, "on")
