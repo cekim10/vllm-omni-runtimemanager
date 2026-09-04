@@ -380,6 +380,18 @@ def test_probe_record_validation_matches_real_resumed_production_semantics():
     mutated = copy.deepcopy(synthetic); mutated[7]["timestep"] = specs[8]["scheduler_timestep"]
     with pytest.raises(killtest.GlobalStopError, match="after_step_007 scheduler timestep"):
         killtest.validate_probe_records(mutated, specs)
+    # Last-bit float32 accelerator differences are accepted; anything beyond the frozen tolerance is not.
+    ulp = float(np.spacing(np.float32(specs[5]["scheduler_timestep"])))
+    accepted = copy.deepcopy(synthetic); accepted[5]["timestep"] = specs[5]["scheduler_timestep"] + ulp
+    killtest.validate_probe_records(accepted, specs)
+    accepted[5]["timestep"] = specs[5]["scheduler_timestep"] - 3 * ulp
+    killtest.validate_probe_records(accepted, specs)
+    rejected = copy.deepcopy(synthetic); rejected[5]["timestep"] = specs[5]["scheduler_timestep"] + 0.01
+    with pytest.raises(killtest.GlobalStopError, match="after_step_005 scheduler timestep"):
+        killtest.validate_probe_records(rejected, specs)
+    rejected = copy.deepcopy(synthetic); rejected[5]["timestep"] = float("nan")
+    with pytest.raises(killtest.GlobalStopError, match="after_step_005 scheduler timestep"):
+        killtest.validate_probe_records(rejected, specs)
     with pytest.raises(killtest.GlobalStopError, match="every requested boundary"):
         killtest.validate_probe_records(synthetic[:-1], specs)
     mutated = copy.deepcopy(synthetic); mutated[3]["latent_path"] = ""
@@ -543,3 +555,21 @@ def test_git_state_ignores_untracked_files_outside_source_scope(monkeypatch):
     assert state["git_dirty"] is False and state["source_dirty_entries"] == []
     killtest.require_committed_source(state)
     assert not any(".venv" in json.dumps(v) for v in state.values())
+
+
+
+def test_timestep_match_policy_is_frozen_and_unambiguous():
+    config, specs = _specs()
+    schedule = killtest.single_flip.scheduler_timesteps_numpy(config)
+    assert killtest.TIMESTEP_MATCH_ABS_TOL == 1e-3
+    gaps = [abs(schedule[i] - schedule[i + 1]) for i in range(len(schedule) - 1)]
+    assert min(gaps) > 100 * killtest.TIMESTEP_MATCH_ABS_TOL  # tolerance cannot bridge two distinct steps
+    for index, expected in enumerate(schedule):
+        assert killtest.timestep_matches(expected, expected, schedule)
+        assert killtest.timestep_matches(expected + 5e-5, expected, schedule)
+        if index > 0:
+            assert not killtest.timestep_matches(expected + 5e-5, schedule[index - 1], schedule)
+    assert not killtest.timestep_matches("x", schedule[0], schedule)
+    assert not killtest.timestep_matches(None, schedule[0], schedule)
+    manifest_policy = killtest.timestep_match_policy()
+    assert manifest_policy["abs_tol"] == killtest.TIMESTEP_MATCH_ABS_TOL and "nearest" in manifest_policy["rule"]

@@ -33,6 +33,11 @@ EXPECTED_SCHEDULER = "WanEulerScheduler"
 EXPECTED_RUNTIME_DTYPE = "torch.bfloat16"
 EXPECTED_INPUT_STORAGE_DTYPE = "<f4"
 EXPECTED_INPUT_RUNTIME_DTYPE = "torch.float32"
+# The runtime computes the shifted schedule in float32 on the accelerator; individual
+# timesteps may differ from the CPU derivation in the last float32 bit (~6e-5 near 1000).
+# Consecutive timesteps are > 2 apart (smallest gap at the end of the schedule), so mapping is unambiguous under this tolerance
+# combined with a nearest-frozen-timestep uniqueness requirement.
+TIMESTEP_MATCH_ABS_TOL = 1e-3
 TRAJECTORIES = ("CLEAN", "PLUS1", "HISTORICAL_PLUS14")
 MODES = ("cpu", "preflight", "phase1", "analyze-phase1", "phase2", "analyze-phase2", "phase3", "analyze-phase3")
 IDENTITY_FORMAT = single_flip.TENSOR_IDENTITY_FORMAT
@@ -216,6 +221,24 @@ def boundary_keys(remaining: int) -> list[str]:
     return ["input", *[f"after_step_{step:03d}" for step in range(1, remaining + 1)]]
 
 
+def timestep_match_policy() -> dict[str, Any]:
+    return {
+        "abs_tol": TIMESTEP_MATCH_ABS_TOL,
+        "rule": "observed runtime timestep must lie within abs_tol of the frozen CPU-derived timestep AND the frozen timestep nearest to the observed value must be the expected one",
+    }
+
+
+def timestep_matches(observed: Any, expected: float, frozen_schedule: list[float]) -> bool:
+    try:
+        value = float(observed)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(value) or abs(value - expected) > TIMESTEP_MATCH_ABS_TOL:
+        return False
+    nearest = min(frozen_schedule, key=lambda item: abs(item - value))
+    return nearest == expected
+
+
 def boundary_specifications(config: dict[str, Any], checkpoint_step: int) -> list[dict[str, Any]]:
     timesteps = single_flip.scheduler_timesteps_numpy(config)
     remaining = int(config["generation"]["num_inference_steps"]) - checkpoint_step
@@ -386,6 +409,7 @@ def anchor_manifest(root: Path, config: dict[str, Any], data: dict[str, Any], pr
         "expected_boundaries": [row["boundary"] for row in boundary_specs],
         "boundary_specifications": boundary_specs,
         "early_late_cutoff": early_late_cutoff(len(boundary_specs)),
+        "timestep_match_policy": timestep_match_policy(),
     }
     manifest["manifest_sha256"] = sha256_bytes(canonical_json(manifest))
     return manifest
@@ -554,6 +578,8 @@ def require_cpu(root: Path, config_path: Path, config: dict[str, Any]) -> tuple[
         raise GlobalStopError("GLOBAL STOP: manifest boundary mapping differs from the frozen scheduler/config")
     if manifest.get("early_late_cutoff") != early_late_cutoff(len(expected_specs)):
         raise GlobalStopError("GLOBAL STOP: manifest early/late cutoff differs from the frozen rule")
+    if manifest.get("timestep_match_policy") != timestep_match_policy():
+        raise GlobalStopError("GLOBAL STOP: manifest timestep match policy differs from the frozen rule")
     expected_states = {
         "CLEAN": data["clean"],
         "PLUS1": data["plus1"],
@@ -586,14 +612,18 @@ def validate_probe_records(records: list[dict[str, Any]], expected_specs: list[d
     """
     if [int(row.get("step_index", -1)) for row in records] != list(range(len(expected_specs))):
         raise GlobalStopError("GLOBAL STOP: trajectory probe did not persist every requested boundary")
+    frozen_schedule = sorted({float(spec["scheduler_timestep"]) for spec in expected_specs})
     for record, expected in zip(records, expected_specs, strict=True):
         if record.get("runtime_dtype") != expected["expected_runtime_dtype"]:
             raise GlobalStopError(
                 f"GLOBAL STOP: {expected['boundary']} runtime dtype {record.get('runtime_dtype')} "
                 f"differs from production semantics {expected['expected_runtime_dtype']}"
             )
-        if record.get("timestep") != expected["scheduler_timestep"]:
-            raise GlobalStopError(f"GLOBAL STOP: {expected['boundary']} scheduler timestep mapping is ambiguous")
+        if not timestep_matches(record.get("timestep"), float(expected["scheduler_timestep"]), frozen_schedule):
+            raise GlobalStopError(
+                f"GLOBAL STOP: {expected['boundary']} scheduler timestep mapping is ambiguous "
+                f"(observed {record.get('timestep')}, frozen {expected['scheduler_timestep']})"
+            )
         if not record.get("latent_path"):
             raise GlobalStopError(f"GLOBAL STOP: {expected['boundary']} has no persisted latent")
 
@@ -850,11 +880,12 @@ def _run_within_step_trace(omni: Any, config: dict[str, Any], source: Any, state
     records = probe.get("records", [])
     if [row.get("boundary") for row in records] != allowed or probe.get("unavailable_boundaries") != ["transformer_raw_output"]:
         raise GlobalStopError("GLOBAL STOP: Phase-2 did not record the actual Wan boundary set")
-    expected_timestep = single_flip.scheduler_timesteps_numpy(config)[selected_step]
+    schedule = single_flip.scheduler_timesteps_numpy(config)
+    expected_timestep = schedule[selected_step]
     if any(
         int(record.get("step_idx", -1)) != local_step
         or int(record.get("absolute_step", -1)) != selected_step
-        or record.get("timestep") != expected_timestep
+        or not timestep_matches(record.get("timestep"), expected_timestep, schedule)
         for record in records
     ):
         raise GlobalStopError("GLOBAL STOP: Phase-2 probe step/timestep mapping differs from the frozen scheduler")
