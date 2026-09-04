@@ -266,7 +266,7 @@ def test_offload_on_zero_swaps_is_measurement_invalid():
     profile["offload_events"] = []
     measured = rl.offload_on_identity(rl.analyze_events(profile, manifest))
     assert measured["schema_valid"] is True  # the profile itself is well-formed ...
-    assert measured["offload_on_identity"] == {"swap_event_count": 0, "components_mutually_exclusive_during_steps": True, "offload_on_valid": False}
+    assert measured["offload_on_identity"]["swap_event_count"] == 0 and measured["offload_on_identity"]["offload_on_valid"] is False
     assert measured["decision_eligible"] is False and measured["ub1_time_overlap"] is None and measured["ub2_residency"] is None
     assert rl.decide(measured["ub1_time_overlap"], measured["ub2_residency"]) == "MEASUREMENT_INVALID"
 
@@ -351,3 +351,58 @@ def test_run_plan_validation_survives_canonical_json_key_order(tmp_path):
     bad["runs"]["plain"]["instrumented"] = True
     with pytest.raises(rl.GlobalStopError, match="instrumentation flag"):
         rl.validate_run_plan(bad, "on")
+
+
+def _with_resident_during_steps(profile, component, nbytes):
+    for event in profile["events"]:
+        if event["event"] == "step_end":
+            event["resident_component_bytes"][component] = nbytes
+            for key in ("memory_allocated", "max_memory_allocated_since_last_event", "memory_reserved", "max_memory_reserved_since_last_event"):
+                event[key] += nbytes
+    return profile
+
+
+def test_vae_resident_during_steps_is_valid_identity_and_counts_as_ub2_headroom():
+    manifest, profile = _valid_profile()
+    vae = 1 * 2**30
+    _with_resident_during_steps(profile, "vae", vae)
+    profile["offload_events"] = profile["offload_events"][:3]  # T5, A, B loads only: the VAE is never swapped in production
+    measured = rl.offload_on_identity(rl.analyze_events(profile, manifest))
+    identity = measured["offload_on_identity"]
+    assert identity["offload_on_valid"] is True and identity["swap_event_count"] == 3
+    assert identity["managed_components_mutually_exclusive_during_steps"] is True
+    assert identity["resident_outside_offload_scope_during_steps"] == ["vae"]
+    assert identity["all_components_mutually_exclusive_during_steps_descriptive"] is False
+    assert measured["decision_eligible"] is True
+    # the resident VAE is inactive weight: remaining residency headroom = vae / peak allocated
+    peak = 28 * 2**30 + int(2.5 * 2**30) + vae
+    assert measured["ub2_residency"] == pytest.approx(vae / peak)
+    assert rl.decide(measured["ub1_time_overlap"], measured["ub2_residency"]) == "STOP_ALL"
+
+
+def test_text_encoder_lingering_during_steps_is_measurement_invalid():
+    manifest, profile = _valid_profile()
+    _with_resident_during_steps(profile, "text_encoder", 11 * 2**30)
+    measured = rl.offload_on_identity(rl.analyze_events(profile, manifest))
+    assert measured["offload_on_identity"]["managed_components_mutually_exclusive_during_steps"] is False
+    assert measured["offload_on_identity"]["offload_on_valid"] is False and measured["decision_eligible"] is False
+    assert rl.decide(measured["ub1_time_overlap"], measured["ub2_residency"]) == "MEASUREMENT_INVALID"
+
+
+def test_executing_expert_not_resident_is_measurement_invalid():
+    manifest, profile = _valid_profile()
+    for event in profile["events"]:
+        if event["event"] == "step_end" and event["component"] == "transformer_2":
+            event["resident_component_bytes"]["transformer_2"] = 0
+            event["resident_component_bytes"]["transformer"] = 28 * 2**30  # wrong expert resident
+    measured = rl.offload_on_identity(rl.analyze_events(profile, manifest))
+    assert measured["offload_on_identity"]["offload_on_valid"] is False
+
+
+def test_config_offload_scope_frozen(tmp_path):
+    config = json.loads(CONFIG_PATH.read_text())
+    config["offload_scope"]["resident_outside_scope"] = []
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps(config))
+    with pytest.raises(rl.GlobalStopError, match="offload scope"):
+        rl.load_config(path)

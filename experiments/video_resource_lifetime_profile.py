@@ -46,6 +46,13 @@ EXPERIMENT_VERSION = "video-resource-lifetime-profile-v1"
 MODES = ("cpu", "profile", "analyze")
 OFFLOAD_MODES = ("on", "off")
 COMPONENTS = ("text_encoder", "transformer", "transformer_2", "vae")
+# Production sequential offload (ModelLevelOffloadBackend.enable -> apply_sequential_offload) makes ONLY
+# {text_encoder} <-> {transformer, transformer_2} (and the two DiTs) mutually exclusive; the VAE is moved
+# to the device once and stays resident. The identity gate therefore checks exclusivity of the managed set
+# and allows exactly the VAE as a resident component outside the offload scope. Its residency during
+# denoising is inactive resident weight and is counted by UB2 as remaining headroom, never excused.
+OFFLOAD_MANAGED_COMPONENTS = ("text_encoder", "transformer", "transformer_2")
+RESIDENT_OUTSIDE_OFFLOAD_SCOPE = ("vae",)
 BOUNDARY_TIMESTEP = 875.0
 EXPECTED_STEPS = 40
 EXPECTED_TRANSFORMER_STEPS = 26
@@ -89,6 +96,9 @@ def load_config(path: Path) -> dict[str, Any]:
         raise GlobalStopError("GLOBAL STOP: experiment version or modes changed")
     if tuple(config.get("offload_modes", ())) != OFFLOAD_MODES or tuple(config.get("components", ())) != COMPONENTS:
         raise GlobalStopError("GLOBAL STOP: offload modes or component set changed")
+    scope = config.get("offload_scope", {})
+    if tuple(scope.get("managed_components", ())) != OFFLOAD_MANAGED_COMPONENTS or tuple(scope.get("resident_outside_scope", ())) != RESIDENT_OUTSIDE_OFFLOAD_SCOPE:
+        raise GlobalStopError("GLOBAL STOP: offload scope (managed / resident-outside-scope components) changed")
     rules = config.get("kill_rules", {})
     if rules.get("ub1_stop_below") != UB1_STOP_BELOW or rules.get("ub2_stop_below") != UB2_STOP_BELOW:
         raise GlobalStopError("GLOBAL STOP: preregistered kill thresholds changed")
@@ -519,10 +529,21 @@ def analyze_events(profile: dict[str, Any], manifest: dict[str, Any]) -> dict[st
     already_captured = None if owned_share is None else 1.0 - owned_share
     ideal_share = _finite_ratio(peak_live, request_owned)
     stack_vs_ideal = None if ideal_share is None else 1.0 - ideal_share
+    step_events = [row_event for row_event in events if row_event["event"] == "step_end"]
     exclusive = all(
         sum(1 for name in COMPONENTS if (row_event["resident_component_bytes"].get(name) or 0) > 0) <= 1
-        for row_event in events if row_event["event"] == "step_end"
+        for row_event in step_events
     )
+    managed_exclusive = all(
+        sum(1 for name in OFFLOAD_MANAGED_COMPONENTS if (row_event["resident_component_bytes"].get(name) or 0) > 0) == 1
+        and (row_event["resident_component_bytes"].get(row_event["component"]) or 0) > 0
+        for row_event in step_events
+    )
+    outside_scope_resident = sorted({
+        name for row_event in step_events for name in COMPONENTS
+        if name not in OFFLOAD_MANAGED_COMPONENTS and (row_event["resident_component_bytes"].get(name) or 0) > 0
+    })
+    only_allowed_outside_scope = all(name in RESIDENT_OUTSIDE_OFFLOAD_SCOPE for name in outside_scope_resident)
     return {
         "schema": schema,
         "schema_valid": True,
@@ -568,6 +589,9 @@ def analyze_events(profile: dict[str, Any], manifest: dict[str, Any]) -> dict[st
             "peak_memory_reserved": peak_reserved,
             "peak_resident_weight_bytes": peak_resident_total,
             "components_mutually_exclusive_during_steps": exclusive,
+            "managed_components_mutually_exclusive_during_steps": managed_exclusive,
+            "resident_outside_offload_scope_during_steps": outside_scope_resident,
+            "only_allowed_components_resident_outside_scope": only_allowed_outside_scope,
             "device": profile.get("device"),
             "live_rows": live_rows,
         },
@@ -596,16 +620,30 @@ def validate_run_plan(document: dict[str, Any], mode: str) -> None:
 def offload_on_identity(measured: dict[str, Any]) -> dict[str, Any]:
     """Primary decision-identity gate for the offload=on run.
 
-    The label 'offload_on' is never trusted. The run must show artifact evidence that sequential
-    offload actually executed: at least one recorded swap AND component mutual exclusion during
-    every denoising step. Otherwise the measurement is not the preregistered baseline and no
-    decision quantity survives (UB1/UB2 -> None, MEASUREMENT_INVALID)."""
+    The label 'offload_on' is never trusted. The run must show artifact evidence that the production
+    sequential offload actually executed: at least one recorded swap, exactly one offload-managed
+    component ({text_encoder, transformer, transformer_2}) resident during every denoising step and it
+    must be the executing expert, and no component outside the offload scope other than the VAE
+    resident during steps. Otherwise the measurement is not the preregistered baseline and no
+    decision quantity survives (UB1/UB2 -> None, MEASUREMENT_INVALID).
+
+    Amendment (2026-09-04, before any decision was read): the first version required mutual exclusion
+    of all four components; production offload never offloads the VAE, so that gate rejected the real
+    runtime. VAE residency during steps is inactive resident weight and enters UB2 as remaining headroom."""
     if not measured.get("schema_valid"):
         return measured
     swap_count = int(measured["time"]["swap_event_count"])
-    exclusive = bool(measured["memory"]["components_mutually_exclusive_during_steps"])
-    valid = swap_count >= 1 and exclusive
-    identity = {"swap_event_count": swap_count, "components_mutually_exclusive_during_steps": exclusive, "offload_on_valid": valid}
+    managed_exclusive = bool(measured["memory"]["managed_components_mutually_exclusive_during_steps"])
+    outside_ok = bool(measured["memory"]["only_allowed_components_resident_outside_scope"])
+    valid = swap_count >= 1 and managed_exclusive and outside_ok
+    identity = {
+        "swap_event_count": swap_count,
+        "managed_components_mutually_exclusive_during_steps": managed_exclusive,
+        "resident_outside_offload_scope_during_steps": measured["memory"]["resident_outside_offload_scope_during_steps"],
+        "only_allowed_components_resident_outside_scope": outside_ok,
+        "all_components_mutually_exclusive_during_steps_descriptive": bool(measured["memory"]["components_mutually_exclusive_during_steps"]),
+        "offload_on_valid": valid,
+    }
     if valid:
         return {**measured, "offload_on_identity": identity}
     return {**measured, "offload_on_identity": identity, "decision_eligible": False, **{key: None for key in INVALID_RESULT_KEYS}}
@@ -743,7 +781,7 @@ def run_analyze(config: dict[str, Any], config_path: Path, root: Path) -> dict[s
         gate("R-A7 kill thresholds unchanged", manifest["kill_rules"]["ub1_stop_below"] == UB1_STOP_BELOW and manifest["kill_rules"]["ub2_stop_below"] == UB2_STOP_BELOW, manifest["kill_rules"], required=True),
         gate("R-A8 probe-overhead control valid for offload=on (instrumented vs plain wall time)", controls["on"]["probe_overhead"]["status"] in ("VALID", "VALID_WITH_CORRECTION"), controls["on"]["probe_overhead"], required=True),
         gate("R-A11 decision computed from the measured offload=on run only (UB1 absolute, UB2 remaining after runtime offload)", primary != "MEASUREMENT_INVALID", decision_inputs["on"], required=True),
-        gate("R-A12 offload=on run identity: >=1 recorded swap AND component mutual exclusion during every step", bool(measured_on.get("offload_on_identity", {}).get("offload_on_valid")), measured_on.get("offload_on_identity"), required=True),
+        gate("R-A12 offload=on run identity: >=1 recorded swap AND exactly the executing offload-managed component resident per step AND only the VAE resident outside the offload scope", bool(measured_on.get("offload_on_identity", {}).get("offload_on_valid")), measured_on.get("offload_on_identity"), required=True),
         gate("R-A9 no scheduler/concurrency/approximation artefacts present", not any((root / name).exists() for name in ("scheduler", "concurrency", "oracle")), None, required=True),
         gate("R-A10 provenance/manifest hash-bound", True, {"manifest_sha256": manifest["manifest_sha256"]}, required=True),
     ]

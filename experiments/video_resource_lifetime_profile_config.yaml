@@ -123,5 +123,18 @@
     "invalid_above": 0.05,
     "between": "UB1 recomputed with the plain wall time (core compute from the instrumented run)",
     "above": "MEASUREMENT INVALID"
+  },
+  "offload_scope": {
+    "managed_components": [
+      "text_encoder",
+      "transformer",
+      "transformer_2"
+    ],
+    "resident_outside_scope": [
+      "vae"
+    ],
+    "source": "vllm_omni/diffusion/offloader/sequential_backend.py::ModelLevelOffloadBackend.enable moves encoders and VAEs to the device, then apply_sequential_offload(dit_modules=[transformer, transformer_2], encoder_modules=[text_encoder]); the VAE is never an offload target",
+    "identity_gate": "offload=on is valid iff >=1 recorded swap AND exactly one managed component is resident during every step and it is the executing expert AND no component outside the managed set other than the VAE is resident during steps",
+    "amendment": "2026-09-04: the first preregistered identity gate required mutual exclusion of all four components and rejected the real runtime (VAE always resident; 3 swaps recorded). Amended from code semantics before any UB value was read; UB1/UB2 formulas and thresholds unchanged. VAE residency during steps enters UB2 as remaining headroom."
   }
 }
