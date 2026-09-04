@@ -1187,6 +1187,34 @@ def test_phase3_boundary_key_set_fails_closed(tmp_path, monkeypatch, mutation):
         _analyze_phase3(bundle, tmp_path)
 
 
+def test_phase3_boundary_set_audit_reports_concrete_labels():
+    expected = ["a", "b", "c"]
+    clean = killtest.phase3_boundary_set_audit(["a", "b", "c"], expected)
+    assert clean == {"recorded_count": 3, "expected_count": 3, "missing": [], "duplicate": [], "unexpected": []}
+    assert killtest.phase3_boundary_set_audit(["a", "c"], expected)["missing"] == ["b"]
+    assert killtest.phase3_boundary_set_audit(["a", "b", "c", "a"], expected)["duplicate"] == ["a"]
+    assert killtest.phase3_boundary_set_audit(["a", "b", "c", "zzz"], expected)["unexpected"] == ["zzz"]
+    assert killtest.phase3_boundary_set_audit(["a", "b", None], expected)["unexpected"] == ["None"]
+    audit = killtest.phase3_boundary_set_audit(["x", "x"], expected)
+    assert audit["missing"] == expected and audit["duplicate"] == ["x"] and audit["unexpected"] == ["x"]
+
+
+def test_phase3_boundary_gates_carry_computed_audit_not_expected_list(tmp_path, monkeypatch):
+    bundle = _synthetic_phase3(tmp_path, monkeypatch)
+    result = _analyze_phase3(bundle, tmp_path)
+    gates = {row["name"]: row for row in result["gates"]}
+    branches = sorted(f"{name}/{branch}" for name in killtest.TRAJECTORIES for branch in killtest.PHASE3_BRANCHES)
+    for number, key in ((12, "missing"), (13, "duplicate"), (14, "unexpected")):
+        gate = gates[f"P3-G{number}"]
+        assert gate["status"] == "PASS"
+        evidence = gate["evidence"]
+        assert evidence != list(killtest.PHASE3_FIXED_BOUNDARIES)
+        assert evidence["audited_branches"] == branches
+        assert evidence["expected_boundary_count"] == len(killtest.PHASE3_FIXED_BOUNDARIES)
+        assert evidence[key] == {branch: [] for branch in branches}
+        assert evidence["recorded_counts"] == {branch: len(killtest.PHASE3_FIXED_BOUNDARIES) for branch in branches}
+
+
 @pytest.mark.parametrize("trajectory", killtest.TRAJECTORIES)
 def test_phase3_entry_must_equal_phase2_transformer_input(tmp_path, monkeypatch, trajectory):
     bundle = _synthetic_phase3(tmp_path, monkeypatch)

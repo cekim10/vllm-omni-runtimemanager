@@ -446,6 +446,29 @@ class Wan22Pipeline(
     def current_timestep(self):
         return self._current_timestep
 
+    @staticmethod
+    def _resolve_execution_step_limit(req: OmniDiffusionRequest, available_steps: int) -> int | None:
+        """Optional bounded execution: ``extra_args.execution_step_limit`` local scheduler updates."""
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        raw = extra_args.get("execution_step_limit")
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValueError("execution_step_limit must be a positive integer")
+        if raw < 1 or raw > available_steps:
+            raise ValueError(f"execution_step_limit must be in [1, {available_steps}], got {raw}")
+        return raw
+
+    @staticmethod
+    def _resolve_skip_vae_decode(req: OmniDiffusionRequest) -> bool:
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        raw = extra_args.get("skip_vae_decode", False)
+        if raw is None or raw is False:
+            return False
+        if raw is not True:
+            raise ValueError("skip_vae_decode must be a boolean")
+        return True
+
     def _build_trajectory_probe_state(
         self,
         req: OmniDiffusionRequest,
@@ -1141,6 +1164,12 @@ class Wan22Pipeline(
             self.scheduler.set_begin_index(resume_step_index)
         if resume_step_index > 0:
             timesteps = timesteps[resume_step_index:]
+        execution_step_limit = self._resolve_execution_step_limit(req, len(timesteps))
+        if execution_step_limit is not None:
+            # Bounded execution: run exactly `execution_step_limit` scheduler updates from the
+            # resume point and stop. Nothing before the truncation point changes.
+            timesteps = timesteps[:execution_step_limit]
+        skip_vae_decode = self._resolve_skip_vae_decode(req)
 
         self._num_timesteps = len(timesteps)
         boundary_timestep = None
@@ -1289,6 +1318,10 @@ class Wan22Pipeline(
             _t_decode_start = time.perf_counter()
         if output_type == "latent":
             output = latents
+        elif skip_vae_decode:
+            # Bounded-execution probes only need the persisted latents; emit a clearly
+            # non-video placeholder so no decoded frames can be mistaken for a result.
+            output = torch.zeros((1, 3, 1, 8, 8), device=latents.device, dtype=torch.float32)
         else:
             latents = latents.to(self.vae.dtype)
             latents_mean = (
@@ -1327,6 +1360,13 @@ class Wan22Pipeline(
         custom_output = self._persist_trajectory_probe(probe_state)
         custom_output.update(self._persist_within_step_probe(within_step_probe_state))
         custom_output.update(self._persist_phase3_block_probe(phase3_block_probe_state))
+        if execution_step_limit is not None or skip_vae_decode:
+            custom_output["execution_control"] = {
+                "execution_step_limit": execution_step_limit,
+                "executed_local_steps": int(len(timesteps)),
+                "resume_step_index": int(resume_step_index),
+                "vae_decode_skipped": bool(skip_vae_decode),
+            }
         return DiffusionOutput(
             output=output,
             custom_output=custom_output,

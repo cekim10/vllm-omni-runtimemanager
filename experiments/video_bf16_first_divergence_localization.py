@@ -2137,6 +2137,34 @@ def _phase3_cfg_classification(raw_exact: dict[str, bool]) -> str:
     return "MERGED_AT_CFG_COMBINATION"
 
 
+def phase3_boundary_set_audit(names: list[Any], expected_boundaries: list[str]) -> dict[str, Any]:
+    """Exact key-set audit of one branch's recorded boundary labels against the frozen expected list.
+
+    Returns the concrete missing / duplicate / unexpected labels so the gate evidence is the
+    computed result, not a restatement of the expected list.
+    """
+    counts: dict[Any, int] = {}
+    for label in names:
+        counts[label] = counts.get(label, 0) + 1
+    return {
+        "recorded_count": len(names),
+        "expected_count": len(expected_boundaries),
+        "missing": [label for label in expected_boundaries if label not in counts],
+        "duplicate": [label for label in expected_boundaries if counts.get(label, 0) > 1]
+        + sorted(str(label) for label, count in counts.items() if count > 1 and label not in expected_boundaries),
+        "unexpected": sorted(str(label) for label in counts if label not in expected_boundaries),
+    }
+
+
+def _boundary_audit_evidence(audit: dict[str, dict[str, Any]], key: str, expected_boundaries: list[str]) -> dict[str, Any]:
+    return {
+        "expected_boundary_count": len(expected_boundaries),
+        "audited_branches": sorted(audit),
+        key: {branch: row[key] for branch, row in sorted(audit.items())},
+        "recorded_counts": {branch: row["recorded_count"] for branch, row in sorted(audit.items())},
+    }
+
+
 def analyze_phase3_artifacts(
     root: Path,
     config: dict[str, Any],
@@ -2174,6 +2202,7 @@ def analyze_phase3_artifacts(
     architecture_valid = True
     branch_valid = True
     relative_paths = True
+    boundary_set_audit: dict[str, dict[str, Any]] = {}
     # ---- structural validation of every record before any tensor is loaded
     for name in TRAJECTORIES:
         result = trajectories[name]
@@ -2186,7 +2215,9 @@ def analyze_phase3_artifacts(
             architecture_valid &= all(architecture.get(key) == value for key, value in expected_architecture.items())
             rows = branch_result.get("records", [])
             names = [row.get("boundary") for row in rows]
-            if set(names) != set(expected_boundaries) or len(names) != len(set(names)):
+            audit = phase3_boundary_set_audit(names, expected_boundaries)
+            boundary_set_audit[f"{name}/{branch}"] = audit
+            if audit["missing"] or audit["duplicate"] or audit["unexpected"]:
                 raise GlobalStopError("GLOBAL STOP: Phase-3 block boundary set is missing, duplicate, or unexpected")
             by_boundary = {row["boundary"]: row for row in rows}
             ordered = [by_boundary[boundary] for boundary in expected_boundaries]
@@ -2336,6 +2367,9 @@ def analyze_phase3_artifacts(
     )
     pairwise_valid = len(pairwise_rows) == len(PHASE3_BRANCHES) * len(expected_boundaries) * len(pairings)
     no_float_binding = not _binding_contains_float_reduction(manifest["trusted_phase1"]) and not _binding_contains_float_reduction(manifest["trusted_phase2"])
+    boundary_audit_complete = set(boundary_set_audit) == {
+        f"{name}/{branch}" for name in TRAJECTORIES for branch in PHASE3_BRANCHES
+    }
     gates = [
         _p3_gate(1, "committed source / clean provenance", not prov.get("source_dirty_entries"), prov),
         _p3_gate(2, "selected_step exactly 10", trace["selected_step"] == 10, trace["selected_step"]),
@@ -2344,9 +2378,9 @@ def analyze_phase3_artifacts(
         *[_p3_gate(5 + index, f"Phase3 {name} entry equals Phase2 transformer_input", all(phase2_entry_matches[name].values()), phase2_entry_matches[name]) for index, name in enumerate(TRAJECTORIES)],
         *[_p3_gate(8 + index, f"Phase3 {name} exit equals Phase2 guidance_combined_output", phase2_exit_matches[name], phase2_exit_matches[name]) for index, name in enumerate(TRAJECTORIES)],
         _p3_gate(11, "exact block count/order matches frozen manifest", architecture_valid, expected_architecture),
-        _p3_gate(12, "no missing expected block boundary", True, expected_boundaries),
-        _p3_gate(13, "no duplicate block boundary", True, expected_boundaries),
-        _p3_gate(14, "no unexpected block boundary", True, expected_boundaries),
+        _p3_gate(12, "no missing expected block boundary", boundary_audit_complete and not any(row["missing"] for row in boundary_set_audit.values()), _boundary_audit_evidence(boundary_set_audit, "missing", expected_boundaries)),
+        _p3_gate(13, "no duplicate block boundary", boundary_audit_complete and not any(row["duplicate"] for row in boundary_set_audit.values()), _boundary_audit_evidence(boundary_set_audit, "duplicate", expected_boundaries)),
+        _p3_gate(14, "no unexpected block boundary", boundary_audit_complete and not any(row["unexpected"] for row in boundary_set_audit.values()), _boundary_audit_evidence(boundary_set_audit, "unexpected", expected_boundaries)),
         _p3_gate(15, "CFG branch identity valid", branch_valid, list(PHASE3_BRANCHES)),
         _p3_gate(16, "tensor shape/dtype semantics valid", shape_dtype_valid, expected_shapes),
         _p3_gate(17, "canonical artifact identities valid", artifact_valid, "all Phase-3 artifacts independently loaded and re-identified"),

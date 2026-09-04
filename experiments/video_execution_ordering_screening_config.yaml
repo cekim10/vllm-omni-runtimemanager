@@ -1,0 +1,222 @@
+{
+  "experiment_version": "video-execution-ordering-screening-v1",
+  "output_root": "results/video_execution_ordering_screening",
+  "allowed_modes": [
+    "cpu",
+    "validate",
+    "screening",
+    "analyze"
+  ],
+  "scientific_question": "Does reconstruction-error ordering (runtime-BF16 state relative L2 to CLEAN) reliably predict one-step execution-error ordering (next-step latent relative L2 to the CLEAN next-step latent) across realistic serialized checkpoint representations?",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875
+  },
+  "checkpoint_steps": [
+    10,
+    20,
+    30
+  ],
+  "trusted_v3": {
+    "root": "results/video_runtime_state_discovery_v3_corrected",
+    "config_file": "results/video_runtime_state_discovery_v3_corrected/preregistered_config.yaml",
+    "config_file_sha256": "12388addb6a90be52ff9baea54d565732a4ba568ecef5517f86410f301874d39",
+    "provenance_file": "results/video_runtime_state_discovery_v3_corrected/run_provenance.json",
+    "provenance_file_sha256": "39ae614a6386f6bcc21333ab4f3b20aa638986d99990ef435667ee39c287f5c0",
+    "config_hash": "6ac879a3c09fc16e1869ee1d6f19f8ae4a7f663770f9e674f964a9b2a52a5295",
+    "provenance_hash": "5f52aed2d3862e21370834e63e5c846f6669ead1810215b1236e8cbc2f949814",
+    "scheduler": "WanEulerScheduler",
+    "runtime_dtype": "torch.bfloat16",
+    "trajectory_ids": [
+      "recovery_000_1234",
+      "recovery_002_3234",
+      "recovery_003_4234",
+      "recovery_004_5234",
+      "recovery_005_6234",
+      "recovery_006_7234",
+      "recovery_008_9234",
+      "recovery_009_10234",
+      "recovery_010_11234",
+      "recovery_011_12234",
+      "recovery_012_13234",
+      "recovery_013_14234"
+    ],
+    "required_states": [
+      9,
+      10,
+      19,
+      20,
+      29,
+      30
+    ]
+  },
+  "trusted_phase1": {
+    "root": "results/video_bf16_first_divergence_localization",
+    "anchor_manifest": "anchor_manifest.json",
+    "anchor_manifest_sha256": "da58f143ec0c51e02e08a49250e633c658ee57021e6715db4315d571ec87ebfc",
+    "trace_manifest": "phase1/trace_manifest.json",
+    "trace_manifest_sha256": "e1eaecf852449e2037e0d26f36e422525bf8aac45eb580f3e89f987741b65286",
+    "anchor_prompt_id": "recovery_008",
+    "anchor_generation_seed": 9234,
+    "anchor_checkpoint_step": 10,
+    "validation_boundary": "after_step_001",
+    "trajectories": [
+      "CLEAN",
+      "PLUS1",
+      "HISTORICAL_PLUS14"
+    ]
+  },
+  "candidates": [
+    {
+      "name": "bf16",
+      "tier": "control",
+      "format": "bf16_bits",
+      "bits": 16,
+      "group_count": null,
+      "role": "exact control; its one-step run is an independent CLEAN repeat (determinism gate)"
+    },
+    {
+      "name": "fp16",
+      "tier": "control",
+      "format": "fp16",
+      "bits": 16,
+      "group_count": null,
+      "role": "anomaly-family control; descriptive only"
+    },
+    {
+      "name": "int8_per_tensor",
+      "tier": "int8",
+      "format": "grouped_symmetric_v1",
+      "bits": 8,
+      "group_count": 1
+    },
+    {
+      "name": "int8_group4",
+      "tier": "int8",
+      "format": "grouped_symmetric_v1",
+      "bits": 8,
+      "group_count": 4
+    },
+    {
+      "name": "int8_group8",
+      "tier": "int8",
+      "format": "grouped_symmetric_v1",
+      "bits": 8,
+      "group_count": 8
+    },
+    {
+      "name": "int8_group16",
+      "tier": "int8",
+      "format": "grouped_symmetric_v1",
+      "bits": 8,
+      "group_count": 16
+    },
+    {
+      "name": "int4_per_tensor",
+      "tier": "int4",
+      "format": "grouped_symmetric_v1",
+      "bits": 4,
+      "group_count": 1
+    },
+    {
+      "name": "int4_group4",
+      "tier": "int4",
+      "format": "grouped_symmetric_v1",
+      "bits": 4,
+      "group_count": 4
+    },
+    {
+      "name": "int4_group8",
+      "tier": "int4",
+      "format": "grouped_symmetric_v1",
+      "bits": 4,
+      "group_count": 8
+    },
+    {
+      "name": "int4_group16",
+      "tier": "int4",
+      "format": "grouped_symmetric_v1",
+      "bits": 4,
+      "group_count": 16
+    }
+  ],
+  "quantizer": {
+    "format": "grouped_symmetric_v1",
+    "partition": "equal_channel",
+    "rounding": "round-half-to-even",
+    "scale_rule": "max|x| / (2^(bits-1)-1) per group; 1.0 if the group is all zero",
+    "reference_implementation": "experiments/video_propagation_aware_checkpoint_killtest.py::_quantize_values/_encode_grouped (torch); this experiment re-implements it in numpy and the CPU tests cross-check both"
+  },
+  "primary": {
+    "x": "relative L2 between the runtime-BF16 candidate state and the runtime-BF16 CLEAN state, computed in float64 on the persisted candidate artifact",
+    "y": "relative L2 between the candidate next-step latent and the CLEAN next-step latent after exactly one scheduler update from the same absolute step, computed in float64 on the persisted artifacts",
+    "primary_tiers": [
+      "int8",
+      "int4"
+    ],
+    "pair_eligibility": {
+      "same_tier": true,
+      "x_ratio_max": 2.0,
+      "both_x_positive": true
+    },
+    "meaningful_reversal": {
+      "x_strictly_less": true,
+      "y_ratio_min": 2.0,
+      "y_abs_floor": 0.0001,
+      "floor_meaning": "excludes numerically trivial ranking flips; not a quality threshold"
+    },
+    "continue_rule": {
+      "min_distinct_prompts": 4,
+      "min_distinct_steps": 2,
+      "min_distinct_pair_types": 2
+    },
+    "decision_values": [
+      "CONTINUE",
+      "NO_GO"
+    ],
+    "cross_tier_pairs": "descriptive only",
+    "controls": "bf16 and fp16 are descriptive/control only and never enter eligibility or the decision",
+    "violation_rate": "descriptive only"
+  },
+  "secondary": [
+    "next_latent_bit_exact",
+    "next_latent_mse",
+    "next_latent_changed_element_fraction",
+    "state_mse",
+    "state_changed_element_fraction",
+    "serialized_bytes"
+  ],
+  "validation": {
+    "anchor_triple": "one-step execution from the Phase-1 CLEAN/PLUS1/HISTORICAL_PLUS14 runtime inputs at recovery_008 step 10 must be bit-exact with the Phase-1 after_step_001 artifacts",
+    "v3_transitions": "for every prompt and every checkpoint step k in {10,20,30}, one-step execution from the trusted v3 state k-1 must reproduce the trusted v3 state k bit-exactly",
+    "any_failure": "GLOBAL STOP: SCREENING INVALID"
+  },
+  "excluded": [
+    "oracle / storage headroom",
+    "final-video quality",
+    "block-0 localization",
+    "additional perturbation families",
+    "seed or prompt expansion"
+  ],
+  "prohibited_interpretations": [
+    "chaos",
+    "Jacobian instability",
+    "high-gain direction",
+    "Lyapunov instability",
+    "safe-resume certificate",
+    "universal diffusion instability"
+  ]
+}
