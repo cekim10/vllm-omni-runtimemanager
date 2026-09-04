@@ -2,11 +2,19 @@
   "experiment_version": "video-bf16-first-divergence-localization-v1",
   "output_root": "results/video_bf16_first_divergence_localization",
   "trusted_single_flip_config": "experiments/video_bf16_single_flip_killtest_config.yaml",
+  "trusted_phase1_root": "results/video_bf16_first_divergence_localization",
   "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
   "scheduler": {"name": "WanEulerScheduler", "sample_solver": "euler", "num_train_timesteps": 1000, "flow_shift": 12.0},
   "generation": {"height": 480, "width": 832, "num_frames": 33, "num_inference_steps": 40, "guidance_scale": 4.0, "fps": 16.0, "boundary_ratio": 0.875},
   "anchor": {"prompt_id": "recovery_008", "generation_seed": 9234, "checkpoint_step": 10, "critical_flat_index": 516515},
-  "phase2": {"selected_step": null, "allowed_boundaries": ["latent_entering_step", "transformer_input", "transformer_raw_output", "guidance_combined_output", "scheduler_input", "scheduler_output"]},
+  "phase2": {
+    "selected_step": 10,
+    "entry_phase1_boundary": "input",
+    "exit_phase1_boundary": "after_step_001",
+    "allowed_boundaries": ["latent_entering_step", "transformer_input", "transformer_raw_output", "guidance_combined_output", "scheduler_input", "scheduler_output"],
+    "available_boundaries": ["latent_entering_step", "transformer_input", "guidance_combined_output", "scheduler_input", "scheduler_output"],
+    "unavailable_boundaries": ["transformer_raw_output"]
+  },
   "phase3": {"enabled": false, "auto_expand": false},
   "controls": {"repeats_per_trajectory": 3},
   "allowed_modes": ["cpu", "preflight", "phase1", "analyze-phase1", "phase2", "analyze-phase2", "phase3", "analyze-phase3"]

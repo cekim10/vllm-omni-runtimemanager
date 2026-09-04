@@ -52,6 +52,7 @@ CPU_REQUIRED_GATES = (
     "G8 coordinate 516515 historical distance exactly +14 adjacent BF16 steps",
     "G9 Euler scheduler/resume semantics exact",
     "G10 model/scheduler/timestep provenance frozen",
+    "G23 phase-2 step explicitly frozen before execution",
     "G24 no automatic phase-3 expansion",
     "G25 no FP32 threshold search",
     "G26 no trusted namespace mutation",
@@ -67,6 +68,42 @@ PREFLIGHT_REQUIRED_GATES = (
     "G15b PLUS1 final equals trusted PLUS1",
     "G15c historical final equals trusted historical",
 )
+PHASE2_AVAILABLE_BOUNDARIES = (
+    "latent_entering_step",
+    "transformer_input",
+    "guidance_combined_output",
+    "scheduler_input",
+    "scheduler_output",
+)
+PHASE2_UNAVAILABLE_BOUNDARIES = ("transformer_raw_output",)
+PHASE2_REQUIRED_GATES = tuple(f"P2-G{number}" for number in range(1, 26))
+PHASE2_BOUNDARY_SEMANTICS = {
+    "latent_entering_step": {
+        "tensor": "latent state entering the selected resumed denoising update",
+        "guidance_position": "before guidance",
+        "consumed_by_next_operation": "used to construct transformer_input and retained as scheduler_input",
+    },
+    "transformer_input": {
+        "tensor": "latent_model_input after conversion to the selected Wan transformer dtype",
+        "guidance_position": "before guidance",
+        "consumed_by_next_operation": "consumed by the positive and, when enabled, negative transformer calls",
+    },
+    "guidance_combined_output": {
+        "tensor": "noise prediction returned after classifier-free guidance combination",
+        "guidance_position": "after guidance",
+        "consumed_by_next_operation": "consumed by WanEulerScheduler as model_output",
+    },
+    "scheduler_input": {
+        "tensor": "pre-update latent state passed to WanEulerScheduler as sample",
+        "guidance_position": "after guidance and before scheduler update",
+        "consumed_by_next_operation": "consumed by WanEulerScheduler as sample",
+    },
+    "scheduler_output": {
+        "tensor": "updated latent state returned by WanEulerScheduler",
+        "guidance_position": "after guidance and scheduler update",
+        "consumed_by_next_operation": "consumed by the next denoising update or final VAE decode",
+    },
+}
 
 
 def canonical_json(value: Any) -> bytes:
@@ -146,7 +183,34 @@ def load_config(path: Path) -> dict[str, Any]:
         raise GlobalStopError("GLOBAL STOP: at least three deterministic control repeats are required")
     if config["phase3"] != {"enabled": False, "auto_expand": False}:
         raise GlobalStopError("GLOBAL STOP: phase 3 must stay disabled and non-automatic")
+    validate_phase2_config(config)
     return config
+
+
+def validate_phase2_config(config: dict[str, Any]) -> None:
+    phase2 = config.get("phase2")
+    if not isinstance(phase2, dict):
+        raise GlobalStopError("GLOBAL STOP: phase 2 configuration is absent")
+    expected = {
+        "selected_step": 10,
+        "entry_phase1_boundary": "input",
+        "exit_phase1_boundary": "after_step_001",
+        "allowed_boundaries": [
+            "latent_entering_step",
+            "transformer_input",
+            "transformer_raw_output",
+            "guidance_combined_output",
+            "scheduler_input",
+            "scheduler_output",
+        ],
+        "available_boundaries": list(PHASE2_AVAILABLE_BOUNDARIES),
+        "unavailable_boundaries": list(PHASE2_UNAVAILABLE_BOUNDARIES),
+    }
+    if phase2 != expected:
+        raise GlobalStopError("GLOBAL STOP: Phase-2 selected step or operation-boundary freeze changed")
+    trusted_root = config.get("trusted_phase1_root")
+    if trusted_root != "results/video_bf16_first_divergence_localization":
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 root changed")
 
 
 def validate_output_namespace(config: dict[str, Any], output_dir: Path) -> None:
@@ -279,6 +343,9 @@ def early_late_cutoff(boundary_count: int) -> dict[str, Any]:
 def phase2_selection_mapping(
     config: dict[str, Any], manifest: dict[str, Any], selected_step: int
 ) -> dict[str, Any]:
+    validate_phase2_config(config)
+    if selected_step != 10:
+        raise GlobalStopError("GLOBAL STOP: Phase-2 selected_step must remain frozen at 10")
     checkpoint_step = int(manifest["anchor"]["checkpoint_step"])
     final_step = int(config["generation"]["num_inference_steps"])
     if not checkpoint_step <= selected_step < final_step:
@@ -289,13 +356,36 @@ def phase2_selection_mapping(
     entry_spec = specs.get(entry_boundary)
     if entry_spec is None or int(entry_spec["absolute_diffusion_step_index"]) != selected_step:
         raise GlobalStopError("GLOBAL STOP: phase-2 selected_step does not map to one frozen Phase-1 boundary")
+    exit_boundary = f"after_step_{resumed_update_index + 1:03d}"
+    exit_spec = specs.get(exit_boundary)
+    if (
+        entry_boundary != config["phase2"]["entry_phase1_boundary"]
+        or exit_boundary != config["phase2"]["exit_phase1_boundary"]
+        or exit_spec is None
+        or int(exit_spec["absolute_diffusion_step_index"]) != selected_step + 1
+    ):
+        raise GlobalStopError("GLOBAL STOP: Phase-2 entry/exit mapping differs from the trusted Phase-1 plan")
     timesteps = single_flip.scheduler_timesteps_numpy(config)
     return {
         "selected_absolute_diffusion_step_index": selected_step,
         "selected_resumed_update_index": resumed_update_index,
         "phase1_entry_boundary": entry_boundary,
         "phase1_entry_boundary_specification": entry_spec,
+        "phase1_exit_boundary": exit_boundary,
+        "phase1_exit_boundary_specification": exit_spec,
         "selected_scheduler_timestep": timesteps[selected_step],
+    }
+
+
+def phase2_freeze(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selected_step": 10,
+        "entry_phase1_boundary": "input",
+        "exit_phase1_boundary": "after_step_001",
+        "selected_scheduler_timestep": single_flip.scheduler_timesteps_numpy(config)[10],
+        "available_boundaries": list(PHASE2_AVAILABLE_BOUNDARIES),
+        "unavailable_boundaries": list(PHASE2_UNAVAILABLE_BOUNDARIES),
+        "boundary_semantics": PHASE2_BOUNDARY_SEMANTICS,
     }
 
 
@@ -327,6 +417,74 @@ def trusted_array_record(path: Path, *, source_path: Path) -> dict[str, Any]:
         "canonical_identity": identity(value),
         "storage_dtype": np.dtype(value.dtype).newbyteorder("<").str,
         "shape": [int(item) for item in value.shape],
+    }
+
+
+def derive_trusted_phase1(config: dict[str, Any]) -> dict[str, Any]:
+    root = (REPO_ROOT / config["trusted_phase1_root"]).resolve()
+    trace_path = root / "phase1/trace_manifest.json"
+    analysis_path = root / "phase1/phase1_analysis.json"
+    if not trace_path.exists() or not analysis_path.exists():
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 trace/analysis is unavailable")
+    trace = json.loads(trace_path.read_text())
+    recorded_analysis = json.loads(analysis_path.read_text())
+    expected_boundaries = boundary_keys(
+        int(config["generation"]["num_inference_steps"]) - int(config["anchor"]["checkpoint_step"])
+    )
+    if trace.get("expected_boundaries") != expected_boundaries:
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 boundary plan changed")
+    recomputed = analyze_trace(root, trace)
+    if (
+        recomputed["outcome"] != "EARLY_EXACT_MERGE"
+        or recomputed["plus1_historical_event"]
+        != {"classification": "PERSISTENT_EXACT_MERGE", "first_boundary": "after_step_001"}
+        or recorded_analysis.get("outcome") != recomputed["outcome"]
+        or recorded_analysis.get("plus1_historical_event") != recomputed["plus1_historical_event"]
+    ):
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 scientific result changed")
+    frozen: dict[str, Any] = {}
+    for name in TRAJECTORIES:
+        rows = {row["boundary"]: row for row in trace["traces"][name]}
+        if set(rows) != set(expected_boundaries):
+            raise GlobalStopError("GLOBAL STOP: trusted Phase-1 trajectory key set changed")
+        entry = load_tensor(root, rows["input"]["artifact"])
+        exit_state = load_tensor(root, rows["after_step_001"]["artifact"])
+        frozen[name] = {
+            "entry_artifact": rows["input"]["artifact"],
+            "entry_identity": identity(entry),
+            "exit_artifact": rows["after_step_001"]["artifact"],
+            "exit_identity": identity(exit_state),
+        }
+    input_clean_plus = metrics(
+        load_tensor(root, frozen["CLEAN"]["entry_artifact"]),
+        load_tensor(root, frozen["PLUS1"]["entry_artifact"]),
+    )
+    exit_clean_plus = metrics(
+        load_tensor(root, frozen["CLEAN"]["exit_artifact"]),
+        load_tensor(root, frozen["PLUS1"]["exit_artifact"]),
+    )
+    exit_plus_historical = metrics(
+        load_tensor(root, frozen["PLUS1"]["exit_artifact"]),
+        load_tensor(root, frozen["HISTORICAL_PLUS14"]["exit_artifact"]),
+    )
+    if (
+        input_clean_plus["differing_element_count"] != 1
+        or exit_clean_plus["differing_element_count"] != 41639
+        or not exit_plus_historical["bit_exact"]
+    ):
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 anchor observations changed")
+    return {
+        "source_root_relative_path": str(root.relative_to(REPO_ROOT)),
+        "trace_manifest_sha256": sha256_file(trace_path),
+        "phase1_analysis_sha256": sha256_file(analysis_path),
+        "source_provenance_hash": trace.get("provenance_hash"),
+        "source_manifest_sha256": trace.get("manifest_sha256"),
+        "entry_boundary": "input",
+        "exit_boundary": "after_step_001",
+        "trajectories": frozen,
+        "trusted_input_clean_vs_plus1": input_clean_plus,
+        "trusted_exit_clean_vs_plus1": exit_clean_plus,
+        "trusted_exit_plus1_vs_historical": exit_plus_historical,
     }
 
 
@@ -374,7 +532,7 @@ def derive_anchor(config: dict[str, Any]) -> dict[str, Any]:
         "PLUS1": {"final_latent": plus_latent, "video": plus_video},
         "HISTORICAL_PLUS14": {"final_latent": historical_latent, "video": historical_video},
     }
-    return {"source": source, "clean": source.clean, "plus1": plus1, "historical": historical, "plus_record": plus_record, "historical_delta": historical_delta, "trusted_config": trusted_cfg, "trusted_finals": trusted_finals}
+    return {"source": source, "clean": source.clean, "plus1": plus1, "historical": historical, "plus_record": plus_record, "historical_delta": historical_delta, "trusted_config": trusted_cfg, "trusted_finals": trusted_finals, "trusted_phase1": derive_trusted_phase1(config)}
 
 
 def anchor_manifest(root: Path, config: dict[str, Any], data: dict[str, Any], prov: dict[str, Any]) -> dict[str, Any]:
@@ -406,10 +564,12 @@ def anchor_manifest(root: Path, config: dict[str, Any], data: dict[str, Any], pr
         },
         "trajectories": {"CLEAN": artifacts["CLEAN"], "PLUS1": {**artifacts["PLUS1"], "construction": data["plus_record"]}, "HISTORICAL_PLUS14": {**artifacts["HISTORICAL_PLUS14"], "historical_delta": data["historical_delta"]}},
         "trusted_final_identities": data["trusted_finals"],
+        "trusted_phase1": data["trusted_phase1"],
         "expected_boundaries": [row["boundary"] for row in boundary_specs],
         "boundary_specifications": boundary_specs,
         "early_late_cutoff": early_late_cutoff(len(boundary_specs)),
         "timestep_match_policy": timestep_match_policy(),
+        "phase2_freeze": phase2_freeze(config),
     }
     manifest["manifest_sha256"] = sha256_bytes(canonical_json(manifest))
     return manifest
@@ -443,6 +603,18 @@ def validate_gate_document(
         raise GlobalStopError("GLOBAL STOP: gate provenance/manifest binding mismatch")
 
 
+def config_phase2_is_frozen(manifest: dict[str, Any]) -> bool:
+    phase2 = manifest.get("phase2_freeze", {})
+    return (
+        phase2.get("selected_step") == 10
+        and phase2.get("entry_phase1_boundary") == "input"
+        and phase2.get("exit_phase1_boundary") == "after_step_001"
+        and phase2.get("available_boundaries") == list(PHASE2_AVAILABLE_BOUNDARIES)
+        and phase2.get("unavailable_boundaries") == list(PHASE2_UNAVAILABLE_BOUNDARIES)
+        and phase2.get("boundary_semantics") == PHASE2_BOUNDARY_SEMANTICS
+    )
+
+
 def write_cpu_gates(root: Path, manifest: dict[str, Any], data: dict[str, Any], prov: dict[str, Any]) -> None:
     hist = data["historical_delta"]
     gates = [
@@ -457,7 +629,7 @@ def write_cpu_gates(root: Path, manifest: dict[str, Any], data: dict[str, Any], 
         gate("G9 Euler scheduler/resume semantics exact", True, manifest["anchor"], required=True),
         gate("G10 model/scheduler/timestep provenance frozen", True, {"provenance": prov, "boundaries": manifest["boundary_specifications"]}, required=True),
         *[gate(f"G{number} GPU scientific gate", None, "GPU work not run in CPU mode", required=False) for number in range(11, 23)],
-        gate("G23 phase-2 step explicitly frozen before execution", None, "phase2.selected_step is null; phase2 must fail closed", required=False),
+        gate("G23 phase-2 step explicitly frozen before execution", config_phase2_is_frozen(manifest), manifest["phase2_freeze"], required=True),
         gate("G24 no automatic phase-3 expansion", True, False, required=True),
         gate("G25 no FP32 threshold search", True, "no threshold-search mode exists", required=True),
         gate("G26 no trusted namespace mutation", True, str(root), required=True),
@@ -528,6 +700,7 @@ def analyze_trace(root: Path, trace_manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_cpu(config: dict[str, Any], config_path: Path, root: Path) -> dict[str, Any]:
+    validate_phase2_config(config)
     validate_output_namespace(config, root)
     prov, data = provenance(config_path, config), derive_anchor(config)
     root.mkdir(parents=True, exist_ok=True)
@@ -541,6 +714,7 @@ def run_cpu(config: dict[str, Any], config_path: Path, root: Path) -> dict[str, 
 
 
 def require_cpu(root: Path, config_path: Path, config: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    validate_phase2_config(config)
     manifest_path, gate_path = root / "anchor_manifest.json", root / "cpu_gates.json"
     if not manifest_path.exists() or not gate_path.exists():
         raise GlobalStopError("GLOBAL STOP: CPU manifest/gates missing")
@@ -600,6 +774,15 @@ def require_cpu(root: Path, config_path: Path, config: dict[str, Any]) -> tuple[
         raise GlobalStopError("GLOBAL STOP: manifest PLUS1 construction differs from frozen construction")
     if manifest.get("trusted_final_identities") != data["trusted_finals"]:
         raise GlobalStopError("GLOBAL STOP: manifest trusted final identities differ from frozen artifacts")
+    if manifest.get("trusted_phase1") != data["trusted_phase1"]:
+        raise GlobalStopError("GLOBAL STOP: manifest trusted Phase-1 binding differs from preserved artifacts")
+    if manifest.get("phase2_freeze") != phase2_freeze(config):
+        raise GlobalStopError("GLOBAL STOP: manifest Phase-2 freeze differs from config/scheduler")
+    if not config_phase2_is_frozen(manifest):
+        raise GlobalStopError("GLOBAL STOP: manifest Phase-2 freeze differs from the preregistered configuration")
+    expected_mapping = phase2_selection_mapping(config, manifest, 10)
+    if manifest["phase2_freeze"].get("selected_scheduler_timestep") != expected_mapping["selected_scheduler_timestep"]:
+        raise GlobalStopError("GLOBAL STOP: manifest Phase-2 scheduler timestep changed")
     return manifest, prov
 
 
@@ -848,7 +1031,11 @@ def run_analyze_phase1(config: dict[str, Any], config_path: Path, root: Path) ->
     return {"mode": "analyze-phase1", "outcome": result["outcome"], "pairwise_rows": len(result["pairwise_rows"])}
 
 
-def _run_within_step_trace(omni: Any, config: dict[str, Any], source: Any, state: np.ndarray, name: str, root: Path, selected_step: int) -> list[dict[str, Any]]:
+def _phase2_runtime_dtype(boundary: str) -> str:
+    return EXPECTED_INPUT_RUNTIME_DTYPE if boundary in ("latent_entering_step", "scheduler_input") else EXPECTED_RUNTIME_DTYPE
+
+
+def _run_within_step_trace(omni: Any, config: dict[str, Any], source: Any, state: np.ndarray, name: str, root: Path, selected_step: int) -> dict[str, Any]:
     """Capture only actual Wan T2V operations for one frozen absolute step."""
     import torch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -866,19 +1053,27 @@ def _run_within_step_trace(omni: Any, config: dict[str, Any], source: Any, state
     sampling.step_index = int(source.checkpoint_step)
     sampling.extra_args = {
         "flow_shift": float(config["scheduler"]["flow_shift"]), "sample_solver": "euler",
+        "trajectory_probe": {
+            "artifact_dir": str(root / "phase2" / name.lower() / "final_probe"),
+            "request_label": name.lower(),
+            "capture_steps": [0, int(config["generation"]["num_inference_steps"]) - int(source.checkpoint_step)],
+            "save_latents": True,
+            "save_decoded": False,
+            "save_mp4": False,
+        },
         "within_step_probe": {
             "artifact_dir": str(root / "phase2" / name.lower() / "probe"), "request_label": name.lower(),
             "selected_local_step": local_step, "selected_absolute_step": selected_step,
         },
     }
     outputs = omni.generate({"prompt": source.prompt}, sampling)
-    _, output = v3.normalize_video(outputs)
+    video, output = v3.normalize_video(outputs)
     probe = output.custom_output.get("within_step_probe")
     if not isinstance(probe, dict):
         raise GlobalStopError("GLOBAL STOP: within-step probe output is missing")
-    allowed = ["latent_entering_step", "transformer_input", "guidance_combined_output", "scheduler_input", "scheduler_output"]
+    allowed = list(PHASE2_AVAILABLE_BOUNDARIES)
     records = probe.get("records", [])
-    if [row.get("boundary") for row in records] != allowed or probe.get("unavailable_boundaries") != ["transformer_raw_output"]:
+    if [row.get("boundary") for row in records] != allowed or probe.get("unavailable_boundaries") != list(PHASE2_UNAVAILABLE_BOUNDARIES):
         raise GlobalStopError("GLOBAL STOP: Phase-2 did not record the actual Wan boundary set")
     schedule = single_flip.scheduler_timesteps_numpy(config)
     expected_timestep = schedule[selected_step]
@@ -891,11 +1086,7 @@ def _run_within_step_trace(omni: Any, config: dict[str, Any], source: Any, state
         raise GlobalStopError("GLOBAL STOP: Phase-2 probe step/timestep mapping differs from the frozen scheduler")
     result = []
     for record in records:
-        expected_runtime_dtype = (
-            EXPECTED_INPUT_RUNTIME_DTYPE
-            if local_step == 0 and record["boundary"] in ("latent_entering_step", "scheduler_input")
-            else EXPECTED_RUNTIME_DTYPE
-        )
+        expected_runtime_dtype = _phase2_runtime_dtype(record["boundary"])
         if record.get("runtime_dtype") != expected_runtime_dtype:
             raise GlobalStopError(f"GLOBAL STOP: Phase-2 {record['boundary']} runtime dtype differs from production semantics")
         tensor = torch.load(Path(record["latent_path"]), map_location="cpu").detach().cpu().float().numpy()
@@ -904,47 +1095,324 @@ def _run_within_step_trace(omni: Any, config: dict[str, Any], source: Any, state
             "boundary": record["boundary"], "absolute_step": int(record["absolute_step"]), "timestep": record["timestep"],
             "phase1_entry_boundary": "input" if local_step == 0 else f"after_step_{local_step:03d}",
             "runtime_dtype": record["runtime_dtype"], "storage_dtype": storage_dtype,
+            "actual_shape": [int(item) for item in tensor.shape],
+            **PHASE2_BOUNDARY_SEMANTICS[record["boundary"]],
             "artifact": save_tensor(root, f"phase2/artifacts/{name}/{record['boundary']}.npy", tensor, runtime_semantics=record["runtime_dtype"]),
         })
-    return result
+    trajectory_probe = output.custom_output.get("trajectory_probe_metadata")
+    if not isinstance(trajectory_probe, dict):
+        raise GlobalStopError("GLOBAL STOP: Phase-2 final-latent trajectory probe is missing")
+    final_step_index = int(config["generation"]["num_inference_steps"]) - int(source.checkpoint_step)
+    final_rows = [row for row in trajectory_probe.get("records", []) if int(row.get("step_index", -1)) == final_step_index]
+    if len(final_rows) != 1 or not final_rows[0].get("latent_path"):
+        raise GlobalStopError("GLOBAL STOP: Phase-2 final latent artifact is missing or ambiguous")
+    final_latent = torch.load(Path(final_rows[0]["latent_path"]), map_location="cpu").detach().cpu().float().numpy()
+    return {
+        "trajectory": name,
+        "boundaries": result,
+        "final_latent_artifact": save_tensor(root, f"phase2/artifacts/{name}/final_latent.npy", final_latent),
+        "final_video_artifact": save_tensor(root, f"phase2/artifacts/{name}/final_video.npy", video, runtime_semantics="uint8 decoded video"),
+    }
 
 
 def run_phase2(config: dict[str, Any], config_path: Path, root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    validate_phase2_config(config)
     manifest, prov = require_cpu(root, config_path, config); require_preflight(root, manifest, prov)
+    require_committed_source(prov)
     selected = config["phase2"]["selected_step"]
-    if selected is None:
-        raise GlobalStopError("GLOBAL STOP: phase 2 requires an explicitly frozen selected_step")
     selection_mapping = phase2_selection_mapping(config, manifest, int(selected))
     data = derive_anchor(config); omni = _build_omni(config, args)
     try:
-        traces = {name: _run_within_step_trace(omni, config, data["source"], state, name, root, int(selected)) for name, state in {"CLEAN": data["clean"], "PLUS1": data["plus1"], "HISTORICAL_PLUS14": data["historical"]}.items()}
-        document = {"provenance_hash": prov["provenance_hash"], "manifest_sha256": manifest["manifest_sha256"], "selected_step": int(selected), "selection_mapping": selection_mapping, "traces": traces, "unavailable_boundaries": ["transformer_raw_output"]}
+        results = {name: _run_within_step_trace(omni, config, data["source"], state, name, root, int(selected)) for name, state in {"CLEAN": data["clean"], "PLUS1": data["plus1"], "HISTORICAL_PLUS14": data["historical"]}.items()}
+        traces = {name: result["boundaries"] for name, result in results.items()}
+        document = {
+            "provenance_hash": prov["provenance_hash"],
+            "manifest_sha256": manifest["manifest_sha256"],
+            "selected_step": int(selected),
+            "selection_mapping": selection_mapping,
+            "expected_boundaries": list(PHASE2_AVAILABLE_BOUNDARIES),
+            "boundary_semantics": PHASE2_BOUNDARY_SEMANTICS,
+            "traces": traces,
+            "final_latents": {name: result["final_latent_artifact"] for name, result in results.items()},
+            "final_videos": {name: result["final_video_artifact"] for name, result in results.items()},
+            "unavailable_boundaries": list(PHASE2_UNAVAILABLE_BOUNDARIES),
+        }
         atomic_json(root / "phase2" / "phase2_manifest.json", document)
         return {"mode": "phase2", "selected_step": int(selected), "boundaries": len(next(iter(traces.values())))}
     finally:
         single_flip._shutdown(omni)
 
 
+def _phase2_merge_event(pairwise_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [row for row in pairwise_rows if row["pair"] == "PLUS1_VS_HISTORICAL_PLUS14"]
+    by_boundary = {row["boundary"]: row for row in rows}
+    if not by_boundary["scheduler_output"]["bit_exact"]:
+        raise GlobalStopError("GLOBAL STOP: CONTRADICTS_PHASE1: PLUS1/HISTORICAL scheduler outputs differ")
+    classifications = {
+        "transformer_input": "MERGED_AT_TRANSFORMER_INPUT",
+        "guidance_combined_output": "MERGED_AT_GUIDANCE_OUTPUT",
+        "scheduler_input": "MERGED_AT_SCHEDULER_INPUT",
+        "scheduler_output": "MERGED_AT_SCHEDULER_OUTPUT",
+    }
+    exact = [boundary for boundary in PHASE2_AVAILABLE_BOUNDARIES if by_boundary[boundary]["bit_exact"]]
+    if exact and exact[0] == "latent_entering_step":
+        raise GlobalStopError("GLOBAL STOP: Phase-2 entry contradicts the distinct trusted Phase-1 inputs")
+    boundary = exact[0]
+    return {
+        "classification": classifications[boundary],
+        "first_bit_exact_boundary": boundary,
+        "exact_boundaries": exact,
+        "allowed_claim": f"PLUS1 and HISTORICAL first become bit-exact at boundary {boundary}.",
+    }
+
+
+def _clean_plus_spread(pairwise_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    source = [row for row in pairwise_rows if row["pair"] == "CLEAN_VS_PLUS1"]
+    progression: list[dict[str, Any]] = []
+    previous: dict[str, Any] | None = None
+    for row in source:
+        item = {key: row[key] for key in (
+            "boundary", "differing_element_count", "differing_fraction", "max_abs_diff", "mean_abs_diff", "mse", "l2", "relative_l2",
+            "lhs_canonical_identity", "rhs_canonical_identity",
+        )}
+        if previous is None:
+            item.update({"delta_differing_count": None, "ratio_differing_count": None, "delta_relative_l2": None, "ratio_relative_l2": None})
+        else:
+            item.update({
+                "delta_differing_count": row["differing_element_count"] - previous["differing_element_count"],
+                "ratio_differing_count": row["differing_element_count"] / previous["differing_element_count"] if previous["differing_element_count"] else None,
+                "delta_relative_l2": row["relative_l2"] - previous["relative_l2"],
+                "ratio_relative_l2": row["relative_l2"] / previous["relative_l2"] if previous["relative_l2"] else None,
+            })
+        progression.append(item)
+        previous = row
+    increases = [row for row in progression[1:] if row["delta_differing_count"] is not None]
+    largest = max(row["delta_differing_count"] for row in increases)
+    tied = [row["boundary"] for row in increases if row["delta_differing_count"] == largest]
+    return progression, {
+        "statistic": "largest absolute increase in differing_element_count between consecutive available Phase-2 boundaries",
+        "largest_increase": largest,
+        "boundaries": tied,
+        "descriptive_only": True,
+    }
+
+
+def _load_trusted_phase1_boundary(root: Path, manifest: dict[str, Any], name: str, which: str) -> np.ndarray:
+    trusted = manifest["trusted_phase1"]
+    trace_path = root / "phase1/trace_manifest.json"
+    analysis_path = root / "phase1/phase1_analysis.json"
+    if not trace_path.exists() or not analysis_path.exists():
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 files are missing from the result root")
+    if sha256_file(trace_path) != trusted["trace_manifest_sha256"] or sha256_file(analysis_path) != trusted["phase1_analysis_sha256"]:
+        raise GlobalStopError("GLOBAL STOP: trusted Phase-1 source file hash changed")
+    return load_tensor(root, trusted["trajectories"][name][f"{which}_artifact"])
+
+
+def _p2_gate(number: int, description: str, passed: bool, evidence: Any) -> dict[str, Any]:
+    return {**gate(f"P2-G{number}", passed, evidence, required=True), "description": description}
+
+
+def analyze_phase2_artifacts(root: Path, config: dict[str, Any], manifest: dict[str, Any], prov: dict[str, Any], trace: dict[str, Any]) -> dict[str, Any]:
+    validate_phase2_config(config)
+    require_committed_source(prov)
+    selected = int(config["phase2"]["selected_step"])
+    mapping = phase2_selection_mapping(config, manifest, selected)
+    if trace.get("provenance_hash") != prov["provenance_hash"] or trace.get("manifest_sha256") != manifest["manifest_sha256"]:
+        raise GlobalStopError("GLOBAL STOP: Phase-2 trace provenance mismatch")
+    if int(trace.get("selected_step", -1)) != selected or trace.get("selection_mapping") != mapping:
+        raise GlobalStopError("GLOBAL STOP: Phase-2 selected-step binding mismatch")
+    expected = list(PHASE2_AVAILABLE_BOUNDARIES)
+    if trace.get("expected_boundaries") != expected or trace.get("unavailable_boundaries") != list(PHASE2_UNAVAILABLE_BOUNDARIES):
+        raise GlobalStopError("GLOBAL STOP: Phase-2 real/unavailable boundary declaration changed")
+    if trace.get("boundary_semantics") != PHASE2_BOUNDARY_SEMANTICS:
+        raise GlobalStopError("GLOBAL STOP: Phase-2 boundary semantics changed")
+    traces = trace.get("traces")
+    if not isinstance(traces, dict) or set(traces) != set(TRAJECTORIES):
+        raise GlobalStopError("GLOBAL STOP: Phase-2 trajectory set is incomplete")
+    schedule = single_flip.scheduler_timesteps_numpy(config)
+    loaded: dict[str, dict[str, np.ndarray]] = {}
+    normalized_rows: dict[str, list[dict[str, Any]]] = {}
+    artifact_evidence: dict[str, dict[str, dict[str, Any]]] = {}
+    for name in TRAJECTORIES:
+        rows = traces[name]
+        names = [row.get("boundary") for row in rows]
+        if len(names) != len(set(names)) or set(names) != set(expected):
+            raise GlobalStopError("GLOBAL STOP: Phase-2 operation boundary set is missing, duplicate, or unexpected")
+        by_name = {row["boundary"]: row for row in rows}
+        normalized_rows[name] = [by_name[boundary] for boundary in expected]
+        loaded[name] = {}
+        artifact_evidence[name] = {}
+        for boundary, row in zip(expected, normalized_rows[name], strict=True):
+            if (
+                int(row.get("absolute_step", -1)) != selected
+                or row.get("phase1_entry_boundary") != mapping["phase1_entry_boundary"]
+                or not timestep_matches(row.get("timestep"), mapping["selected_scheduler_timestep"], schedule)
+                or row.get("runtime_dtype") != _phase2_runtime_dtype(boundary)
+                or row.get("storage_dtype") != "<f4"
+                or {key: row.get(key) for key in PHASE2_BOUNDARY_SEMANTICS[boundary]} != PHASE2_BOUNDARY_SEMANTICS[boundary]
+            ):
+                raise GlobalStopError(f"GLOBAL STOP: Phase-2 boundary metadata changed at {name}:{boundary}")
+            value = load_tensor(root, row["artifact"])
+            if row.get("actual_shape") != [int(item) for item in value.shape]:
+                raise GlobalStopError("GLOBAL STOP: Phase-2 boundary shape metadata does not match artifact")
+            loaded[name][boundary] = value
+            artifact_evidence[name][boundary] = {
+                "recorded_identity": row["artifact"]["canonical_identity"],
+                "recomputed_identity": identity(value),
+                "valid": row["artifact"]["canonical_identity"] == identity(value),
+            }
+    pairings = (("CLEAN", "PLUS1"), ("CLEAN", "HISTORICAL_PLUS14"), ("PLUS1", "HISTORICAL_PLUS14"))
+    pairwise_rows = [
+        {"boundary": boundary, "pair": f"{left}_VS_{right}", **metrics(loaded[left][boundary], loaded[right][boundary])}
+        for boundary in expected for left, right in pairings
+    ]
+    expected_pair_identities = {
+        (boundary, f"{left}_VS_{right}"): (
+            identity(loaded[left][boundary]), identity(loaded[right][boundary])
+        )
+        for boundary in expected for left, right in pairings
+    }
+    pairwise_recomputed = all(
+        (row["lhs_canonical_identity"], row["rhs_canonical_identity"])
+        == expected_pair_identities[(row["boundary"], row["pair"])]
+        for row in pairwise_rows
+    )
+    if pairwise_rows[0]["differing_element_count"] != 1:
+        raise GlobalStopError("GLOBAL STOP: Phase-2 CLEAN/PLUS1 entry does not reproduce one changed coordinate")
+
+    entry_matches: dict[str, bool] = {}
+    exit_matches: dict[str, bool] = {}
+    input_matches: dict[str, bool] = {}
+    for name in TRAJECTORIES:
+        phase1_entry = _load_trusted_phase1_boundary(root, manifest, name, "entry")
+        phase1_exit = _load_trusted_phase1_boundary(root, manifest, name, "exit")
+        entry_matches[name] = identity(loaded[name]["latent_entering_step"]) == identity(phase1_entry)
+        exit_matches[name] = identity(loaded[name]["scheduler_output"]) == identity(phase1_exit)
+        input_matches[name] = identity(loaded[name]["latent_entering_step"]) == manifest["trajectories"][name]["canonical_identity"]
+    if not all(entry_matches.values()) or not all(exit_matches.values()):
+        failure = {"classification": "PHASE1_PHASE2_BOUNDARY_MISMATCH", "entry_matches": entry_matches, "exit_matches": exit_matches}
+        atomic_json(root / "phase2/phase1_phase2_boundary_mismatch.json", failure)
+        raise GlobalStopError("GLOBAL STOP: PHASE1_PHASE2_BOUNDARY_MISMATCH")
+
+    final_matches: dict[str, dict[str, Any]] = {}
+    for name in TRAJECTORIES:
+        latent = load_tensor(root, trace["final_latents"][name])
+        video = load_tensor(root, trace["final_videos"][name])
+        expected_latent, expected_video = _trusted_final_pair(manifest, name)
+        final_matches[name] = {
+            "final_latent_identity": identity(latent),
+            "trusted_final_latent_identity": expected_latent,
+            "final_video_identity": identity(video),
+            "trusted_final_video_identity": expected_video,
+            "matches": identity(latent) == expected_latent and identity(video) == expected_video,
+            "artifacts_valid": (
+                trace["final_latents"][name]["canonical_identity"] == identity(latent)
+                and trace["final_videos"][name]["canonical_identity"] == identity(video)
+            ),
+        }
+    if not all(row["matches"] for row in final_matches.values()):
+        failure = {"classification": "PHASE2_TRACE_ALTERS_EXECUTION", "evidence": final_matches}
+        atomic_json(root / "phase2/phase2_trace_alters_execution.json", failure)
+        raise GlobalStopError("GLOBAL STOP: PHASE2_TRACE_ALTERS_EXECUTION")
+
+    merge_event = _phase2_merge_event(pairwise_rows)
+    spread, largest_support_increase = _clean_plus_spread(pairwise_rows)
+    cross_event = {
+        "merge_boundary": merge_event["first_bit_exact_boundary"],
+        "largest_support_increase_boundaries": largest_support_increase["boundaries"],
+        "same_boundary": merge_event["first_bit_exact_boundary"] in largest_support_increase["boundaries"],
+        "descriptive_only": True,
+    }
+    finite = all(
+        np.isfinite(float(row[key])) for row in pairwise_rows
+        for key in ("differing_fraction", "max_abs_diff", "mean_abs_diff", "mse", "l2", "relative_l2")
+    )
+    relative_paths = all(
+        not Path(row["artifact"]["relative_path"]).is_absolute()
+        for name in TRAJECTORIES for row in normalized_rows[name]
+    ) and all(
+        not Path(trace[group][name]["relative_path"]).is_absolute()
+        for group in ("final_latents", "final_videos") for name in TRAJECTORIES
+    )
+    plus_hist_output = metrics(loaded["PLUS1"]["scheduler_output"], loaded["HISTORICAL_PLUS14"]["scheduler_output"])
+    final_plus = load_tensor(root, trace["final_latents"]["PLUS1"])
+    final_hist = load_tensor(root, trace["final_latents"]["HISTORICAL_PLUS14"])
+    final_clean = load_tensor(root, trace["final_latents"]["CLEAN"])
+    final_plus_video = load_tensor(root, trace["final_videos"]["PLUS1"])
+    final_hist_video = load_tensor(root, trace["final_videos"]["HISTORICAL_PLUS14"])
+    final_clean_video = load_tensor(root, trace["final_videos"]["CLEAN"])
+    all_artifacts_valid = (
+        all(
+            evidence["valid"]
+            for trajectory in artifact_evidence.values()
+            for evidence in trajectory.values()
+        )
+        and all(row["artifacts_valid"] for row in final_matches.values())
+    )
+    plus_hist_final_equal = (
+        identity(final_plus) == identity(final_hist)
+        and identity(final_plus_video) == identity(final_hist_video)
+    )
+    clean_plus_final_different = (
+        identity(final_clean) != identity(final_plus)
+        and identity(final_clean_video) != identity(final_plus_video)
+    )
+    gates = [
+        _p2_gate(1, "committed source / clean provenance", not prov.get("source_dirty_entries"), prov),
+        _p2_gate(2, "exact selected_step == 10", selected == 10, selected),
+        _p2_gate(3, "exact Phase1 input to Phase2 entry mapping", mapping["phase1_entry_boundary"] == "input", mapping),
+        _p2_gate(4, "exact Phase1 after_step_001 to Phase2 exit mapping", mapping["phase1_exit_boundary"] == "after_step_001", mapping),
+        _p2_gate(5, "exact scheduler timestep", all(timestep_matches(row["timestep"], mapping["selected_scheduler_timestep"], schedule) for rows in normalized_rows.values() for row in rows), mapping),
+        _p2_gate(6, "exact CLEAN input identity", input_matches["CLEAN"], entry_matches),
+        _p2_gate(7, "exact PLUS1 input identity", input_matches["PLUS1"], entry_matches),
+        _p2_gate(8, "exact HISTORICAL input identity", input_matches["HISTORICAL_PLUS14"], entry_matches),
+        _p2_gate(9, "all expected real operation boundaries present", all([row["boundary"] for row in rows] == expected for rows in normalized_rows.values()), expected),
+        _p2_gate(10, "no unexpected/duplicate boundaries", all(len({row["boundary"] for row in rows}) == len(expected) for rows in normalized_rows.values()), expected),
+        _p2_gate(11, "persisted artifact identities valid", all_artifacts_valid, artifact_evidence),
+        _p2_gate(12, "pairwise metrics recomputed from artifacts", pairwise_recomputed and len(pairwise_rows) == len(expected) * 3, {"row_count": len(pairwise_rows), "identity_binding_valid": pairwise_recomputed}),
+        _p2_gate(13, "CLEAN Phase2 final equals trusted CLEAN", final_matches["CLEAN"]["matches"], final_matches["CLEAN"]),
+        _p2_gate(14, "PLUS1 Phase2 final equals trusted PLUS1", final_matches["PLUS1"]["matches"], final_matches["PLUS1"]),
+        _p2_gate(15, "HISTORICAL Phase2 final equals trusted historical", final_matches["HISTORICAL_PLUS14"]["matches"], final_matches["HISTORICAL_PLUS14"]),
+        _p2_gate(16, "PLUS1 Phase2 final equals HISTORICAL Phase2 final", plus_hist_final_equal, {"latent_equal": identity(final_plus) == identity(final_hist), "video_equal": identity(final_plus_video) == identity(final_hist_video)}),
+        _p2_gate(17, "CLEAN Phase2 final differs from PLUS1 Phase2 final", clean_plus_final_different, {"latent_differs": identity(final_clean) != identity(final_plus), "video_differs": identity(final_clean_video) != identity(final_plus_video)}),
+        _p2_gate(18, "Phase2 entries equal Phase1 inputs", all(entry_matches.values()), entry_matches),
+        _p2_gate(19, "Phase2 scheduler outputs equal Phase1 after_step_001", all(exit_matches.values()), exit_matches),
+        _p2_gate(20, "PLUS1 scheduler_output equals HISTORICAL scheduler_output", plus_hist_output["bit_exact"], plus_hist_output),
+        _p2_gate(21, "no NaN/Inf", finite, None),
+        _p2_gate(22, "relocation/path resolution valid", relative_paths, None),
+        _p2_gate(23, "Phase3 not automatically triggered", config["phase3"] == {"enabled": False, "auto_expand": False}, config["phase3"]),
+        _p2_gate(24, "no forbidden expansion modes", tuple(config["allowed_modes"]) == MODES and "fp32-search" not in MODES, list(MODES)),
+        _p2_gate(25, "provenance/config/manifest/selected-step binding valid", trace["provenance_hash"] == prov["provenance_hash"] and trace["manifest_sha256"] == manifest["manifest_sha256"] and trace["selection_mapping"] == mapping, mapping),
+    ]
+    gate_document = {"gates": gates, "provenance_hash": prov["provenance_hash"], "manifest_sha256": manifest["manifest_sha256"]}
+    atomic_json(root / "phase2/phase2_gates.json", gate_document)
+    validate_gate_document(gate_document, PHASE2_REQUIRED_GATES, provenance_hash=prov["provenance_hash"], manifest_sha256=manifest["manifest_sha256"])
+    return {
+        "selected_step": selected,
+        "selection_mapping": mapping,
+        "available_boundaries": expected,
+        "unavailable_boundaries": list(PHASE2_UNAVAILABLE_BOUNDARIES),
+        "boundary_semantics": PHASE2_BOUNDARY_SEMANTICS,
+        "pairwise_rows": pairwise_rows,
+        "plus1_historical_exact_merge": merge_event,
+        "clean_plus1_spread": spread,
+        "largest_support_increase": largest_support_increase,
+        "cross_event_observation": cross_event,
+        "phase1_phase2_crosscheck": {"entry_matches": entry_matches, "exit_matches": exit_matches},
+        "traced_vs_trusted_final_controls": final_matches,
+        "gates": gates,
+    }
+
+
 def run_analyze_phase2(config: dict[str, Any], config_path: Path, root: Path) -> dict[str, Any]:
+    validate_phase2_config(config)
     manifest, prov = require_cpu(root, config_path, config); require_preflight(root, manifest, prov)
     path = root / "phase2" / "phase2_manifest.json"
     if not path.exists():
-        raise GlobalStopError("GLOBAL STOP: phase-2 trace manifest is missing")
-    trace = json.loads(path.read_text())
-    if trace.get("provenance_hash") != prov["provenance_hash"] or trace.get("manifest_sha256") != manifest["manifest_sha256"]:
-        raise GlobalStopError("GLOBAL STOP: phase-2 trace provenance mismatch")
-    selected = config["phase2"]["selected_step"]
-    if selected is None or int(trace.get("selected_step", -1)) != int(selected):
-        raise GlobalStopError("GLOBAL STOP: phase-2 trace selected_step differs from the explicitly frozen config step")
-    if trace.get("selection_mapping") != phase2_selection_mapping(config, manifest, int(selected)):
-        raise GlobalStopError("GLOBAL STOP: phase-2 selection mapping differs from the frozen Phase-1 boundary mapping")
-    expected = ["latent_entering_step", "transformer_input", "guidance_combined_output", "scheduler_input", "scheduler_output"]
-    adapted = {"expected_boundaries": expected, "traces": trace.get("traces", {})}
-    result = analyze_trace(root, adapted)
-    result["selected_step"] = trace["selected_step"]
-    result["unavailable_boundaries"] = trace["unavailable_boundaries"]
+        raise GlobalStopError("GLOBAL STOP: Phase-2 trace manifest is missing")
+    result = analyze_phase2_artifacts(root, config, manifest, prov, json.loads(path.read_text()))
     atomic_json(root / "phase2" / "phase2_analysis.json", result)
-    return {"mode": "analyze-phase2", "selected_step": result["selected_step"], "pairwise_rows": len(result["pairwise_rows"])}
+    return {"mode": "analyze-phase2", "selected_step": result["selected_step"], "pairwise_rows": len(result["pairwise_rows"]), "classification": result["plus1_historical_exact_merge"]["classification"]}
 
 
 def unavailable_gpu(mode: str) -> None:
