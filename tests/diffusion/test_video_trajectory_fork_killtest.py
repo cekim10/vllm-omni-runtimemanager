@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,23 @@ def test_frozen_configuration_and_prompt_change_isolation() -> None:
     assert family["old_prompt"].replace("red", "blue") == family["new_prompt"]
     assert tuple(config["generation"]["switch_steps"]) == killtest.EXPECTED_SWITCHES
     assert config["generation"]["num_inference_steps"] == 40
+
+
+def test_direct_script_entrypoint_can_import_repository_helpers() -> None:
+    script = killtest.REPO_ROOT / "experiments/video_trajectory_fork_killtest.py"
+    code = (
+        "import runpy; "
+        f"runpy.run_path({str(script)!r}, run_name='fork_killtest_module'); "
+        "import experiments.video_runtime_state_discovery"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd="/tmp",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_switch_step_index_and_k0_semantics() -> None:

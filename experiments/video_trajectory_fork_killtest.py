@@ -13,12 +13,16 @@ import hashlib
 import json
 import math
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 DEFAULT_CONFIG = REPO_ROOT / "experiments/video_trajectory_fork_killtest_config.yaml"
 DEFAULT_OUTPUT = REPO_ROOT / "results/video_trajectory_fork_killtest"
 EXPECTED_MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
