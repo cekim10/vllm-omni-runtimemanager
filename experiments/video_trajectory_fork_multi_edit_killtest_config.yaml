@@ -1,0 +1,78 @@
+{
+  "experiment_version": "video-trajectory-fork-multi-edit-screening-v1",
+  "round": "4C-0 replication screening (no statistical claim)",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {"name": "WanEulerScheduler", "sample_solver": "euler", "num_train_timesteps": 1000, "flow_shift": 12.0},
+  "generation": {"height": 480, "width": 832, "num_frames": 33, "num_inference_steps": 40, "guidance_scale": 4.0, "fps": 16.0, "boundary_ratio": 0.875},
+  "prompts": {
+    "old": "A red sports car driving on a snowy road, cinematic video",
+    "object": {"new": "A red motorcycle driving on a snowy road, cinematic video", "old_concept": "sports car", "new_concept": "motorcycle"},
+    "background": {"new": "A red sports car driving on a desert road, cinematic video", "old_concept": "snowy road", "new_concept": "desert road"}
+  },
+  "edits": ["object", "background"],
+  "seeds": [5678, 6789, 7890, 8901],
+  "seed_rule": "first four Round 4B seeds in frozen order; not selected on any outcome; OLD trajectories are deterministic re-runs checked bit-exactly against Round 4B (C0)",
+  "k_grid": [4, 8, 12, 16, 20, 24],
+  "control_k": 8,
+  "frame_positions": ["first", "q25", "middle", "q75", "last"],
+  "blinded_review": true,
+  "labels": {
+    "scale": ["NEW", "MIXED_NEW_DOMINANT", "MIXED_BALANCED", "MIXED_OLD_DOMINANT", "OLD"],
+    "ordinal": {"NEW": 2, "MIXED_NEW_DOMINANT": 1, "MIXED_BALANCED": 0, "MIXED_OLD_DOMINANT": -1, "OLD": -2},
+    "definitions": {
+      "object": {
+        "NEW": "The vehicle is clearly a motorcycle throughout the video (two wheels, rider and/or exposed frame); car residue does not characterize the body.",
+        "MIXED_NEW_DOMINANT": "Motorcycle form dominates, but car elements (body panels, four-wheel traces) are clearly present.",
+        "MIXED_BALANCED": "Both forms coexist, or the vehicle is a hybrid / indeterminate object.",
+        "MIXED_OLD_DOMINANT": "Car form dominates, but motorcycle elements are clearly present.",
+        "OLD": "The vehicle is clearly a car."
+      },
+      "background": {
+        "NEW": "Road surface and surroundings are clearly desert throughout the video (sand, arid terrain, no snow).",
+        "MIXED_NEW_DOMINANT": "Desert dominates, but snow or winter terrain is clearly present.",
+        "MIXED_BALANCED": "Snow and desert elements coexist in comparable measure.",
+        "MIXED_OLD_DOMINANT": "Snow terrain dominates, but desert elements are clearly present.",
+        "OLD": "The road is clearly snow-covered."
+      }
+    },
+    "judging_rule": "Judge the whole video plus the five fixed frames (first, 25%, middle, 75%, last); never a favourable single frame. The edit class is visible; seed and K are hidden. Use that edit's definitions."
+  },
+  "oracle": {
+    "success_labels": ["NEW", "MIXED_NEW_DOMINANT"],
+    "trajectory_oracle": "K_i* := largest grid K such that every grid K' <= K succeeds (monotone cut); 0 if K=4 fails. Violations are reported and never rescue K_i*.",
+    "dispersion": ">= 2 distinct K_i* values and max - min >= 8 (two grid steps)",
+    "static_retry": "C_static(K) := (40 - K) + p_fail(K) * 40 for K in grid u {0}, p_fail from informative seeds; perfect free checker assumed (favours the static policy)",
+    "gap_retry": "(min_K C_static(K) - mean_i(40 - K_i*)) / 40",
+    "allowed_failures_descriptive": [1, 0],
+    "descriptive_only": ["tau frontier by allowed failures (nominal 75% / 100% at n=4)", "K* distribution", "CLIP separability (min success vs max failure new_minus_old) per edit", "within-trajectory K* comparison against Round 4B colour K* (anecdotal, n <= 4)", "monotonicity violations", "SSIM"]
+  },
+  "gate": {
+    "strong_min_gap": 0.15,
+    "dispersion_min_range": 8,
+    "min_informative_seeds": 3,
+    "extension_edit_class": "action",
+    "edit_rule": "EDIT_STRONG iff DISPERSION and gap_retry >= 0.15; EDIT_INVALID if fewer than 3 informative seeds or C0/C1 fail; otherwise EDIT_WEAK",
+    "overall_rule": "INVEST_4C1 iff both edits STRONG; EXTEND_ONE_EDIT (action, same design, then final) iff exactly one STRONG; STOP_DIFFUSION_REUSE iff none STRONG; INVALID if any edit INVALID",
+    "stop_rule": "STOP_DIFFUSION_REUSE closes the trajectory-fork line and all diffusion intermediate-state reuse work; no rescue characterization",
+    "automated_evaluator_rule": "an automated (CLIP) semantic evaluator may be preregistered for later rounds only if CLIP separates human success/failure labels perfectly in BOTH edits here; even then a blinded human audit subset is required"
+  },
+  "baseline_informativeness": {
+    "manual": ["old_matches_expected (shared per seed)", "new_matches_expected (per edit)", "clearly_different (per edit)"],
+    "automated": "CLIP new_minus_old with the edit's concept pair: < 0 on the OLD baseline video, > 0 on the edit's NEW baseline (sign only)",
+    "rule": "(edit, seed) informative iff manual booleans true AND automated signs correct AND identical initial latent; uninformative pairs are kept in the denominator and not forked",
+    "stop_rule": "any edit with fewer than 3 informative seeds, or any C0 failure, is INVALID before controls"
+  },
+  "controls": {
+    "C0": "OLD baseline re-run reproduces the Round 4B OLD baseline bit-exactly (final latent and video) for every seed",
+    "C1": "OLD->OLD at K=8 reproduces the OLD baseline bit-exactly for every control seed",
+    "C2": "OLD and both NEW baselines share the identical initial latent",
+    "C3": "trusted WanEulerScheduler / euler solver on every trajectory",
+    "C4": "resume index K, resume timestep = schedule[K], final timestep = schedule[-1], executed steps = 40-K",
+    "C5": "only the conditioning differs after the fork (checkpoint hash bound at controls time)",
+    "C6": "sha256 recorded for initial latent, fork latent, final latent, final video, config, commit"
+  },
+  "concept_metric": {"model": "openai/clip-vit-base-patch32", "frame_count": 8, "old_concept": "sports car", "new_concept": "motorcycle", "sign_only_threshold": 0.0, "role": "descriptive, uncalibrated; per-edit concept pairs override these defaults"},
+  "excluded": ["style edits", "any probe", "K outside the grid", "seed replacement or addition", "changing success set, dispersion rule, or thresholds after results", "treating n=4 results as statistical evidence"],
+  "claim_boundary": "One model/scheduler/config, four seeds, two structural edit classes with one prompt pair each, blinded five-level labels by one human judge. The result screens whether per-trajectory fork-depth dispersion and a retry-adjusted oracle gap appear outside the colour edit; it supports no statistical claim, no mechanism, no speedup, and no generalization beyond these two prompt pairs."
+}
