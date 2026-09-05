@@ -1,0 +1,90 @@
+{
+  "experiment_version": "video-trajectory-fork-probe-killtest-v1",
+  "source": {
+    "namespace": "video_trajectory_fork_confirmatory",
+    "preregistration_sha256": "8b7231da647e51b2c594b02ec425277ae7b48f6fda514ee1990d2bb598ac86a9",
+    "summary_sha256": "a41189f2ac9d07b7d77f324dd33cd2bab43674ffea9a02240a6deb6f927cfb40",
+    "note": "frozen confirmatory GO experiment; read-only; labels and OLD checkpoints are consumed as ground truth"
+  },
+  "seeds": [
+    2345,
+    3456,
+    4567
+  ],
+  "k_values": [
+    10,
+    15,
+    20,
+    25
+  ],
+  "conditions": [
+    "old",
+    "new"
+  ],
+  "prompts": {
+    "old": "A red sports car driving on a snowy road, cinematic video",
+    "new": "A blue sports car driving on a snowy road, cinematic video"
+  },
+  "ordinal": {
+    "NEW": 2,
+    "MIXED_NEW_DOMINANT": 1,
+    "MIXED_BALANCED": 0,
+    "MIXED_OLD_DOMINANT": -1,
+    "OLD": -2
+  },
+  "probe": {
+    "definition": "from the persisted OLD checkpoint x_k, execute exactly one trusted Euler step under OLD conditioning and, from the identical persisted x_k, one under NEW conditioning; the response is the CFG-combined noise prediction consumed by the scheduler",
+    "response_boundary": "guidance_combined_output",
+    "update_boundary": "scheduler_output",
+    "input_boundary": "latent_entering_step",
+    "execution_step_limit": 1,
+    "skip_vae_decode": true,
+    "primary_signal": "relative_response_l2",
+    "formula": "||p_new - p_old||_2 / (||p_old||_2 + eps)",
+    "eps": 1e-12,
+    "direction": "higher_probe_means_more_forkable",
+    "direction_note": "frozen; an opposite observed direction is a failure of the primary probe, never flipped post hoc"
+  },
+  "secondary_signals": [
+    "response_delta_rms",
+    "response_cosine",
+    "differing_element_fraction",
+    "relative_step_effect (||x_next_new - x_next_old|| / (||x_k|| + eps) using the trusted scheduler output)",
+    "delta_over_response_rms",
+    "rho_all",
+    "rho_without_k25",
+    "timestep_only_rho = Spearman(-k, ordinal)",
+    "probe_vs_timestep_rho = Spearman(k, probe)"
+  ],
+  "gate": {
+    "primary_k": 15,
+    "low_forkability_seed": 2345,
+    "high_forkability_seeds": [
+      3456,
+      4567
+    ],
+    "primary_rule": "probe(2345,k15) < probe(3456,k15) AND probe(2345,k15) < probe(4567,k15); no averaging; no secondary override",
+    "support_k": 20,
+    "support_rule": "probe(2345,k20) < probe(3456,k20) AND probe(2345,k20) < probe(4567,k20)",
+    "confounded_k": 25,
+    "k15_gap_over_repeat_noise_min_ratio": 10.0,
+    "k15_gap_abs_floor": 1e-06
+  },
+  "determinism_audit": {
+    "point": [
+      3456,
+      15
+    ],
+    "repeat": "both OLD and NEW responses once",
+    "tolerance": 0.0,
+    "note": "the trusted Euler path is bit-exact deterministic on this host; any difference is INVALID"
+  },
+  "decision_rule": {
+    "INVALID": "any hard control fails: checkpoint/input binding, prompt, model/scheduler/config, execution boundary timestep, one-step semantics, determinism audit, missing rows, non-finite artifacts",
+    "NO-GO": "SAME_K_PRIMARY_PASS false; no sign flip, no metric switch, no added probes/seeds, no rescue via global correlation",
+    "WEAK-PASS": "SAME_K_PRIMARY_PASS true but k20 support fails, or k15 gaps not material (min gap <= max(10 x repeat |diff|, 1e-6)), or rho_all <= 0, or rho_without_k25 <= 0",
+    "PROMISING": "SAME_K_PRIMARY_PASS and SAME_K20_SUPPORT and determinism pass and material k15 gaps and rho_all > 0 and rho_without_k25 > 0"
+  },
+  "expected_local_responses": 26,
+  "claim_boundary": "Allowed at most: 'In this previously frozen three-seed red-to-blue dataset, a cheap local OLD-vs-NEW response probe distinguished trajectory-specific downstream forkability at the same denoising timestep.' No predictor, threshold, cross-prompt/edit/model, serving, NIRVANA-comparison, or optimal-rollback claim."
+}
