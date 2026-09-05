@@ -1,0 +1,102 @@
+{
+  "experiment_version": "video-trajectory-fork-oracle-gap-killtest-v1",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875
+  },
+  "prompts": {
+    "old": "A red sports car driving on a snowy road, cinematic video",
+    "new": "A blue sports car driving on a snowy road, cinematic video",
+    "old_concept": "red sports car",
+    "new_concept": "blue sports car"
+  },
+  "seeds": [5678, 6789, 7890, 8901, 9012, 10123, 11234, 12345, 13456, 14567],
+  "excluded_seeds": [1234, 2345, 3456, 4567],
+  "excluded_seeds_reason": "1234 exploratory smoke; 2345/3456/4567 confirmatory + Round 4A; they are context only and never enter the Round 4B denominator",
+  "k_grid": [12, 15, 18, 21, 24],
+  "control_k": 18,
+  "frame_positions": ["first", "q25", "middle", "q75", "last"],
+  "blinded_review": true,
+  "labels": {
+    "scale": ["NEW", "MIXED_NEW_DOMINANT", "MIXED_BALANCED", "MIXED_OLD_DOMINANT", "OLD"],
+    "ordinal": {"NEW": 2, "MIXED_NEW_DOMINANT": 1, "MIXED_BALANCED": 0, "MIXED_OLD_DOMINANT": -1, "OLD": -2},
+    "definitions": {
+      "NEW": "The target vehicle is overwhelmingly blue across the video; any red residue is negligible and does not characterize the body.",
+      "MIXED_NEW_DOMINANT": "Both red and blue are clearly present on the vehicle, but blue dominates the visible body.",
+      "MIXED_BALANCED": "Both red and blue are clearly present and neither visually dominates.",
+      "MIXED_OLD_DOMINANT": "Both red and blue are present, but red dominates the visible body.",
+      "OLD": "The target vehicle is overwhelmingly red; any blue/cyan residue is negligible and does not characterize the body."
+    },
+    "judging_rule": "Judge the whole video plus the five fixed frames (first, 25%, middle, 75%, last); never a favourable single frame. Labels are given blind to seed and K."
+  },
+  "oracle": {
+    "success_labels": ["NEW", "MIXED_NEW_DOMINANT"],
+    "trajectory_oracle": "K_i* := largest grid K such that every grid K' <= K succeeds (monotone cut); 0 if the smallest grid K fails. Monotonicity violations (success after a failure at smaller K) are reported descriptively and never rescue K_i*.",
+    "static_oracle": "K_static(tau) := largest grid K whose success fraction over informative seeds >= tau; 0 if none.",
+    "tau_primary": 1.0,
+    "tau_descriptive": 0.9,
+    "gap": "G := mean_i (K_i* - K_static(1.0)) / 40 (fraction of a full 40-step generation)",
+    "descriptive_only": [
+      "relative gap mean(K_i* - K_static) / (40 - K_static)",
+      "fraction of seeds with K_i* > K_static",
+      "tau = 0.9 K_static and gap",
+      "K_i* distribution and per-seed label sequences",
+      "leave-out-earliest-committing-seed gap",
+      "monotonicity violation count",
+      "CLIP new_minus_old, SSIM (uncalibrated)"
+    ]
+  },
+  "gate": {
+    "probe_pair_cost_fraction": 0.09,
+    "probe_pair_cost_source": "Round 4A results/video_trajectory_fork_probe_killtest/summary.json: OLD+NEW one-step probe pair wall ~21 s vs 237-278 s full generation (0.08-0.09)",
+    "no_go_max_gap": 0.09,
+    "go_min_gap": 0.15,
+    "min_informative_seeds": 8,
+    "decision_order": "INVALID (fewer than 8 informative seeds, or C1 spot exactness fails) > NO-GO (G <= 0.09) > GO (G >= 0.15) > WEAK (0.09 < G < 0.15)",
+    "rationale": "If the best trajectory-specific policy saves at most the cost of measuring the trajectory (one probe pair), trajectory information cannot pay for itself for this edit; the 0.15 GO bar requires the saving to clearly exceed that cost."
+  },
+  "baseline_informativeness": {
+    "manual": ["old_matches_expected", "new_matches_expected", "clearly_different"],
+    "automated": "CLIP new_minus_old < 0 for the OLD baseline and > 0 for the NEW baseline (sign only)",
+    "rule": "informative iff all manual booleans true AND automated signs correct AND OLD/NEW share the identical initial latent; otherwise BASELINE_UNINFORMATIVE (kept in the denominator of the 10, forks not run); manual/automated disagreement counts as uninformative",
+    "stop_rule": "if fewer than 8 of 10 seeds are informative the experiment is INVALID and stops before controls"
+  },
+  "controls": {
+    "C1": "OLD->OLD at K=18 reproduces the OLD baseline bit-exactly (final latent and video) for every informative seed (spot check; the confirmatory experiment established exactness at every k for 3 seeds)",
+    "C2": "OLD and NEW baselines share the identical initial latent",
+    "C3": "trusted WanEulerScheduler / euler solver on every trajectory",
+    "C4": "resume index K, resume timestep = schedule[K], final timestep = schedule[-1], executed steps = 40-K",
+    "C5": "only the conditioning differs after the fork (same seed, config, checkpoint hash bound at controls time)",
+    "C6": "sha256 recorded for initial latent, fork latent, final latent, final video, config, commit"
+  },
+  "concept_metric": {
+    "model": "openai/clip-vit-base-patch32",
+    "frame_count": 8,
+    "old_concept": "red sports car",
+    "new_concept": "blue sports car",
+    "sign_only_threshold": 0.0,
+    "role": "descriptive, uncalibrated"
+  },
+  "excluded": [
+    "any probe or trajectory measurement (Round 4B measures the oracle ceiling only)",
+    "K outside {12,15,18,21,24}",
+    "other prompts, colours, models, schedulers",
+    "correction, blending, interpolation, seed replacement",
+    "seeds 1234/2345/3456/4567 in the denominator",
+    "post-hoc changes to success set, tau, or thresholds"
+  ],
+  "claim_boundary": "One prompt pair (red->blue sports car), one model/scheduler/config, 10 seeds, 5 grid depths, blinded five-level labels by one human judge. The result bounds how much a trajectory-specific fork-depth policy could save over the best static depth for this edit; it makes no mechanism, scheduler, or end-to-end speedup claim and does not transfer to other edits."
+}
