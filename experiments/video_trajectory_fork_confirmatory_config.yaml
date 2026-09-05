@@ -1,0 +1,132 @@
+{
+  "experiment_version": "video-trajectory-fork-confirmatory-v1",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875
+  },
+  "prompts": {
+    "old": "A red sports car driving on a snowy road, cinematic video",
+    "new": "A blue sports car driving on a snowy road, cinematic video",
+    "old_concept": "red sports car",
+    "new_concept": "blue sports car"
+  },
+  "seeds": [
+    2345,
+    3456,
+    4567
+  ],
+  "exploratory_seed_excluded": 1234,
+  "switch_steps": [
+    10,
+    15,
+    20,
+    25
+  ],
+  "frame_positions": [
+    "first",
+    "q25",
+    "middle",
+    "q75",
+    "last"
+  ],
+  "blinded_review": true,
+  "labels": {
+    "scale": [
+      "NEW",
+      "MIXED_NEW_DOMINANT",
+      "MIXED_BALANCED",
+      "MIXED_OLD_DOMINANT",
+      "OLD"
+    ],
+    "ordinal": {
+      "NEW": 2,
+      "MIXED_NEW_DOMINANT": 1,
+      "MIXED_BALANCED": 0,
+      "MIXED_OLD_DOMINANT": -1,
+      "OLD": -2
+    },
+    "definitions": {
+      "NEW": "The target vehicle is overwhelmingly blue across the video; any red residue is negligible and does not characterize the body.",
+      "MIXED_NEW_DOMINANT": "Both red and blue are clearly present on the vehicle, but blue dominates the visible body.",
+      "MIXED_BALANCED": "Both red and blue are clearly present and neither visually dominates.",
+      "MIXED_OLD_DOMINANT": "Both red and blue are present, but red dominates the visible body.",
+      "OLD": "The target vehicle is overwhelmingly red; any blue/cyan residue is negligible and does not characterize the body."
+    },
+    "judging_rule": "Judge the whole video plus the five fixed frames (first, 25%, middle, 75%, last); never a favourable single frame."
+  },
+  "baseline_informativeness": {
+    "manual": [
+      "old_matches_expected",
+      "new_matches_expected",
+      "clearly_different"
+    ],
+    "automated": "CLIP new_minus_old < 0 for the OLD baseline and > 0 for the NEW baseline (sign only)",
+    "rule": "informative iff all manual booleans true AND automated signs correct AND OLD/NEW share the identical initial latent; otherwise BASELINE_UNINFORMATIVE (kept in the denominator, forks not run); manual/automated disagreement is recorded and counts as uninformative",
+    "stop_rule": "if >= 2 of 3 seeds are uninformative the experiment is INVALID and stops"
+  },
+  "gate": {
+    "early_new_labels": [
+      "NEW",
+      "MIXED_NEW_DOMINANT"
+    ],
+    "early_new_steps": [
+      10,
+      15
+    ],
+    "late_shift_reference_step": 15,
+    "late_shift_candidate_steps": [
+      20,
+      25
+    ],
+    "late_shift_rule": "ordinal(k20) < ordinal(k15) or ordinal(k25) < ordinal(k15) (strict)",
+    "frontier_replication": "EARLY_NEW and LATE_SHIFT",
+    "go_min_frontier_seeds": 2,
+    "go_min_early_new_seeds": 2,
+    "no_go_min_early_new_failures": 2,
+    "invalid_min_uninformative_baselines": 2,
+    "decision_order": "INVALID (>=2 uninformative or controls failed) > GO (>=2 clean FRONTIER and >=2 clean EARLY_NEW) > NO-GO (>=2 clean seeds fail EARLY_NEW) > INCONCLUSIVE",
+    "clean_seed": "informative and no METRIC_DISAGREEMENT at any k; only clean seeds count as successes or interpretable failures"
+  },
+  "metric_disagreement": {
+    "rule": "label in {NEW, MIXED_NEW_DOMINANT} with CLIP new_minus_old < 0, or label in {OLD, MIXED_OLD_DOMINANT} with new_minus_old > 0; MIXED_BALANCED never disagrees",
+    "effect": "seed is flagged; it cannot count as success or interpretable failure"
+  },
+  "concept_metric": {
+    "model": "openai/clip-vit-base-patch32",
+    "frame_count": 8,
+    "old_concept": "red sports car",
+    "new_concept": "blue sports car",
+    "sign_only_threshold": 0.0,
+    "role": "descriptive, uncalibrated"
+  },
+  "controls": {
+    "C1": "OLD->OLD at every k reproduces the OLD baseline bit-exactly (final latent and video)",
+    "C2": "OLD and NEW baselines share the identical initial latent",
+    "C3": "trusted WanEulerScheduler / euler solver on every trajectory",
+    "C4": "resume index k, resume timestep = schedule[k], final timestep = schedule[-1], executed steps = 40-k (no repeat, no skip)",
+    "C5": "only the conditioning differs after the fork (same seed, config, checkpoint hash)",
+    "C6": "sha256 recorded for initial latent, fork latent, final latent, final video, config, commit; prompt embeddings are not exposed by the pipeline and are not recorded"
+  },
+  "excluded": [
+    "k=5",
+    "k=30",
+    "other prompts or colours",
+    "other models or schedulers",
+    "correction, blending, interpolation",
+    "seed replacement",
+    "exploratory seed 1234 in the denominator"
+  ]
+}
