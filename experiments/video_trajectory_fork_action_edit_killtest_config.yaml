@@ -1,0 +1,72 @@
+{
+  "experiment_version": "video-trajectory-fork-action-edit-screening-v1",
+  "round": "4C-0 extension: action edit (final STOP / INVEST decision for the trajectory-fork branch)",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {"name": "WanEulerScheduler", "sample_solver": "euler", "num_train_timesteps": 1000, "flow_shift": 12.0},
+  "generation": {"height": 480, "width": 832, "num_frames": 33, "num_inference_steps": 40, "guidance_scale": 4.0, "fps": 16.0, "boundary_ratio": 0.875},
+  "edit": "action",
+  "prompts": {
+    "old": "A red sports car driving forward on a snowy road, static camera, cinematic video",
+    "new": "A red sports car parked motionless on a snowy road, static camera, cinematic video",
+    "old_concept": "a car driving",
+    "new_concept": "a parked car",
+    "camera_control": "both prompts carry 'static camera' so that camera motion does not masquerade as vehicle motion"
+  },
+  "seeds": [5678, 6789, 7890, 8901],
+  "k_grid": [4, 8, 12, 16, 20, 24],
+  "control_k": 8,
+  "frame_positions": ["first", "q25", "middle", "q75", "last"],
+  "blinded_review": true,
+  "labels": {
+    "scale": ["NEW", "MIXED_NEW_DOMINANT", "MIXED_BALANCED", "MIXED_OLD_DOMINANT", "OLD"],
+    "ordinal": {"NEW": 2, "MIXED_NEW_DOMINANT": 1, "MIXED_BALANCED": 0, "MIXED_OLD_DOMINANT": -1, "OLD": -2},
+    "definitions": {
+      "NEW": "The vehicle is clearly stationary relative to the road throughout the video.",
+      "MIXED_NEW_DOMINANT": "The vehicle is stationary for most of the video, with weak or brief movement.",
+      "MIXED_BALANCED": "Evidence of stationary and driving states is comparable, or the vehicle's motion is indeterminate.",
+      "MIXED_OLD_DOMINANT": "The vehicle drives for most of the video, with some stationary or indeterminate segments.",
+      "OLD": "The vehicle is clearly and continuously driving."
+    },
+    "judging_rule": "Judge vehicle motion relative to the road over the whole video plus the five fixed frames; ignore colour, vehicle type and scenery. Baselines and forks are mixed in one blinded pool; seed, K and sample type are hidden."
+  },
+  "oracle": {
+    "success_labels": ["NEW", "MIXED_NEW_DOMINANT"],
+    "trajectory_oracle": "K_i* := largest grid K such that every grid K' <= K succeeds (monotone cut); 0 if K=4 fails",
+    "dispersion": ">= 2 distinct K_i* values and max - min >= 8",
+    "static_retry": "C_static(K) := (40 - K) + p_fail(K) * 40 for K in grid u {0}; perfect free checker assumed",
+    "gap_retry": "(min_K C_static(K) - mean_i(40 - K_i*)) / 40"
+  },
+  "gate": {
+    "strong_min_gap": 0.15,
+    "dispersion_min_range": 8,
+    "min_informative_seeds": 3,
+    "edit_rule": "EDIT_STRONG iff DISPERSION and gap_retry >= 0.15; EDIT_INVALID if fewer than 3 informative seeds or C1 fails; otherwise EDIT_WEAK",
+    "final_decision_rule": "INVEST_4C1 iff action is EDIT_STRONG (with Round 4C-0 background STRONG this makes 2 of 4 edit classes strong); otherwise STOP_DIFFUSION_REUSE. INVALID only reports. This is the last cheap extension of the branch: no K-grid change, no edit swap or addition, no seed addition, no threshold change regardless of how ambiguous the result is.",
+    "stop_rule": "STOP_DIFFUSION_REUSE closes the trajectory-fork line and all diffusion intermediate-state reuse work; no rescue characterization"
+  },
+  "baseline_informativeness": {
+    "method": "blinded_human",
+    "old_baseline_required_label": "OLD",
+    "new_baseline_required_label": "NEW",
+    "plus": "identical initial latent between OLD and NEW baselines",
+    "automated_validity_gate": null,
+    "rationale": "For an action edit the semantic ground truth is human motion judgment; CLIP (8 frames) and frame-difference energy are both unreliable for motion and would risk killing the experiment through the evaluator rather than the science. Baselines are therefore labelled blind inside the same pool as the forks, and a seed is informative iff its OLD baseline is labelled OLD and its NEW baseline NEW. Forks are executed for every seed before labelling; uninformative seeds are dropped from the denominator at analysis."
+  },
+  "motion_metric_descriptive": {
+    "definition": "mean absolute grayscale frame difference over the whole frame, normalized to [0,1]",
+    "role": "descriptive secondary only; reported against human labels as a candidate automated evaluator for a later large-N round; never a gate"
+  },
+  "controls": {
+    "C1": "OLD->OLD at K=8 reproduces the OLD baseline bit-exactly for every seed",
+    "C2": "OLD and NEW baselines share the identical initial latent",
+    "C3": "trusted WanEulerScheduler / euler solver on every trajectory",
+    "C4": "resume index K, resume timestep = schedule[K], final timestep = schedule[-1], executed steps = 40-K",
+    "C5": "only the conditioning differs after the fork (checkpoint hash bound at controls time)",
+    "C6": "sha256 recorded for initial latent, fork latent, final latent, final video, config, commit",
+    "note": "C0 (bit-exact OLD vs a prior round) does not apply: the action OLD prompt is new"
+  },
+  "concept_metric": {"model": "openai/clip-vit-base-patch32", "frame_count": 8, "old_concept": "a car driving", "new_concept": "a parked car", "sign_only_threshold": 0.0, "role": "descriptive only; not used for informativeness"},
+  "excluded": ["any probe", "any automated validity gate", "K outside the grid", "seed replacement or addition", "further edit classes after this one", "changing success set, dispersion rule, or thresholds after results", "treating n<=4 results as statistical evidence"],
+  "claim_boundary": "One model/scheduler/config, four seeds, one action prompt pair with a static-camera control, blinded five-level labels by one human judge covering baselines and forks. The result screens whether per-trajectory fork-depth dispersion and a retry-adjusted oracle gap appear for an action edit; it supports no statistical claim, no mechanism, no speedup, and no generalization beyond this prompt pair. Together with Round 4C-0 it decides only whether the branch continues."
+}
