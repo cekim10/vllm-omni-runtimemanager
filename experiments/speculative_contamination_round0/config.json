@@ -1,0 +1,160 @@
+{
+  "experiment_version": "speculative-contamination-round0-v3",
+  "round": "Round 0 rev 3: after four skipped/stale regional updates, does correctness require a global dense refresh, or can a dependency-bounded subset regenerated with actual target computation restore the trajectory? (no serving system, no scheduler, no draft model, no kernels, no sparse compute)",
+  "primary_question": "When region-selective diffusion execution introduces a localized approximation error (frozen regime: a region skipped its last L = 4 target updates and kept its last velocity), does correctness require a global dense refresh, or can an actually recomputable dependency-bounded subset, regenerated over the d = 4 following steps, recover the trajectory?",
+  "related_work_and_problem_statement": "Prior work already demonstrates region-selective diffusion execution (SpotEdit, RegionCache, FlashPS/InstGenIE, Chorus SRD), stale-state / KV reuse and heterogeneous token progress (RAS, HSA, RhymeFlow, Patch Forcing, AsyncPatch, AsynDM), and periodic dense refresh to control accumulated regional approximation error (RAS dense steps, RhymeFlow rhythmic points, Chorus Stage 3). This experiment does NOT claim region-selective execution, stale-state reuse, heterogeneous progress, or dense refresh. It asks whether accumulated regional approximation error requires GLOBAL repair, or whether a dependency-bounded subset can restore correctness. Nearest prior ideas to cite at the boundary: ToCa (proactive attention-weight-estimated error-propagation scoring to choose which tokens to compute) and Chorus's hierarchical M_see context halo (context expansion without recomputation).",
+  "headroom_disclaimer": "Round 0 does NOT establish end-to-end systems headroom, speedup, throughput, GPU savings or SLO benefit. It measures structural recoverability under one controlled approximation regime with full target forwards. If R_compute* is small, Round 1 must measure real skipped compute, failure/error frequency, dense-refresh frequency and cost, actual sparse selective-recompute GPU cost, verification cost, dependency-discovery overhead, synchronization/versioning overhead, and net end-to-end speedup against the GLOBAL_DENSE_REFRESH baseline before any systems claim is made.",
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "model_revision": null,
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875
+  },
+  "prompts": [
+    {
+      "category": "static",
+      "prompt": "A red vintage car parked on a quiet cobblestone street at dusk, still camera, cinematic video"
+    },
+    {
+      "category": "object_motion",
+      "prompt": "A red sports car driving on a snowy road, cinematic video"
+    },
+    {
+      "category": "articulated_motion",
+      "prompt": "A person in a yellow raincoat jogging along a beach at sunrise, cinematic video"
+    },
+    {
+      "category": "complex_scene",
+      "prompt": "A busy city intersection at night with crowds, traffic and neon signs, camera slowly panning, cinematic video"
+    }
+  ],
+  "seeds": [
+    9101,
+    9202
+  ],
+  "decision_seed": 9101,
+  "seed_roles": "all 8 trajectories run CONTROL_ZERO and STALE_VELOCITY (L=4) no-repair; materiality is evaluated over all 24 (trajectory, t) cells; the 4 decision-seed trajectories additionally run the oracle and recompute sweeps and the descriptive W1 / GAUSS_HIGH no-repair arms",
+  "checkpoints": [
+    12,
+    20,
+    28
+  ],
+  "propagation_offsets": [
+    1,
+    2,
+    4
+  ],
+  "repair_offset": 4,
+  "thresholds": {
+    "material_threshold": 0.02,
+    "trace_threshold_descriptive": 0.01,
+    "recovery_rel_l2": 0.02,
+    "recovery_ssim": 0.95,
+    "recovery_sensitivity_descriptive": [
+      0.01,
+      0.02,
+      0.05,
+      0.1
+    ],
+    "material_cell_fraction_min": 0.5,
+    "rcompute_strong_go": 0.2,
+    "rcompute_go": 0.4,
+    "rcompute_weak": 0.7,
+    "gauss_high_alpha": 0.3,
+    "stale_window_primary": 4,
+    "stale_window_secondary": 1,
+    "decision_error_model": "STALE_VELOCITY",
+    "decision_regions": [
+      "SPATIAL_SMALL",
+      "TEMPORAL_MEDIUM"
+    ],
+    "repair_offset_d": 4,
+    "weak_band_domains": {
+      "SPATIAL_SMALL": [
+        "50",
+        "60"
+      ],
+      "TEMPORAL_MEDIUM": [
+        "56"
+      ]
+    }
+  },
+  "matrix": {
+    "decision_regions": [
+      "SPATIAL_SMALL",
+      "TEMPORAL_MEDIUM"
+    ],
+    "decision_error_model": "STALE_VELOCITY",
+    "secondary_error_models": [
+      "STALE_VELOCITY_W1",
+      "GAUSS_HIGH"
+    ],
+    "recovery_domains": {
+      "SPATIAL_SMALL": [
+        "R",
+        "20",
+        "40",
+        "70",
+        "100"
+      ],
+      "TEMPORAL_MEDIUM": [
+        "R",
+        "22",
+        "44",
+        "67",
+        "100"
+      ]
+    },
+    "weak_band_characterization_domains": {
+      "SPATIAL_SMALL": [
+        "50",
+        "60"
+      ],
+      "TEMPORAL_MEDIUM": [
+        "56"
+      ]
+    },
+    "arms": [
+      "CONTROL_ZERO",
+      "NO_REPAIR (= GLOBAL_DENSE_REFRESH)",
+      "ORACLE_REPAIR(D) incl. 100% = FULL_ROLLBACK (copy)",
+      "FULL-FORWARD SELECTIVE-STATE RECOMPUTATION with cached contaminated context (D) incl. 100% = FULL_ROLLBACK (chained clean steps)",
+      "WEAK-band characterization (RECOMPUTE at frozen intermediate domains; descriptive only; only if WEAK)"
+    ],
+    "early_stop": "analyze may return STOP_NO_RECOVERY_PROBLEM (or INVALID) from reference + propagation alone; the oracle and recompute phases are required only when the materiality gate passes"
+  },
+  "quarantine": "DEFERRED_TO_ROUND1",
+  "blinded_review": false,
+  "excluded": [
+    "changing thresholds, regions, error models, L, d, prompts, seeds or the timestep grid after any GPU outcome is inspected",
+    "replacing failed-looking generations",
+    "claiming runtime speedup, GPU savings or throughput from oracle latent replacement or from latent-fraction recompute",
+    "using attention maps as causal evidence",
+    "treating STALE_VELOCITY as a draft-model error distribution",
+    "treating R_state* << 1 as GO when R_compute* ~= 1",
+    "using the WEAK-band characterization to upgrade the verdict",
+    "generalizing a STOP beyond the frozen L = 4 / d = 4 regime"
+  ],
+  "claim_boundary": "One model / scheduler / configuration, 8 trajectories (4 for the sweeps), three checkpoints, one stale window L = 4, one repair window d = 4, one controlled approximation error (RAS/HSA cached-velocity form). Results characterize whether a dependency-bounded subset regenerated with full target forwards against cached contaminated context restores the trusted Wan2.2 Euler trajectory; they do not measure real draft/target mismatch, skipped compute, sparse execution cost, verification cost, or any speedup. Similarity to CLEAN is not perceptual quality.",
+  "recompute_arm_label": "FULL-FORWARD SELECTIVE-STATE RECOMPUTATION with cached contaminated context",
+  "recompute_arm_statement": "Every recompute step executes a full 14,040-token target forward through the trusted pipeline; only the recovery-domain output is retained; non-domain tokens are supplied as the cached perturbed-trajectory latents, so their K/V are recomputed inside the forward from contaminated inputs (optimistic relative to a cached-K/V engine). This measures logical/state recomputability under cached context. It does NOT demonstrate sparse GPU compute proportional to |D|. Actual sparse selective execution and its cost are deferred to Round 1.",
+  "verification_semantics": "The recompute arm starts from the verified clean x_t[D]. In a real region-selective system, obtaining the verified region state after L stale updates requires either re-deriving R's skipped target updates (L query-side partial forwards for R over the stale window, with the context those steps would need) or a target check at t that detects the error and triggers that re-derivation. This verification/re-derivation cost is NOT counted in Round 0; verification is NOT assumed to be free. In this error model non-R is clean during the stale window, which is itself an idealization.",
+  "cost_semantics": {
+    "GLOBAL_DENSE_REFRESH": "continue from the approximate state x'_t using dense target execution; no extra rollback/recompute window; 40 - t dense forwards; zero extra work. Identical in effect to the RAS/HSA dense-step reset and Chorus Stage-3 full recompute, placed at the earliest possible moment (most favourable to the baseline). Implemented as the NO_REPAIR arm.",
+    "FULL_ROLLBACK": "re-execute the entire failed window t..t+d for all tokens from the verified state, then continue; 40 - t dense forwards + d full forwards. Implemented as ORACLE 100% (copy) and RECOMPUTE 100% (chained clean single steps); both must be bit-exact with the reference.",
+    "SELECTIVE_STATE_RECOMPUTE(D)": "re-execute the failed window logically for D while preserving cached non-D state; idealized cost 40 - t dense forwards + d * |D|/N forwards; in this experiment implemented with d FULL target forwards (14,040 tokens each) and therefore has NO measured sparse-compute speedup. Theoretical idealized saved window work d * (1 - |D|/N) is reported separately from the actual experimental GPU work (d full forwards).",
+    "ceiling_note": "relative to FULL_ROLLBACK, any selective repair can save at most d = 4 partial forwards per failure event; relative to GLOBAL_DENSE_REFRESH it costs extra work and is justified only where dense refresh fails to restore correctness."
+  },
+  "kill_scope": "Any STOP / NO_GO result applies to the frozen regime only: STALE_VELOCITY with L = 4 stale regional updates, repair window d = 4, regions SPATIAL_SMALL (3.85%) and TEMPORAL_MEDIUM (11.1%), checkpoints {12, 20, 28}, the frozen recovery criterion (final rel-L2 <= 0.02 and SSIM >= 0.95) and material threshold (0.02 latent std). It must not be generalized to arbitrary regional approximation regimes, other L, other d, or other error models; any such extension requires a new preregistration and re-audit."
+}
