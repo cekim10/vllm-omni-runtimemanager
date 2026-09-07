@@ -10,10 +10,12 @@ Latent geometry (trusted Wan2.2 T2V path, 480x832x33, 40 Euler steps):
     token index = f * 1560 + h * 52 + w (patch_embedding -> flatten(2) -> transpose(1, 2)); full self-attention with 3D RoPE.
 
 Trusted scheduler (WanEulerScheduler.step):  x_{k+1} = x_k + (sigma_{k+1} - sigma_k) * v_k,  sigma_k = timesteps[k] / 1000.
-STALE_VELOCITY (primary error model): the region R skipped its last L target updates and kept the velocity of its last active
-step (the RAS / HSA "cached Euler update"), so at the checkpoint t
-    x'_t[R] = x_{t-L}[R] + (sigma_t - sigma_{t-L}) * v_{t-L-1}[R],   v_{t-L-1} = (x_{t-L} - x_{t-L-1}) / (sigma_{t-L} - sigma_{t-L-1}),
-everything else equal to the clean x_t. PRIMARY L = 4 (frozen on real-model evidence: L = 1 is below the bf16 resolution floor at
+STALE_VELOCITY (primary error model): the region R skipped its last L target updates and kept the ACTUAL model output of its
+last active step, v_{t-L-1} = guidance_combined_output captured by the within-step probe (the RAS / HSA "cached Euler update"),
+applied step by step with the scheduler's bf16 realisation:
+    x'_{t-L}[R] = x_{t-L}[R];   for k = t-L .. t-1:  x'_{k+1}[R] = bf16( x'_k[R] + (sigma_{k+1} - sigma_k) * v_{t-L-1}[R] )
+everything else equal to the clean x_t. Velocities are never inferred from bf16 state differences (attempt 1 showed those are
+quantisation-dominated at high noise: one-step updates of ~0.006 vs a bf16 ulp of 0.0078). PRIMARY L = 4 (frozen on real-model evidence: L = 1 is below the bf16 resolution floor at
 injection; existing region-selective systems skip regional updates across several steps). L = 1 is a descriptive magnitude arm.
 Primary repair window d = 4 (aligned with L): after four stale regional updates, can correctness be restored by recomputing
 substantially less than the full state?
@@ -177,7 +179,8 @@ def implied_velocity(x_k: np.ndarray, x_k1: np.ndarray, sigmas: np.ndarray, k: i
 
 
 def euler_step(x_k: np.ndarray, v_k: np.ndarray, sigmas: np.ndarray, k: int) -> np.ndarray:
-    return (x_k.astype(np.float64) + delta_sigma(sigmas, k) * v_k.astype(np.float64)).astype(np.float32)
+    """fp32 arithmetic exactly as WanEulerScheduler.step (sample.to(float32) + fp32 delta_sigma * model_output); caller applies the bf16 cast."""
+    return (x_k.astype(np.float32) + np.float32(delta_sigma(sigmas, k)) * v_k.astype(np.float32)).astype(np.float32)
 
 
 # --------------------------------------------------------------------------------------
@@ -222,22 +225,25 @@ def _perturbation_stats(x_clean: np.ndarray, x_pert: np.ndarray, region: str, on
     return stats
 
 
-def stale_velocity_state(*, x_last_active_prev: np.ndarray, x_last_active: np.ndarray, x_t: np.ndarray, sigmas: np.ndarray, t: int, window: int, region: str) -> tuple[np.ndarray, dict[str, Any]]:
-    """x'_t[R] = x_{t-L}[R] + (sigma_t - sigma_{t-L}) * v_{t-L-1}[R] with v from the last active step; bf16-realised; outside R clean.
+def stale_velocity_state(*, x_last_active: np.ndarray, v_last_active: np.ndarray, x_t: np.ndarray, sigmas: np.ndarray, t: int, window: int, region: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """Cached Euler update: from x_{t-L}, apply the ACTUAL model output of the last active step (v_{t-L-1}) for L steps, bf16 per step, inside R only.
 
-    x_last_active_prev = x_{t-L-1}, x_last_active = x_{t-L}. With window L = 1 this is the previous-step velocity applied at step t-1.
+    x_last_active = x_{t-L}; v_last_active = guidance_combined_output at step t-L-1 (probe-captured, bf16-realised). Outside R: clean x_t.
     """
     if window < 1 or t - window - 1 < 0:
         raise ValueError("stale window out of range")
-    v_stale = implied_velocity(x_last_active_prev, x_last_active, sigmas, t - window - 1)
-    total_dsigma = float(sigmas[t] - sigmas[t - window])
+    if v_last_active.shape != LATENT_SHAPE or x_last_active.shape != LATENT_SHAPE:
+        raise ValueError("velocity / state shape mismatch")
     mask = token_to_latent_mask(REGIONS[region].token_mask())
-    x_stale = (x_last_active.astype(np.float64) + total_dsigma * v_stale).astype(np.float32)
-    x_pert = np.where(mask, bf16_round(x_stale), x_t.astype(np.float32)).astype(np.float32)
+    x = x_last_active.astype(np.float32)
+    v = v_last_active.astype(np.float32)
+    for k in range(t - window, t):
+        x = bf16_round((x.astype(np.float32) + np.float32(delta_sigma(sigmas, k)) * v).astype(np.float32))  # fp32 add, bf16 cast: WanEulerScheduler.step
+    x_pert = np.where(mask, x, x_t.astype(np.float32)).astype(np.float32)
     stats = _perturbation_stats(x_t, x_pert, region, None)
     stats.update({"error_model": "STALE_VELOCITY" if window == STALE_WINDOW_PRIMARY else f"STALE_VELOCITY_W{window}", "window": window,
-                  "last_active_step": t - window - 1, "delta_sigma_stale_step": delta_sigma(sigmas, t - window - 1), "total_delta_sigma_window": total_dsigma,
-                  "formula": "x'_t[R] = x_{t-L}[R] + (sigma_t - sigma_{t-L}) * (x_{t-L} - x_{t-L-1})[R] / (sigma_{t-L} - sigma_{t-L-1})"})
+                  "last_active_step": t - window - 1, "total_delta_sigma_window": float(sigmas[t] - sigmas[t - window]),
+                  "formula": "x'_{t-L}=x_{t-L}; for k=t-L..t-1: x'_{k+1}[R] = bf16(x'_k[R] + (sigma_{k+1}-sigma_k) * v_{t-L-1}[R]); v = probe-captured model output"})
     return x_pert, stats
 
 

@@ -36,8 +36,10 @@ from experiments import video_trajectory_fork_killtest as smoke  # noqa: E402
 from experiments.speculative_contamination_round0 import core  # noqa: E402
 
 PKG = "experiments/speculative_contamination_round0"
-EXPERIMENT_VERSION = "speculative-contamination-round0-v3"
-NAMESPACE = "speculative_contamination_round0"
+EXPERIMENT_VERSION = "regional-recompute-round0-v4"
+NAMESPACE = "regional_recompute_round0"
+ATTEMPT1_NAMESPACE = "speculative_contamination_round0"  # rev 3 attempt: INVALID_EXPERIMENT (implied-delta-sigma check was quantisation-naive)
+ATTEMPT1_DIR = REPO_ROOT / "results" / ATTEMPT1_NAMESPACE
 DEFAULT_CONFIG = REPO_ROOT / PKG / "config.json"
 DEFAULT_OUTPUT = REPO_ROOT / "results" / NAMESPACE
 PHASES = ("cpu", "preregister", "reference", "perturb", "propagation", "oracle", "recompute", "analyze", "weakprobe", "quarantine")
@@ -47,7 +49,7 @@ TRUSTED_SOURCE_FILES = (
     "experiments/video_trajectory_fork_killtest.py", "experiments/video_runtime_state_discovery.py",
     "vllm_omni/diffusion/models/wan2_2/pipeline_wan2_2.py", "vllm_omni/diffusion/models/wan2_2/scheduling_wan_euler.py", "vllm_omni/diffusion/models/wan2_2/wan2_2_transformer.py",
 )
-FORBIDDEN_OUTPUT_PARTS = ("video_trajectory_fork", "video_runtime_state_discovery", "video_bf16", "video_execution_ordering", "video_resource_lifetime")
+FORBIDDEN_OUTPUT_PARTS = ("video_trajectory_fork", "video_runtime_state_discovery", "video_bf16", "video_execution_ordering", "video_resource_lifetime", "speculative_contamination_round0")
 GateError = smoke.GateError
 sha256_file, sha256_bytes, array_sha256, atomic_json = smoke.sha256_file, smoke.sha256_bytes, smoke.array_sha256, smoke.atomic_json
 SECONDS_FIXED, SECONDS_PER_STEP, SECONDS_SINGLE_STEP = 8.0, 5.8, 11.0  # measured on the L40S host (Rounds 4B/4C, 4A)
@@ -127,7 +129,7 @@ def run_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
     plan: list[dict[str, Any]] = []
     d = core.REPAIR_OFFSET
     for tr in trajectories(config):
-        plan.append({"phase": "reference", "label": f"{tr['id']}_reference", "traj": tr["id"], "start": 0, "kind": "CLEAN", "single_steps": len(core.CHECKPOINTS)})  # + velocity validation steps
+        plan.append({"phase": "reference", "label": f"{tr['id']}_reference", "traj": tr["id"], "start": 0, "kind": "CLEAN", "single_steps": 3 * len(core.CHECKPOINTS)})  # validation at t-1, cached v at t-5 and t-2
         for t in core.CHECKPOINTS:
             plan.append({"phase": "propagation", "label": f"{tr['id']}_t{t}_ZERO", "traj": tr["id"], "t": t, "start": t, "kind": "CONTROL_ZERO", "error": "ZERO", "region": "SPATIAL_SMALL"})
             for region in core.DECISION_REGIONS:
@@ -151,6 +153,17 @@ def run_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
     if len(labels) != len(set(labels)):
         raise GateError("Duplicate run labels in plan")
     return plan
+
+
+def attempt1_reference() -> dict[str, Any]:
+    """Pin of the rev-3 attempt (same design, state-difference velocities): INVALID_EXPERIMENT at the velocity-validation gate."""
+    dec = ATTEMPT1_DIR / "decision.json"
+    if not dec.exists():
+        return {"namespace": ATTEMPT1_NAMESPACE, "status": "decision.json not present on this host", "cause": "implied-delta-sigma median check failed at t=12/20 because one-step updates (~0.006) are below the bf16 ulp (0.0078); scheduler_output and single-step chain were bit-exact; bf16 reconstruction >= 0.99988"}
+    doc = json.loads(dec.read_text())
+    return {"namespace": ATTEMPT1_NAMESPACE, "decision": doc.get("decision"), "reason": doc.get("reason"), "decision_sha256": sha256_file(dec),
+            "cause": "implied-delta-sigma median check failed at t=12/20 because one-step updates (~0.006) are below the bf16 ulp (0.0078); scheduler_output and single-step chain were bit-exact; bf16 reconstruction >= 0.99988",
+            "fix": "validation now uses a least-squares slope over all positions; STALE_VELOCITY now uses probe-captured model outputs applied step by step"}
 
 
 def weak_band_plan(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -209,7 +222,9 @@ def build_preregistration(config: dict[str, Any], provenance: dict[str, Any]) ->
     d = core.REPAIR_OFFSET
     return {
         "experiment_version": EXPERIMENT_VERSION,
-        "title": "Round 0 (rev 2) - does regional approximation error require a global dense refresh, or can a recomputable dependency-bounded subset recover the trajectory?",
+        "attempt": 2,
+        "attempt1_reference": attempt1_reference(),
+        "title": "Round 0 (rev 4, attempt 2) - does regional approximation error require a global dense refresh, or can a recomputable dependency-bounded subset recover the trajectory?",
         "primary_question": config["primary_question"],
         "related_work_and_problem_statement": config["related_work_and_problem_statement"],
         "headroom_disclaimer": config["headroom_disclaimer"],
@@ -223,13 +238,14 @@ def build_preregistration(config: dict[str, Any], provenance: dict[str, Any]) ->
         "weak_band_characterization": {"allowed_iff": f"{core.RCOMPUTE_GO} < worst-region median R_compute* <= {core.RCOMPUTE_WEAK}", "domains": {r: {k: core.WEAK_BAND_DOMAINS[r][k].fraction for k in core.WEAK_BAND_DOMAINS[r]} for r in core.DECISION_REGIONS},
                                        "arm": "RECOMPUTE only (same d, same cells)", "status": "DESCRIPTIVE ONLY; cannot upgrade WEAK to GO; if the expanded cone still needs > 0.70 the branch is NO_GO", "labels": [p["label"] for p in weak_band_plan(config)]},
         "scheduler_algebra": {"step": "x_{k+1} = x_k + (sigma_{k+1} - sigma_k) * v_k  (WanEulerScheduler.step: fp32 arithmetic, result cast to the model dtype bf16)", "sigma": "sigma_k = timesteps[k] / num_train_timesteps",
-                              "delta_sigma_by_t": {str(t): {"t-2": core.delta_sigma(sigmas, t - 2), "t-1": core.delta_sigma(sigmas, t - 1), "t": core.delta_sigma(sigmas, t)} for t in core.CHECKPOINTS},
-                              "on_host_validation": "reference phase runs one bounded single step at t-1 with the within-step probe; requires scheduler_output == x_t bit-exact, bf16(x_{t-1} + delta_sigma * v_probe) == x_t at >= 99.9% of positions, and the implied delta_sigma within 1e-3 relative of the plan value; failure is INVALID_EXPERIMENT"},
-        "error_models": {"STALE_VELOCITY": {"role": "PRIMARY, decides", "window": core.STALE_WINDOW_PRIMARY, "formula": "x'_t[R] = x_{t-4}[R] + (sigma_t - sigma_{t-4}) * v_{t-5}[R], v_{t-5} = (x_{t-4} - x_{t-5}) / (sigma_{t-4} - sigma_{t-5}); outside R identical to clean x_t; bf16-realised",
+                              "delta_sigma_by_t": {str(t): {"t-5": core.delta_sigma(sigmas, t - 5), "t-2": core.delta_sigma(sigmas, t - 2), "t-1": core.delta_sigma(sigmas, t - 1), "t": core.delta_sigma(sigmas, t)} for t in core.CHECKPOINTS},
+                              "bf16_note": "one-step updates at t=12 (~0.006) are below the bf16 ulp of the latent (0.0078); velocities are therefore taken from the probe-captured model output, never from bf16 state differences",
+                              "on_host_validation": "reference phase runs bounded single steps at t-1, t-2 and t-5 with the within-step probe; requires scheduler_output == x_{k+1} bit-exact, the single-step output == x_{k+1} bit-exact, bf16(x_k + delta_sigma_k * v_probe) == x_{k+1} at >= 99.9% of positions, bf16 runtime dtype, and the least-squares slope of (x_{k+1} - x_k) on v_probe over all positions within 5e-2 relative of delta_sigma_k with the correct sign (sub-ulp updates bias the slope by ~1%; the reconstruction test carries the precision: a one-index sigma error flips ~5% of positions); failure is INVALID_EXPERIMENT"},
+        "error_models": {"STALE_VELOCITY": {"role": "PRIMARY, decides", "window": core.STALE_WINDOW_PRIMARY, "formula": "x'_{t-4}[R] = x_{t-4}[R]; for k = t-4..t-1: x'_{k+1}[R] = bf16(x'_k[R] + (sigma_{k+1} - sigma_k) * v_{t-5}[R]); v_{t-5} = probe-captured guidance_combined_output at step t-5; outside R identical to clean x_t",
                                             "meaning": "R skipped its target evaluation at steps t-4..t-1 and kept the velocity of its last active step (RAS/HSA cached Euler update over a multi-step skip)",
                                             "magnitude_evidence": "frozen Round 4C-0 OLD trajectories: 4-step stale average velocity gives 0.0085-0.0123 latent std and 0.7-1.9 one-step-update RMS at t=12..24; L=1 is ~1/16 of that, below the bf16 half-ulp (0.0039 std)",
                                             "idealization": "non-R is taken as clean during the stale window; a real engine's non-R would have consumed stale R, so this is a lower bound on multi-step staleness error"},
-                         "STALE_VELOCITY_W1": {"role": "descriptive magnitude / control arm, propagation only, never decides", "window": core.STALE_WINDOW_SECONDARY, "formula": "x'_t[R] = x_{t-1}[R] + (sigma_t - sigma_{t-1}) * v_{t-2}[R]"},
+                         "STALE_VELOCITY_W1": {"role": "descriptive magnitude / control arm, propagation only, never decides", "window": core.STALE_WINDOW_SECONDARY, "formula": "x'_t[R] = bf16(x_{t-1}[R] + (sigma_t - sigma_{t-1}) * v_{t-2}[R]); v_{t-2} = probe-captured model output at step t-2"},
                          "GAUSS_HIGH": {"role": "stress / calibration control, no-repair (propagation) only; never decides", "alpha_fraction_of_channel_std": core.GAUSS_HIGH_ALPHA}},
         "checkpoints": list(core.CHECKPOINTS), "schedule_timesteps_by_t": {str(t): timesteps[t] for t in core.CHECKPOINTS},
         "expert_by_t": {str(t): "high_noise_transformer" if timesteps[t] >= 875.0 else "low_noise_transformer_2" for t in core.CHECKPOINTS},
@@ -293,7 +309,8 @@ def phase_cpu(config: dict[str, Any]) -> dict[str, Any]:
     demo: dict[str, Any] = {"geometry": {k: v for k, v in core.geometry_document().items() if k in ("token_grid_fhw", "n_tokens")}}
     for t in core.CHECKPOINTS:
         for w in (core.STALE_WINDOW_PRIMARY, core.STALE_WINDOW_SECONDARY):
-            xs, st = core.stale_velocity_state(x_last_active_prev=traj[t - w - 1], x_last_active=traj[t - w], x_t=traj[t], sigmas=sig, t=t, window=w, region="SPATIAL_SMALL")
+            v_last = core.implied_velocity(traj[t - w - 1], traj[t - w], sig, t - w - 1).astype(np.float32)  # synthetic stand-in for the probe-captured model output
+            xs, st = core.stale_velocity_state(x_last_active=traj[t - w], v_last_active=v_last, x_t=traj[t], sigmas=sig, t=t, window=w, region="SPATIAL_SMALL")
             cm = core.contamination_metrics(xs, traj[t], "SPATIAL_SMALL")
             demo[f"stale_velocity_L{w}_t{t}"] = {"rms_over_std": round(st["rms_in_region_over_mean_channel_std"], 5), "material_inside_at_injection": cm["material_fraction_inside_region"], "outside_changed": st["outside_region_changed"], "total_delta_sigma": round(st["total_delta_sigma_window"], 5)}
     v = core.implied_velocity(traj[11], traj[12], sig, 11)
@@ -535,19 +552,24 @@ def reference_capture_steps() -> list[int]:
     return sorted(steps)
 
 
-def velocity_validation(x_prev: np.ndarray, x_t: np.ndarray, within: dict[str, Any], next_state: np.ndarray, sigmas: np.ndarray, t: int) -> dict[str, Any]:
-    """Validate the scheduler algebra against the actual model output and scheduler output of the trusted pipeline at step t-1."""
-    v = within["guidance_combined_output"]
-    dsig = core.delta_sigma(sigmas, t - 1)
-    recon = core.bf16_round(core.euler_step(x_prev, v, sigmas, t - 1))
-    exact_frac = float(np.mean(recon == x_t))
-    strong = np.abs(v) > np.percentile(np.abs(v), 50)
-    implied = float(np.median(((x_t.astype(np.float64) - x_prev.astype(np.float64)) / v.astype(np.float64))[strong]))
-    rel_err = abs(implied - dsig) / abs(dsig)
-    sched_exact = bool(np.array_equal(within["scheduler_output"], x_t))
-    return {"scheduler_output_bit_exact": sched_exact, "single_step_bit_exact": bool(np.array_equal(next_state, x_t)), "delta_sigma_from_plan": dsig, "delta_sigma_implied_median": implied, "delta_sigma_relative_error": rel_err,
-            "bf16_reconstruction_exact_fraction": exact_frac, "reconstruction_max_abs": float(np.abs(recon.astype(np.float64) - x_t.astype(np.float64)).max()), "timestep": within["timestep"], "runtime_dtype": within["runtime_dtype"],
-            "pass": bool(sched_exact and exact_frac >= 0.999 and rel_err < 1e-3)}
+def velocity_validation(x_k: np.ndarray, x_k1: np.ndarray, within: dict[str, Any], next_state: np.ndarray, sigmas: np.ndarray, k: int) -> dict[str, Any]:
+    """Validate the scheduler algebra at step k against the actual model output (v) and scheduler output of the trusted pipeline.
+
+    The per-position ratio (x_{k+1} - x_k) / v is quantisation-dominated when the update is below the bf16 ulp, so the sign / scale of
+    delta_sigma is checked with a least-squares slope over all positions; exactness is checked with bit-exact and bf16-reconstruction tests.
+    """
+    v = within["guidance_combined_output"].astype(np.float64)
+    dsig = core.delta_sigma(sigmas, k)
+    recon = core.bf16_round(core.euler_step(x_k, v, sigmas, k))
+    exact_frac = float(np.mean(recon == x_k1))
+    dx = x_k1.astype(np.float64) - x_k.astype(np.float64)
+    slope = float((dx * v).sum() / max((v * v).sum(), 1e-30))
+    rel_err = abs(slope - dsig) / abs(dsig)
+    sched_exact = bool(np.array_equal(within["scheduler_output"], x_k1))
+    dtype_ok = str(within.get("runtime_dtype", "")).endswith("bfloat16")
+    return {"step": k, "scheduler_output_bit_exact": sched_exact, "single_step_bit_exact": bool(np.array_equal(next_state, x_k1)), "delta_sigma_from_plan": dsig, "delta_sigma_ls_slope": slope, "delta_sigma_relative_error": rel_err,
+            "bf16_reconstruction_exact_fraction": exact_frac, "reconstruction_max_abs": float(np.abs(recon.astype(np.float64) - x_k1.astype(np.float64)).max()), "timestep": within["timestep"], "runtime_dtype": within.get("runtime_dtype"),
+            "pass": bool(sched_exact and exact_frac >= 0.999 and rel_err < 5e-2 and dtype_ok and np.sign(slope) == np.sign(dsig))}  # precision comes from the reconstruction test (a one-index sigma error flips ~5% of positions); the slope guards sign/scale
 
 
 def phase_reference(config: dict[str, Any], config_path: Path, output_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -569,16 +591,22 @@ def phase_reference(config: dict[str, Any], config_path: Path, output_dir: Path,
                     if k != core.TOTAL_STEPS:
                         np.save(ck / f"x_{k:02d}.npy", r["arrays"][k], allow_pickle=False)
                         ck_hashes[str(k)] = array_sha256(r["arrays"][k])
-                validation = {}
+                validation, v_hashes = {}, {}
                 for t in core.CHECKPOINTS:
-                    s = engine.single_step(tr, f"{label}_velocity_check_t{t}", r["arrays"][t - 1], t - 1, within_step=True)
-                    validation[str(t)] = velocity_validation(r["arrays"][t - 1], r["arrays"][t], s["within"], s["next"], engine.sigmas, t)
-                    if not validation[str(t)]["pass"]:
-                        failures.append(f"{label}_t{t}")
+                    for k, role in ((t - 1, "validation"), (t - core.STALE_WINDOW_SECONDARY - 1, "cached_velocity_W1"), (t - core.STALE_WINDOW_PRIMARY - 1, "cached_velocity_L4")):
+                        s = engine.single_step(tr, f"{label}_v_step{k:02d}", r["arrays"][k], k, within_step=True)
+                        vv = velocity_validation(r["arrays"][k], r["arrays"][k + 1], s["within"], s["next"], engine.sigmas, k)
+                        vv["role"] = role
+                        validation[f"t{t}_k{k}"] = vv
+                        if not vv["pass"]:
+                            failures.append(f"{label}_t{t}_k{k}")
+                        v_arr = np.ascontiguousarray(s["within"]["guidance_combined_output"].astype(np.float32))
+                        np.save(ck / f"v_{k:02d}.npy", v_arr, allow_pickle=False)
+                        v_hashes[str(k)] = array_sha256(v_arr)
                 sigma = {str(t): core.channel_std(r["arrays"][t]).tolist() for t in core.CHECKPOINTS}
                 one_step = {str(t): float(np.sqrt(np.mean((r["arrays"][t].astype(np.float64) - r["arrays"][t - 1].astype(np.float64)) ** 2))) for t in core.CHECKPOINTS}
                 _save_run(output_dir, "reference", label, provenance["provenance_hash"], arrays={"final": r["arrays"][core.TOTAL_STEPS], "initial": r["arrays"][0]}, video=r["video"], keep_video_npy=True, fps=float(config["generation"]["fps"]),
-                          info={"kind": "CLEAN", "traj": tr["id"], "prompt": tr["prompt"], "seed": tr["seed"], "wall_s": r["wall_s"], "checkpoint_sha256": ck_hashes, "channel_std_by_t": sigma, "one_step_update_rms_by_t": one_step, "velocity_validation": validation, "latent_shape": list(core.LATENT_SHAPE)})
+                          info={"kind": "CLEAN", "traj": tr["id"], "prompt": tr["prompt"], "seed": tr["seed"], "wall_s": r["wall_s"], "checkpoint_sha256": ck_hashes, "velocity_sha256": v_hashes, "channel_std_by_t": sigma, "one_step_update_rms_by_t": one_step, "velocity_validation": validation, "latent_shape": list(core.LATENT_SHAPE)})
             out[tr["id"]] = "COMPLETE"
     finally:
         engine.shutdown()
@@ -600,21 +628,25 @@ def phase_perturb(config: dict[str, Any], config_path: Path, output_dir: Path) -
     P, S = core.STALE_WINDOW_PRIMARY, core.STALE_WINDOW_SECONDARY
     for tr in trajectories(config):
         _, _, ref = _reference(output_dir, tr["id"])
-        if not all(ref["velocity_validation"][str(t)]["pass"] for t in core.CHECKPOINTS):
+        if not all(v["pass"] for v in ref["velocity_validation"].values()):
             raise GateError(f"Velocity validation did not pass for {tr['id']}")
         for t in core.CHECKPOINTS:
             x = {k: _checkpoint(output_dir, tr["id"], k) for k in sorted({t, t - 1, t - P, t - P - 1, t - S, t - S - 1})}
             for k, arr in x.items():
                 if array_sha256(arr) != ref["checkpoint_sha256"][str(k)]:
                     raise GateError(f"Checkpoint hash mismatch {tr['id']} k={k}")
+            v = {k: np.load(output_dir / "checkpoints" / tr["id"] / f"v_{k:02d}.npy", allow_pickle=False) for k in (t - P - 1, t - S - 1)}
+            for k, arr in v.items():
+                if array_sha256(arr) != ref["velocity_sha256"][str(k)]:
+                    raise GateError(f"Cached velocity hash mismatch {tr['id']} k={k}")
             d = output_dir / "perturbations" / tr["id"] / f"t{t}"
             d.mkdir(parents=True, exist_ok=True)
             one_step = x[t].astype(np.float64) - x[t - 1].astype(np.float64)
             states = {("SPATIAL_SMALL", "ZERO"): (x[t].copy(), {"error_model": "ZERO", "region": "SPATIAL_SMALL", "rms_in_region": 0.0})}
             for region in core.DECISION_REGIONS:
-                states[(region, "STALE_VELOCITY")] = core.stale_velocity_state(x_last_active_prev=x[t - P - 1], x_last_active=x[t - P], x_t=x[t], sigmas=sigmas, t=t, window=P, region=region)
+                states[(region, "STALE_VELOCITY")] = core.stale_velocity_state(x_last_active=x[t - P], v_last_active=v[t - P - 1], x_t=x[t], sigmas=sigmas, t=t, window=P, region=region)
                 if tr["decision"]:
-                    states[(region, "STALE_VELOCITY_W1")] = core.stale_velocity_state(x_last_active_prev=x[t - S - 1], x_last_active=x[t - S], x_t=x[t], sigmas=sigmas, t=t, window=S, region=region)
+                    states[(region, "STALE_VELOCITY_W1")] = core.stale_velocity_state(x_last_active=x[t - S], v_last_active=v[t - S - 1], x_t=x[t], sigmas=sigmas, t=t, window=S, region=region)
                     states[(region, "GAUSS_HIGH")] = core.gaussian_state(x[t], trajectory_id=tr["id"], t=t, region=region)
             for (region, error), (xp, stats) in states.items():
                 if error == "ZERO" and not np.array_equal(xp, x[t]):

@@ -1,4 +1,4 @@
-"""CPU / synthetic contracts for the speculative-contamination Round-0 experiment, revision 3 (L = 4 / d = 4). No GPU, no model."""
+"""CPU / synthetic contracts for the regional-recompute Round-0 experiment, revision 4 (L = 4 / d = 4, probe-captured velocities). No GPU, no model."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ def test_frozen_config_and_constants():
     assert c["thresholds"] == core.frozen_thresholds() and c["quarantine"] == "DEFERRED_TO_ROUND1"
     assert (core.RCOMPUTE_STRONG_GO, core.RCOMPUTE_GO, core.RCOMPUTE_WEAK) == (0.20, 0.40, 0.70) and core.MATERIAL_CELL_FRACTION_MIN == 0.5
     assert c["recompute_arm_label"] == r0.RECOMPUTE_LABEL == "FULL-FORWARD SELECTIVE-STATE RECOMPUTATION with cached contaminated context"
+    assert c["experiment_version"] == "regional-recompute-round0-v4" and c["attempt"] == 2 and c["attempt1"]["decision"] == "INVALID_EXPERIMENT" and r0.NAMESPACE == "regional_recompute_round0"
     for phrase, key in (("full 14,040-token target forward", "recompute_arm_statement"), ("NOT demonstrate sparse GPU compute", "recompute_arm_statement"), ("NOT counted", "verification_semantics"), ("L = 4", "kill_scope"), ("does NOT claim", "related_work_and_problem_statement"), ("does NOT establish", "headroom_disclaimer"), ("L = 4", "primary_question")):
         assert phrase in c[key], (phrase, key)
     assert set(c["cost_semantics"]) == {"GLOBAL_DENSE_REFRESH", "FULL_ROLLBACK", "SELECTIVE_STATE_RECOMPUTE(D)", "ceiling_note"} and "NO measured sparse-compute speedup" in c["cost_semantics"]["SELECTIVE_STATE_RECOMPUTE(D)"]
@@ -80,7 +81,7 @@ def test_config_mutations_fail_closed(tmp_path, mutate):
 
 def test_output_namespace_isolation():
     r0.validate_output_path(r0.REPO_ROOT / "results" / r0.NAMESPACE)
-    for bad in ("video_trajectory_fork_confirmatory", "other"):
+    for bad in ("video_trajectory_fork_confirmatory", "speculative_contamination_round0", "other"):
         with pytest.raises(ValueError):
             r0.validate_output_path(r0.REPO_ROOT / "results" / bad)
 
@@ -110,34 +111,55 @@ def test_scheduler_algebra_identities():
         assert np.abs(core.euler_step(traj[k], v, sig, k) - traj[k + 1]).max() < 1e-5
 
 
-def test_stale_velocity_primary_window_matches_hand_derivation():
+def test_stale_velocity_cached_euler_update_matches_hand_derivation():
     sig, traj = _trajectory()
     t, L = 12, core.STALE_WINDOW_PRIMARY
-    xs, st = core.stale_velocity_state(x_last_active_prev=traj[t - L - 1], x_last_active=traj[t - L], x_t=traj[t], sigmas=sig, t=t, window=L, region="SPATIAL_SMALL")
+    v_last = core.implied_velocity(traj[t - L - 1], traj[t - L], sig, t - L - 1).astype(np.float32)  # stand-in for the probe-captured model output at t-5
+    xs, st = core.stale_velocity_state(x_last_active=traj[t - L], v_last_active=v_last, x_t=traj[t], sigmas=sig, t=t, window=L, region="SPATIAL_SMALL")
     mask = core.token_to_latent_mask(core.REGIONS["SPATIAL_SMALL"].token_mask())
-    hand = traj[t - L].astype(np.float64) + (sig[t] - sig[t - L]) * (traj[t - L].astype(np.float64) - traj[t - L - 1].astype(np.float64)) / (sig[t - L] - sig[t - L - 1])
-    assert np.array_equal(xs[mask], core.bf16_round(hand.astype(np.float32))[mask]) and np.array_equal(xs[~mask], traj[t][~mask])
+    # hand derivation: four scheduler steps with the frozen velocity, bf16 after each (fp32 add, bf16 cast)
+    x = traj[t - L].astype(np.float32)
+    for k in range(t - L, t):
+        x = core.bf16_round((x + np.float32(sig[k + 1] - sig[k]) * v_last).astype(np.float32))
+    assert np.array_equal(xs[mask], x[mask]) and np.array_equal(xs[~mask], traj[t][~mask]) and not st["outside_region_changed"]
     assert st["error_model"] == "STALE_VELOCITY" and st["window"] == 4 and st["last_active_step"] == t - 5 and st["total_delta_sigma_window"] == pytest.approx(sig[t] - sig[t - 4])
-    # L = 1 is the descriptive arm and is smaller than L = 4 on the same trajectory (error grows with the stale window)
-    x1, s1 = core.stale_velocity_state(x_last_active_prev=traj[t - 2], x_last_active=traj[t - 1], x_t=traj[t], sigmas=sig, t=t, window=1, region="SPATIAL_SMALL")
-    assert s1["error_model"] == "STALE_VELOCITY_W1" and s1["rms_in_region"] < st["rms_in_region"]
-    # no look-ahead: only x_{t-5}, x_{t-4} and the schedule enter R; x_t enters only outside R
-    x_alt = dict(traj)
-    x_alt[t] = traj[t] + np.float32(1.0)
-    xs2, _ = core.stale_velocity_state(x_last_active_prev=traj[t - 5], x_last_active=traj[t - 4], x_t=x_alt[t], sigmas=sig, t=t, window=4, region="SPATIAL_SMALL")
+    # a trajectory with constant velocity has zero stale error (up to bf16 rounding of the true path)
+    x0, eps = np.zeros(core.LATENT_SHAPE, np.float32), _latent(3)
+    lin = {k: core.bf16_round(((1 - sig[k]) * x0 + sig[k] * eps).astype(np.float32)) for k in range(14)}
+    xl, sl = core.stale_velocity_state(x_last_active=lin[8], v_last_active=eps, x_t=lin[12], sigmas=sig, t=12, window=4, region="SPATIAL_SMALL")
+    assert sl["rms_in_region_over_mean_channel_std"] < 0.01
+    # L = 1 descriptive arm uses v_{t-2} for one step
+    v1 = core.implied_velocity(traj[t - 2], traj[t - 1], sig, t - 2).astype(np.float32)
+    x1, s1 = core.stale_velocity_state(x_last_active=traj[t - 1], v_last_active=v1, x_t=traj[t], sigmas=sig, t=t, window=1, region="SPATIAL_SMALL")
+    assert s1["error_model"] == "STALE_VELOCITY_W1" and s1["last_active_step"] == t - 2 and s1["rms_in_region"] < st["rms_in_region"]
+    # no look-ahead: x_t enters only outside R
+    xs2, _ = core.stale_velocity_state(x_last_active=traj[t - L], v_last_active=v_last, x_t=traj[t] + np.float32(1.0), sigmas=sig, t=t, window=L, region="SPATIAL_SMALL")
     assert np.array_equal(xs2[mask], xs[mask])
     with pytest.raises(ValueError):
-        core.stale_velocity_state(x_last_active_prev=traj[0], x_last_active=traj[1], x_t=traj[4], sigmas=sig, t=4, window=4, region="SPATIAL_SMALL")
+        core.stale_velocity_state(x_last_active=traj[0], v_last_active=v_last, x_t=traj[4], sigmas=sig, t=4, window=4, region="SPATIAL_SMALL")
 
 
-def test_velocity_validation_pass_and_fail():
-    sig, traj = _trajectory()
-    t = 20
-    v = core.implied_velocity(traj[t - 1], traj[t], sig, t - 1).astype(np.float32)
-    within = {"guidance_combined_output": v, "scheduler_input": traj[t - 1], "scheduler_output": traj[t], "timestep": float(sig[t - 1] * 1000), "runtime_dtype": "torch.bfloat16"}
-    assert r0.velocity_validation(traj[t - 1], traj[t], within, traj[t], sig, t)["pass"]
-    assert not r0.velocity_validation(traj[t - 1], traj[t], {**within, "guidance_combined_output": -v}, traj[t], sig, t)["pass"]
-    assert not r0.velocity_validation(traj[t - 1], traj[t], {**within, "scheduler_output": traj[t - 1]}, traj[t], sig, t)["pass"]
+def test_velocity_validation_is_robust_to_bf16_quantisation():
+    sig = r0.synthetic_sigmas()
+    rng = np.random.default_rng(7)
+    k = 11  # delta_sigma ~ -0.004: one-step updates are below the bf16 ulp of a unit-scale latent (the attempt-1 failure regime)
+    x_k = core.bf16_round(rng.standard_normal(core.LATENT_SHAPE).astype(np.float32))
+    v = rng.standard_normal(core.LATENT_SHAPE).astype(np.float32) * 1.4
+    x_k1 = core.bf16_round((x_k + np.float32(core.delta_sigma(sig, k)) * v).astype(np.float32))  # exactly what the scheduler produces
+    within = {"guidance_combined_output": v, "scheduler_input": x_k, "scheduler_output": x_k1, "timestep": float(sig[k] * 1000), "runtime_dtype": "torch.bfloat16"}
+    ok = r0.velocity_validation(x_k, x_k1, within, x_k1, sig, k)
+    assert ok["pass"] and ok["scheduler_output_bit_exact"] and ok["bf16_reconstruction_exact_fraction"] >= 0.999 and ok["delta_sigma_relative_error"] < 5e-2
+    # the old per-position median would have failed here: dx is quantised to bf16 ulps while the update is smaller than one ulp
+    strong = np.abs(v) > np.percentile(np.abs(v), 50)
+    median_ratio = float(np.median(((x_k1.astype(np.float64) - x_k.astype(np.float64)) / v.astype(np.float64))[strong]))
+    assert abs(median_ratio - core.delta_sigma(sig, k)) / abs(core.delta_sigma(sig, k)) > 1e-3
+    assert not r0.velocity_validation(x_k, x_k1, {**within, "guidance_combined_output": -v}, x_k1, sig, k)["pass"]  # sign flip
+    assert not r0.velocity_validation(x_k, x_k1, {**within, "scheduler_output": x_k}, x_k1, sig, k)["pass"]  # scheduler output mismatch
+    assert not r0.velocity_validation(x_k, x_k1, {**within, "runtime_dtype": "torch.float32"}, x_k1, sig, k)["pass"]  # dtype
+    # a one-index sigma error is caught by the reconstruction test even though it moves the slope by only ~6%
+    x1_wrong = core.bf16_round((x_k + np.float32(core.delta_sigma(sig, k + 1)) * v).astype(np.float32))
+    bad = r0.velocity_validation(x_k, x1_wrong, {**within, "scheduler_output": x1_wrong}, x1_wrong, sig, k)
+    assert bad["bf16_reconstruction_exact_fraction"] < 0.999 and not bad["pass"]
 
 
 def test_gaussian_stress_control_is_local_and_deterministic():
@@ -221,7 +243,7 @@ def test_run_plan_counts_labels_and_cost():
     assert not any(p["traj"].endswith("9202") for p in plan if p["phase"] in ("oracle", "recompute"))
     assert all(p["start"] == p["t"] + 4 for p in plan if p["phase"] in ("oracle", "recompute")) and all(p.get("single_steps") == 4 for p in plan if p["phase"] == "recompute")
     est = r0.estimate_cost(plan)
-    assert est["continuations"] == 344 and est["single_step_requests"] == 8 * 3 + 108 * 4 == 456 and 10 < est["hours_total"] < 15 and est["storage_gb_est"] < 10
+    assert est["continuations"] == 344 and est["single_step_requests"] == 8 * 9 + 108 * 4 == 504 and 10 < est["hours_total"] < 15 and est["storage_gb_est"] < 10
     weak = r0.weak_band_plan(c)
     assert len(weak) == 4 * 3 * 3 and all(p["kind"] == "WEAK_RECOMPUTE" for p in weak) and not (set(p["label"] for p in weak) & labels)
     assert sorted(r0.reference_capture_steps()) == [7, 8, 10, 11, 12, 15, 16, 18, 19, 20, 23, 24, 26, 27, 28, 40]
@@ -249,6 +271,8 @@ def test_preregistration_seal_and_gpu_refusal(tmp_path, monkeypatch):
         assert res["status"] == "SEALED" and res["n_continuations"] == 344
         prereg = json.loads((out / "preregistration.json").read_text())
         assert prereg["definitions"]["L"].endswith("4") and prereg["error_models"]["STALE_VELOCITY"]["window"] == 4 and prereg["error_models"]["STALE_VELOCITY_W1"]["role"].startswith("descriptive")
+        assert prereg["attempt"] == 2 and prereg["attempt1_reference"]["namespace"] == "speculative_contamination_round0" and "probe-captured" in prereg["error_models"]["STALE_VELOCITY"]["formula"]
+        assert "least-squares slope" in prereg["scheduler_algebra"]["on_host_validation"]
         assert prereg["recompute_arm_label"] == r0.RECOMPUTE_LABEL and "full 14,040-token" in prereg["recompute_arm_statement"] and "NOT counted" in prereg["verification_semantics"]
         assert set(prereg["cost_semantics"]) >= {"GLOBAL_DENSE_REFRESH", "FULL_ROLLBACK", "SELECTIVE_STATE_RECOMPUTE(D)"} and "L = 4" in prereg["kill_scope"]
         assert prereg["weak_band_characterization"]["domains"] == {"SPATIAL_SMALL": {"50": 0.5, "60": 0.6}, "TEMPORAL_MEDIUM": {"56": 5 / 9}} and len(prereg["weak_band_characterization"]["labels"]) == 36
