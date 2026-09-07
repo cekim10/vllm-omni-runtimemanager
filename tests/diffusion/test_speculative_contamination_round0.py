@@ -41,7 +41,7 @@ def test_frozen_config_and_constants():
     assert c["thresholds"] == core.frozen_thresholds() and c["quarantine"] == "DEFERRED_TO_ROUND1"
     assert (core.RCOMPUTE_STRONG_GO, core.RCOMPUTE_GO, core.RCOMPUTE_WEAK) == (0.20, 0.40, 0.70) and core.MATERIAL_CELL_FRACTION_MIN == 0.5
     assert c["recompute_arm_label"] == r0.RECOMPUTE_LABEL == "FULL-FORWARD SELECTIVE-STATE RECOMPUTATION with cached contaminated context"
-    assert c["experiment_version"] == "regional-recompute-round0-v4" and c["attempt"] == 2 and c["attempt1"]["decision"] == "INVALID_EXPERIMENT" and r0.NAMESPACE == "regional_recompute_round0"
+    assert c["experiment_version"] == "regional-recompute-round0-v5" and c["attempt"] == 3 and c["attempt1"]["decision"] == c["attempt2"]["decision"] == "INVALID_EXPERIMENT" and r0.NAMESPACE == "regional_recompute_round0" and r0.ATTEMPT_SUBDIR == "attempt3"
     for phrase, key in (("full 14,040-token target forward", "recompute_arm_statement"), ("NOT demonstrate sparse GPU compute", "recompute_arm_statement"), ("NOT counted", "verification_semantics"), ("L = 4", "kill_scope"), ("does NOT claim", "related_work_and_problem_statement"), ("does NOT establish", "headroom_disclaimer"), ("L = 4", "primary_question")):
         assert phrase in c[key], (phrase, key)
     assert set(c["cost_semantics"]) == {"GLOBAL_DENSE_REFRESH", "FULL_ROLLBACK", "SELECTIVE_STATE_RECOMPUTE(D)", "ceiling_note"} and "NO measured sparse-compute speedup" in c["cost_semantics"]["SELECTIVE_STATE_RECOMPUTE(D)"]
@@ -80,10 +80,11 @@ def test_config_mutations_fail_closed(tmp_path, mutate):
 
 
 def test_output_namespace_isolation():
-    r0.validate_output_path(r0.REPO_ROOT / "results" / r0.NAMESPACE)
-    for bad in ("video_trajectory_fork_confirmatory", "speculative_contamination_round0", "other"):
+    r0.validate_output_path(r0.REPO_ROOT / "results" / r0.NAMESPACE / "attempt3")
+    r0.validate_output_path(r0.REPO_ROOT / "results" / r0.NAMESPACE / "attempt3" / "sub")
+    for bad in (r0.REPO_ROOT / "results" / "video_trajectory_fork_confirmatory", r0.REPO_ROOT / "results" / "speculative_contamination_round0", r0.REPO_ROOT / "results" / r0.NAMESPACE, r0.REPO_ROOT / "results" / r0.NAMESPACE / "attempt2", r0.REPO_ROOT / "results" / "other" / "attempt3"):
         with pytest.raises(ValueError):
-            r0.validate_output_path(r0.REPO_ROOT / "results" / bad)
+            r0.validate_output_path(bad)
 
 
 # ------------------------------------------------------------------ geometry
@@ -148,7 +149,14 @@ def test_velocity_validation_is_robust_to_bf16_quantisation():
     x_k1 = core.bf16_round((x_k + np.float32(core.delta_sigma(sig, k)) * v).astype(np.float32))  # exactly what the scheduler produces
     within = {"guidance_combined_output": v, "scheduler_input": x_k, "scheduler_output": x_k1, "timestep": float(sig[k] * 1000), "runtime_dtype": "torch.bfloat16"}
     ok = r0.velocity_validation(x_k, x_k1, within, x_k1, sig, k)
-    assert ok["pass"] and ok["scheduler_output_bit_exact"] and ok["bf16_reconstruction_exact_fraction"] >= 0.999 and ok["delta_sigma_relative_error"] < 5e-2
+    assert ok["pass"] and ok["scheduler_output_bit_exact"] and ok["bf16_reconstruction_exact_fraction"] >= 0.999 and ok["delta_sigma_relative_error"] < 0.15
+    # real-model attempt 2 showed a 7% upward slope bias at k=7 with everything bit-exact: that must PASS
+    k7 = 7
+    x7 = core.bf16_round(rng.standard_normal(core.LATENT_SHAPE).astype(np.float32) * 1.3)
+    v7 = rng.standard_normal(core.LATENT_SHAPE).astype(np.float32) * 1.4
+    x71 = core.bf16_round((x7 + np.float32(core.delta_sigma(sig, k7)) * v7).astype(np.float32))
+    ok7 = r0.velocity_validation(x7, x71, {**within, "guidance_combined_output": v7, "scheduler_input": x7, "scheduler_output": x71}, x71, sig, k7)
+    assert ok7["pass"] and ok7["bf16_reconstruction_exact_fraction"] >= 0.999
     # the old per-position median would have failed here: dx is quantised to bf16 ulps while the update is smaller than one ulp
     strong = np.abs(v) > np.percentile(np.abs(v), 50)
     median_ratio = float(np.median(((x_k1.astype(np.float64) - x_k.astype(np.float64)) / v.astype(np.float64))[strong]))
@@ -264,14 +272,14 @@ def test_preregistration_seal_and_gpu_refusal(tmp_path, monkeypatch):
         r0.smoke.scheduler_plan({**json.loads(json.dumps(config)), "seed": 9101, "generation": {**config["generation"], "switch_steps": list(r0.smoke.EXPECTED_SWITCHES)}})
     except ModuleNotFoundError:
         monkeypatch.setattr(r0.smoke, "scheduler_plan", _synthetic_scheduler_plan)
-    out = r0.REPO_ROOT / "results" / r0.NAMESPACE / "_pytest_tmp"
+    out = r0.REPO_ROOT / "results" / r0.NAMESPACE / "attempt3" / "_pytest_tmp"
     shutil.rmtree(out, ignore_errors=True)
     try:
         res = r0.phase_preregister(config, CONFIG_PATH, out)
         assert res["status"] == "SEALED" and res["n_continuations"] == 344
         prereg = json.loads((out / "preregistration.json").read_text())
         assert prereg["definitions"]["L"].endswith("4") and prereg["error_models"]["STALE_VELOCITY"]["window"] == 4 and prereg["error_models"]["STALE_VELOCITY_W1"]["role"].startswith("descriptive")
-        assert prereg["attempt"] == 2 and prereg["attempt1_reference"]["namespace"] == "speculative_contamination_round0" and "probe-captured" in prereg["error_models"]["STALE_VELOCITY"]["formula"]
+        assert prereg["attempt"] == 3 and set(prereg["prior_attempts"]) == {"attempt1", "attempt2"} and "probe-captured" in prereg["error_models"]["STALE_VELOCITY"]["formula"]
         assert "least-squares slope" in prereg["scheduler_algebra"]["on_host_validation"]
         assert prereg["recompute_arm_label"] == r0.RECOMPUTE_LABEL and "full 14,040-token" in prereg["recompute_arm_statement"] and "NOT counted" in prereg["verification_semantics"]
         assert set(prereg["cost_semantics"]) >= {"GLOBAL_DENSE_REFRESH", "FULL_ROLLBACK", "SELECTIVE_STATE_RECOMPUTE(D)"} and "L = 4" in prereg["kill_scope"]

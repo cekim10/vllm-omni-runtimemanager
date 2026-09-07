@@ -6,7 +6,7 @@ if [ $# -lt 1 ]; then
   exit 2
 fi
 PHASE="$1"
-OUT="${2:-results/regional_recompute_round0}"
+OUT="${2:-results/regional_recompute_round0/attempt3}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 python experiments/speculative_contamination_round0/run.py \
