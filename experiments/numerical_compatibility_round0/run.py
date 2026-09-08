@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Numerical Compatibility Round 0 - phased, preregistered, fail-closed orchestration (rev 0.2d).
+"""Numerical Compatibility Round 0 - phased, preregistered, fail-closed orchestration (rev 0.2f).
 
-Phases: cpu | preregister | canonical | axis --axis {EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN} | freshcheck --axis {CANONICAL,...} | analyze
+Phases: cpu | preregister | canonical | axis --axis {EAGER,OFFLOAD,ATTN_SDPA,ATTN_FLASHINFER,ATTN_CUDNN} | freshcheck --axis {CANONICAL,...} | analyze
 
 Every GPU run is one request into the trusted Wan2.2 pipeline (no denoising is re-implemented).  The runner only produces
 arrays and hashes; every class and the decision are computed by core.py from saved artifacts in `analyze`.
@@ -31,9 +31,10 @@ from experiments import video_trajectory_fork_killtest as smoke  # noqa: E402
 from experiments.numerical_compatibility_round0 import core  # noqa: E402
 
 PKG = "experiments/numerical_compatibility_round0"
-EXPERIMENT_VERSION = "numerical-compatibility-round0-v0.2d"
+EXPERIMENT_VERSION = "numerical-compatibility-round0-v0.2f"
 NAMESPACE = "numerical_compatibility_round0"
-ATTEMPT_SUBDIR = "rev0_2"
+ATTEMPT_SUBDIR = "rev0_3"  # rev0_2 = frozen instrument-mismatch record (canonical run 1 stopped fail-closed: FLASH_ATTN resolved, SDPA expected)
+PRIOR_RUNS = {"rev0_2_instrument_mismatch": REPO_ROOT / "results" / NAMESPACE / "rev0_2"}
 DEFAULT_CONFIG = REPO_ROOT / PKG / "config.json"
 DEFAULT_OUTPUT = REPO_ROOT / "results" / NAMESPACE / ATTEMPT_SUBDIR
 PHASES = ("cpu", "preregister", "canonical", "axis", "freshcheck", "analyze")
@@ -141,6 +142,23 @@ def motivation_reference_hashes() -> dict[str, Any]:
     return {"root": str(MOTIVATION_ROOT.relative_to(REPO_ROOT)), "preregistration_sha256": pre.read_text().split()[0] if pre.exists() else None, "final_sha256_by_traj": out}
 
 
+def prior_runs() -> dict[str, Any]:
+    """Frozen earlier namespaces of this experiment (never written again); their outcome is pinned here."""
+    out: dict[str, Any] = {}
+    for name, root in PRIOR_RUNS.items():
+        rj = root / "canonical" / "p0_s9101_CANONICAL_F1" / "run.json"
+        sp = root / "preregistration.sha256"
+        entry: dict[str, Any] = {"root": str(root.relative_to(REPO_ROOT)), "preregistration_sha256": sp.read_text().split()[0] if sp.exists() else None,
+                                 "outcome": "INSTRUMENT_MISMATCH: first canonical run stopped fail-closed (attention_backend_resolved FLASH_ATTN, declared SDPA); no comparison was made; no scientific rule changed",
+                                 "descriptive_only": "its final latent equalled the rev 4.1 reference final bit-exactly; recorded as a pre-experimental observation, never reused as gate evidence for this namespace"}
+        if rj.exists():
+            d = json.loads(rj.read_text())
+            entry["canonical_F1_final_sha256"] = d["final_sha256"]
+            entry["fingerprint_mismatches"] = d["fingerprint_mismatches"]
+        out[name] = entry
+    return out
+
+
 def build_preregistration(config: dict[str, Any], provenance: dict[str, Any]) -> dict[str, Any]:
     plan_cfg = json.loads(json.dumps(config))
     plan_cfg["seed"] = int(config["trajectories"][0]["seed"])
@@ -149,7 +167,7 @@ def build_preregistration(config: dict[str, Any], provenance: dict[str, Any]) ->
     runs = plan_for(config)
     return {
         "title": "Numerical Compatibility Round 0: is intermediate Wan2.2 denoising state portable across single-GPU execution configurations?",
-        "experiment_version": EXPERIMENT_VERSION, "revision": "0.2d", "primary_question": config["primary_question"], "broken_assumption": config["broken_assumption"],
+        "experiment_version": EXPERIMENT_VERSION, "revision": "0.2f", "prior_runs": prior_runs(), "primary_question": config["primary_question"], "broken_assumption": config["broken_assumption"],
         "motivation_evidence": {**config["motivation_evidence"], "frozen_reference_finals": motivation_reference_hashes(),
                                  "status": "synthetic perturbation evidence; motivation only, never evidence for this round"},
         "model": config["model"], "generation": config["generation"], "scheduler": config["scheduler"], "scheduler_plan": sched,

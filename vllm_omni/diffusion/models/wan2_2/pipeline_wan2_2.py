@@ -898,6 +898,16 @@ class Wan22Pipeline(
                 except Exception:
                     return None
 
+            def _fa_provider() -> str | None:
+                # mirrors vllm_omni.diffusion.attention.backends.utils.fa.is_flash_attn_installed probe order
+                for mod in ("fa3_fwd_interface", "flash_attn_interface", "flash_attn"):
+                    try:
+                        __import__(mod)
+                        return mod
+                    except Exception:
+                        continue
+                return None
+
             od = self.od_config
             pc = getattr(od, "parallel_config", None)
             parallel = {
@@ -933,7 +943,8 @@ class Wan22Pipeline(
                 "tf32_matmul": bool(torch.backends.cuda.matmul.allow_tf32),
                 "tf32_cudnn": bool(torch.backends.cudnn.allow_tf32),
                 "flashinfer_version": _version("flashinfer-python") or _version("flashinfer"),
-                "flash_attn_version": _version("flash-attn") or _version("flash_attn"),
+                "flash_attn_version": _version("flash-attn") or _version("flash_attn") or _version("fa3-fwd") or _version("fa3_fwd"),
+                "flash_attn_provider": _fa_provider(),
                 "attention_backend_env": os.environ.get("DIFFUSION_ATTENTION_BACKEND"),
             }
         except Exception as exc:  # pragma: no cover - instrumentation must never break generation

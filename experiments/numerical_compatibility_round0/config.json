@@ -1,7 +1,7 @@
 {
   "experiment": "numerical-compatibility-round0",
-  "version": "numerical-compatibility-round0-v0.2d",
-  "status": "FROZEN DESIGN rev 0.2d (final hostile audit fixes applied 2026-09-07); sealed by --phase preregister; GPU execution requires separate approval",
+  "version": "numerical-compatibility-round0-v0.2f",
+  "status": "FROZEN DESIGN rev 0.2f (ATTN_SDPA axis added before any comparison, user-approved 2026-09-07); sealed by --phase preregister; GPU canonical approved after re-seal",
   "primary_question": "Does an intermediate Wan2.2 denoising state created under one execution configuration remain the SAME SAMPLE when denoising is continued under a different single-GPU execution configuration? Observable: H_{A->B,t} = F_B^{t:40}(x_t^A) versus F_A and F_B.",
   "broken_assumption": "Stateful diffusion systems increasingly checkpoint, reuse, or move intermediate latents, which implicitly requires the consumer execution to interpret the saved state compatibly with its producer; we test whether the effective state is C=(x_t,t) or C=(x_t,t,phi).",
   "motivation_evidence": {
@@ -74,7 +74,7 @@
     "name": "phi_0",
     "enforce_eager": false,
     "enable_cpu_offload": true,
-    "attention_backend": "TORCH_SDPA (platform default on sm_89 with flash_attn absent; unpinned torch dispatcher; resolved class recorded at runtime)",
+    "attention_backend": "FLASH_ATTN (platform default on this host: FA3 provider fa3_fwd_interface / flash_attn_interface present, FA2 flash_attn absent; recorded at runtime as backend.get_name())",
     "step_execution": false,
     "max_num_seqs": 1,
     "parallel": {
@@ -100,19 +100,27 @@
       "runtime_reason": "memory-pressure policy toggled per worker/pool; outside the #5512 contract",
       "note": "FULL_TRAJECTORY_BIT_INVARIANT here is a valid compatibility-matrix cell (offload preserves the domain), not a failure"
     },
+    "ATTN_SDPA": {
+      "class": "core",
+      "change": {
+        "attention_backend": "TORCH_SDPA"
+      },
+      "runtime_reason": "platform/package-dependent backend resolution: the selector falls back to TORCH_SDPA when no flash-attention provider is importable; on this host the default resolves to FLASH_ATTN, so FLASH_ATTN <-> SDPA is the availability-driven edge",
+      "claim_caution": "Round 0 claims only that backend availability/platform differences can resolve the same serving stack to different attention implementations; no claim about how often a runtime switches dynamically"
+    },
     "ATTN_FLASHINFER": {
       "class": "core",
       "change": {
         "attention_backend": "FLASHINFER_ATTN"
       },
-      "runtime_reason": "Blackwell hosts default to FLASHINFER/CUDNN, Ada hosts to SDPA -> heterogeneous pools mix them; selector silently falls back when a package is missing"
+      "runtime_reason": "platform/package-dependent backend resolution: different hosts/images of the same serving stack resolve to different attention implementations (this Ada host: FLASH_ATTN via an FA3 provider; other platforms default to CUDNN_ATTN or FLASHINFER_ATTN)"
     },
     "ATTN_CUDNN": {
       "class": "core",
       "change": {
         "attention_backend": "CUDNN_ATTN"
       },
-      "runtime_reason": "CUDNN_ATTN is the Blackwell platform default; pins sdpa_kernel([CUDNN_ATTENTION])"
+      "runtime_reason": "platform/package-dependent backend resolution: different hosts/images of the same serving stack resolve to different attention implementations (this Ada host: FLASH_ATTN via an FA3 provider; other platforms default to CUDNN_ATTN or FLASHINFER_ATTN)"
     },
     "BATCH": {
       "class": "NOT_MEASURED",
@@ -185,13 +193,21 @@
         20,
         28
       ],
-      "note": "t=0 is the resume-plumbing anchor (full length)"
+      "note": "t=0 is the resume-plumbing anchor (full length)",
+      "axes": [
+        "EAGER",
+        "OFFLOAD",
+        "ATTN_SDPA",
+        "ATTN_FLASHINFER",
+        "ATTN_CUDNN"
+      ]
     },
     "fresh_engine_control": {
       "configs": [
         "CANONICAL",
         "EAGER",
         "OFFLOAD",
+        "ATTN_SDPA",
         "ATTN_FLASHINFER",
         "ATTN_CUDNN"
       ],
@@ -202,7 +218,7 @@
     },
     "latent_capture": "all 41 boundaries float32 for run 1 of each pair and all hybrids; run 2 stores per-boundary sha256 + final only",
     "decode": true,
-    "totals": "35 full + 51 resume (BATCH and PARALLEL not measured)"
+    "totals": "42 full + 63 resume = 105 runs (BATCH and PARALLEL not measured)"
   },
   "thresholds": {
     "same_sample_rel_l2_max": 0.02,
@@ -244,7 +260,7 @@
     "exact-resume anchor H_{A->A,12} not BIT_EXACT with F_A run 1 3/3",
     "any H_{A->X,0} anchor not BIT_EXACT with F_X run 1 3/3",
     "recorded fingerprint != declared for any axis",
-    "fewer than 2 core axes measured (core: EAGER, OFFLOAD, ATTN_FLASHINFER, ATTN_CUDNN)",
+    "fewer than 2 core axes measured (core: EAGER, OFFLOAD, ATTN_SDPA, ATTN_FLASHINFER, ATTN_CUDNN)",
     "any Engine gate error (non-Euler path, step count, probe mismatch)",
     "non-axis environment fingerprint fields (torch/cuda/cudnn/gpu/model revision/TF32/cuBLAS workspace/library versions/parallel) differ between any two runs"
   ],
@@ -270,32 +286,33 @@
     "resume_model_s": "55 + 4.5*(40-t): t0 235, t12 181, t20 145, t28 109",
     "canonical_h": 0.54,
     "per_core_axis_h": 0.95,
-    "fresh_engine_controls_h": 0.75,
-    "engine_constructions_h": 0.4,
-    "storage_gb": 10,
-    "gpu_hours": 5.5
+    "fresh_engine_controls_h": 0.9,
+    "engine_constructions_h": 0.5,
+    "storage_gb": 12.5,
+    "gpu_hours": 6.6
   },
-  "kill_scope": "Wan2.2-T2V-A14B, 40-step Euler, bf16, single L40S (GPU 0), axes EAGER/OFFLOAD/ATTN_FLASHINFER/ATTN_CUDNN; NO_GO closes single-GPU configuration-induced incompatibility on Wan2.2 only; parallel layout and batching not measured",
+  "kill_scope": "Wan2.2-T2V-A14B, 40-step Euler, bf16, single L40S (GPU 0), axes EAGER/OFFLOAD/ATTN_SDPA/ATTN_FLASHINFER/ATTN_CUDNN; NO_GO closes single-GPU configuration-induced incompatibility on Wan2.2 only; parallel layout and batching not measured; no further axes will be added (frozen matrix)",
   "claim_boundary": "GO claims only that intermediate state created under phi_0 and continued under >= 1 other single-GPU configuration is a different sample from both replay and fresh runs on this model/host; no frequency, throughput, mechanism or cross-model claims",
   "novelty_boundary": "Prior work (vLLM-Omni #5512, verl-omni #203, ComfyUI Deterministic Toolkit, CoRun) asks whether the same request stays deterministic under a fixed regime or across batch compositions; Round 0 asks whether intermediate state remains the same sample when the execution regime changes after the state was created.",
   "phases": [
     "cpu",
     "preregister",
     "canonical",
-    "axis --axis {EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN}",
-    "freshcheck --axis {CANONICAL,EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN}",
+    "axis --axis {EAGER,OFFLOAD,ATTN_SDPA,ATTN_FLASHINFER,ATTN_CUDNN}",
+    "freshcheck --axis {CANONICAL,EAGER,OFFLOAD,ATTN_SDPA,ATTN_FLASHINFER,ATTN_CUDNN}",
     "analyze"
   ],
-  "namespace": "results/numerical_compatibility_round0/rev0_2",
+  "namespace": "results/numerical_compatibility_round0/rev0_3",
   "open_items_before_freeze": [],
   "host_facts_2026_09_07": {
     "gpu": "NVIDIA L40S sm_89",
     "torch": "2.11.0+cu128",
     "cudnn": 91900,
-    "flash_attn": "MISSING",
+    "flash_attn": "FA2 package MISSING; FA3 provider present (platform default resolves to FLASH_ATTN; observed in rev0_2 canonical run 1)",
     "flashinfer": "installed",
     "sageattention": "MISSING",
-    "gpu_count": "2x L40S visible; GPU 1 allocated to another user -> only GPU 0 usable"
+    "gpu_count": "2x L40S visible; GPU 1 allocated to another user -> only GPU 0 usable",
+    "fa_provider_probe": "plain-python probe: fa3_fwd_interface ImportError (extension needs torch loaded), flash_attn_interface/flash_attn absent; distributions: fa3-fwd 0.0.3, flashinfer-python 0.6.12, flash-attn not installed; provider is an environment-consistency field, never a hard-coded gate"
   },
   "boundary_indexing": {
     "x_k": "latent ENTERING step k (k=0..39); x_40 = final",
@@ -327,12 +344,18 @@
     "rev 0.2b: AX_BATCH NOT_MEASURED (pipeline lacks step execution); fingerprint readback requires additive probe-metadata change",
     "rev 0.2b: AX_PARALLEL NOT_MEASURED (GPU 1 occupied)",
     "rev 0.2c (implementation-discovered, before seal): HYBRID_COMPATIBLE_BOTH label added with precedence when H is compatible with both F_A and F_X (was ambiguous between REPLAY_LIKE and FRESH_LIKE); environment-field consistency across runs added as INVALID condition; axis keys without AX_ prefix in code",
-    "rev 0.2d (final hostile audit, before seal): FULL_BIT_INVARIANT -> FULL_TRAJECTORY_BIT_INVARIANT (all 41 boundaries + video); D exclusion uses it; '|D|>=2 and no HYBRID_INCOMPATIBLE' moved from WEAK to NO_GO_STATE_PORTABLE; model_revision made mandatory in the recorded fingerprint; 'hybrids then trivially bit-exact' wording removed"
+    "rev 0.2d (final hostile audit, before seal): FULL_BIT_INVARIANT -> FULL_TRAJECTORY_BIT_INVARIANT (all 41 boundaries + video); D exclusion uses it; '|D|>=2 and no HYBRID_INCOMPATIBLE' moved from WEAK to NO_GO_STATE_PORTABLE; model_revision made mandatory in the recorded fingerprint; 'hybrids then trivially bit-exact' wording removed",
+    "rev 0.2e (instrument fix, before any comparison): canonical attention expectation SDPA -> FLASH_ATTN (FA3 provider present on host; rev0_2 canonical run 1 stopped fail-closed on this mismatch); flash_attn_provider recorded as environment field; namespace rev0_3; rev0_2 pinned as prior run",
+    "rev 0.2f (user-approved before any comparison): ATTN_SDPA core axis added (FLASH_ATTN -> TORCH_SDPA, the availability-driven fallback edge revealed by rev0_2); attention runtime reasons generalised to platform/package-dependent backend resolution; matrix 42 full + 63 resume = 105 runs, ~6.6 GPU-h; matrix declared final (no further axes)"
   ],
   "fingerprint_recorded_values": {
-    "attention_backend_resolved": "backend.get_name(): SDPA | FLASHINFER_ATTN | CUDNN_ATTN",
+    "attention_backend_resolved": "backend.get_name(): FLASH_ATTN | FLASHINFER_ATTN | CUDNN_ATTN | SDPA",
     "inductor_active": "count of repeated transformer blocks whose forward carries a torch.compile wrapper > 0",
     "offload_hooks_present": "any transformer module _hook_registry contains sequential_offload or layerwise_offload",
-    "model_revision": "resolved snapshot revision from the runner environment document; run is a GateError if unresolved (never None)"
+    "model_revision": "resolved snapshot revision from the runner environment document; run is a GateError if unresolved (never None)",
+    "flash_attn_provider": "first importable of fa3_fwd_interface / flash_attn_interface / flash_attn inside the worker (environment field: must match across runs; no expected value is hard-coded)"
+  },
+  "prior_runs": {
+    "rev0_2": "instrument mismatch record: canonical run 1 stopped fail-closed (FLASH_ATTN resolved, SDPA declared); its saved run is bit-exact with the rev 4.1 reference final (cross-session anchor); no comparison made"
   }
 }

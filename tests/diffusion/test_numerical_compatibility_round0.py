@@ -243,14 +243,16 @@ def test_anchor_failures_enumerated():
 
 
 def test_fingerprint_declared_vs_recorded():
-    rec = {"enforce_eager": False, "enable_cpu_offload": True, "inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "SDPA", "step_execution": False, "max_num_seqs": 1}
+    rec = {"enforce_eager": False, "enable_cpu_offload": True, "inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "FLASH_ATTN", "step_execution": False, "max_num_seqs": 1}
     assert core.fingerprint_check("CANONICAL", rec) == []
     assert core.fingerprint_check("EAGER", {**rec, "enforce_eager": True, "inductor_active": False}) == []
     silent_compile = core.fingerprint_check("EAGER", {**rec, "enforce_eager": True, "inductor_active": True})
     assert silent_compile and "inductor_active" in silent_compile[0]
-    silent_attn_fallback = core.fingerprint_check("ATTN_FLASHINFER", rec)  # requested FLASHINFER but SDPA resolved
+    silent_attn_fallback = core.fingerprint_check("ATTN_FLASHINFER", rec)  # requested FLASHINFER but FLASH_ATTN resolved
+    assert core.fingerprint_check("CANONICAL", {**rec, "attention_backend_resolved": "SDPA"})  # the rev0_2 stop, mirrored
     assert any("attention_backend_resolved" in d for d in silent_attn_fallback)
     assert core.fingerprint_check("OFFLOAD", {**rec, "enable_cpu_offload": False, "offload_hooks_present": False}) == []
+    assert core.fingerprint_check("ATTN_SDPA", {**rec, "attention_backend_resolved": "SDPA"}) == [] and core.fingerprint_check("ATTN_SDPA", rec)
     assert core.fingerprint_check("OFFLOAD", {**rec, "enable_cpu_offload": False, "offload_hooks_present": True})
     with pytest.raises(ValueError):
         core.fingerprint_check("BATCH", rec)
@@ -269,16 +271,16 @@ def test_run_plan_counts_and_cost():
     trajs = [{"id": t} for t in TRAJ]
     plan = core.run_plan(trajs, "p0_s9101")
     labels = [p["label"] for p in plan]
-    assert len(labels) == len(set(labels)) == 86
+    assert len(labels) == len(set(labels)) == 105
     full = [p for p in plan if p["kind"] == "FULL"]
     resume = [p for p in plan if p["kind"] == "HYBRID"]
-    assert len(full) == 35 and len(resume) == 51
+    assert len(full) == 42 and len(resume) == 63
     assert sum(1 for p in plan if p["phase"] == "canonical") == 9
-    assert sum(1 for p in plan if p["phase"] == "axis") == 72 and sum(1 for p in plan if p["phase"] == "freshcheck") == 5
+    assert sum(1 for p in plan if p["phase"] == "axis") == 90 and sum(1 for p in plan if p["phase"] == "freshcheck") == 6
     assert {p["t"] for p in resume} == {0, 12, 20, 28}
     cost = core.estimate_cost(plan)
-    assert cost["engine_constructions"] == 10  # canonical, 4 axes, 5 fresh processes
-    assert 5.0 < cost["hours_total"] < 6.5 and cost["storage_gb_est"] < 12
+    assert cost["engine_constructions"] == 12  # canonical, 5 axes, 6 fresh processes
+    assert 6.0 < cost["hours_total"] < 7.5 and cost["storage_gb_est"] < 14
     with pytest.raises(ValueError):
         core.run_plan(trajs[:2], "p0_s9101")
 
@@ -343,7 +345,7 @@ def test_output_namespace_rules():
 def test_plan_matches_core_and_configurations():
     cfg = _config()
     plan = rn.plan_for(cfg)
-    assert len(plan) == 86 and all(p["config"] in core.CONFIGURATIONS for p in plan)
+    assert len(plan) == 105 and all(p["config"] in core.CONFIGURATIONS for p in plan)
     assert rn.fresh_trajectory(cfg) == "p0_s9101"
     axes = {p["config"] for p in plan if p["phase"] == "axis"}
     assert axes == set(core.CORE_AXES) and "BATCH" not in axes and "PARALLEL" not in axes
@@ -357,7 +359,7 @@ def test_plan_matches_core_and_configurations():
 
 def test_phase_cpu_runs():
     res = rn.phase_cpu(_config())
-    assert res["runs"] == 86 and 5.0 < res["cost_estimate"]["hours_total"] < 6.5 and set(res["not_measured"]) == {"BATCH", "PARALLEL"}
+    assert res["runs"] == 105 and 6.0 < res["cost_estimate"]["hours_total"] < 7.5 and set(res["not_measured"]) == {"BATCH", "PARALLEL"}
 
 
 def test_preregistration_seal_and_tamper(tmp_path, monkeypatch):
@@ -370,13 +372,13 @@ def test_preregistration_seal_and_tamper(tmp_path, monkeypatch):
     shutil.rmtree(out, ignore_errors=True)
     try:
         res = rn.phase_preregister(cfg, CONFIG_PATH, out)
-        assert res["status"] == "SEALED" and res["n_runs"] == 86
+        assert res["status"] == "SEALED" and res["n_runs"] == 105
         pre = json.loads((out / "preregistration.json").read_text())
-        assert pre["revision"] == "0.2d" and pre["design"]["core_axes"] == list(core.CORE_AXES) and set(pre["design"]["not_measured_axes"]) == {"BATCH", "PARALLEL"}
+        assert pre["revision"] == "0.2f" and "rev0_2_instrument_mismatch" in pre["prior_runs"] and pre["design"]["core_axes"] == list(core.CORE_AXES) and set(pre["design"]["not_measured_axes"]) == {"BATCH", "PARALLEL"}
         assert pre["design"]["decision_set_D"].startswith("core axes that are WITHIN_REPRODUCIBLE")
         assert core.GO_STRONG in pre["design"]["decision"] and "predicted to FAIL" in pre["design"]["hypotheses_non_gating"]["H2"]
         assert pre["motivation_evidence"]["status"].startswith("synthetic")
-        assert len(pre["run_plan_labels"]) == 86 and "p0_s9101_EAGER_H12" in pre["run_plan_labels"] and "p0_s9101_ATTN_CUDNN_FRESH" in pre["run_plan_labels"]
+        assert len(pre["run_plan_labels"]) == 105 and "p2_s9101_ATTN_SDPA_H28" in pre["run_plan_labels"] and "p0_s9101_EAGER_H12" in pre["run_plan_labels"] and "p0_s9101_ATTN_CUDNN_FRESH" in pre["run_plan_labels"]
         assert pre["gpu_execution"].startswith("requires separate explicit user approval")
         assert rn.phase_preregister(cfg, CONFIG_PATH, out)["status"] == "ALREADY_SEALED"
         prov = rn.build_provenance(CONFIG_PATH)
@@ -415,7 +417,7 @@ FRAMES = (4, 16, 16, 3)
 def _fp(cfg_name: str) -> dict:
     spec = core.CONFIGURATIONS[cfg_name]
     env = {"torch": "2.11", "cuda": "12.8", "cudnn": 91900, "gpu_model": "L40S", "model_revision": "rev", "dtype": "torch.bfloat16", "cublas_workspace_config": None, "tf32_matmul": False, "tf32_cudnn": True,
-           "flashinfer_version": "0.4", "flash_attn_version": None, "parallel": {"tp": 1, "sp": 1, "ulysses": 1, "ring": 1, "cfg": 1, "pp": 1}}
+           "flashinfer_version": "0.4", "flash_attn_version": None, "flash_attn_provider": "fa3_fwd_interface", "parallel": {"tp": 1, "sp": 1, "ulysses": 1, "ring": 1, "cfg": 1, "pp": 1}}
     return {"enforce_eager": spec["enforce_eager"], "enable_cpu_offload": spec["enable_cpu_offload"], **spec["expect"], "step_execution": False, "max_num_seqs": 1, "batch_slot": 0, "compiled_block_count": 40 if spec["expect"]["inductor_active"] else 0, **env}
 
 

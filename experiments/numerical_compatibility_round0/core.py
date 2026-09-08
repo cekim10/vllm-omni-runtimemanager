@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 # --------------------------------------------------------------------------------------------------------------------
-# frozen constants (rev 0.2d)
+# frozen constants (rev 0.2f)
 # --------------------------------------------------------------------------------------------------------------------
 TOTAL_STEPS = 40
 N_BOUNDARIES = TOTAL_STEPS + 1
@@ -34,7 +34,7 @@ MATERIAL_FRACTION_STEP_THRESHOLD = 0.02  # k_material: first boundary with > 2% 
 AMPLIFICATION_FACTOR_H1 = 10.0  # descriptive hypothesis H1
 KSTAR_OFFSET_H1 = 4
 
-CORE_AXES = ("EAGER", "OFFLOAD", "ATTN_FLASHINFER", "ATTN_CUDNN")
+CORE_AXES = ("EAGER", "OFFLOAD", "ATTN_SDPA", "ATTN_FLASHINFER", "ATTN_CUDNN")
 NOT_MEASURED_AXES = {
     "BATCH": "Wan2.2 pipeline does not implement SupportsStepExecution; step_execution=True is rejected and max_num_seqs>1 is forced to 1; batch invariance is covered by vLLM-Omni #5512 Part 2",
     "PARALLEL": "host has 2x L40S but GPU 1 is allocated to another user; only GPU 0 is available for Round 0",
@@ -50,22 +50,25 @@ CROSS_ENGINE_REPRODUCIBLE, CROSS_ENGINE_NONREPRODUCIBLE, CROSS_ENGINE_NOT_RUN = 
 
 GO_STRONG, GO, WEAK, NO_GO_PORTABLE, NO_GO_INVARIANT, NO_GO, INVALID = ("GO_STRONG_REGIME_CROSSING", "GO_STATE_NOT_PORTABLE", "WEAK", "NO_GO_STATE_PORTABLE", "NO_GO_INVARIANT_SINGLE_GPU", "NO_GO", "INVALID_EXPERIMENT")
 
-# Declared execution configurations.  `expect` holds the runtime-observable fingerprint fields that MUST be recorded with these
+# Declared execution configurations.  rev 0.2e: on the L40S host the platform default resolves to FLASH_ATTN (FA3 provider,
+# fa3_fwd_interface / flash_attn_interface), NOT SDPA: the first canonical run of rev0_2 stopped fail-closed on exactly this mismatch.  `expect` holds the runtime-observable fingerprint fields that MUST be recorded with these
 # values for a run to count for its configuration (silent fallbacks make the run INVALID for the axis, never re-labelled).
 CONFIGURATIONS: dict[str, dict[str, Any]] = {
     CANONICAL: {"enforce_eager": False, "enable_cpu_offload": True, "attention_backend_env": None,
-                "expect": {"inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "SDPA"}},
+                "expect": {"inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "FLASH_ATTN"}},
     "EAGER": {"enforce_eager": True, "enable_cpu_offload": True, "attention_backend_env": None,
-              "expect": {"inductor_active": False, "offload_hooks_present": True, "attention_backend_resolved": "SDPA"}},
+              "expect": {"inductor_active": False, "offload_hooks_present": True, "attention_backend_resolved": "FLASH_ATTN"}},
     "OFFLOAD": {"enforce_eager": False, "enable_cpu_offload": False, "attention_backend_env": None,
-                "expect": {"inductor_active": True, "offload_hooks_present": False, "attention_backend_resolved": "SDPA"}},
+                "expect": {"inductor_active": True, "offload_hooks_present": False, "attention_backend_resolved": "FLASH_ATTN"}},
+    "ATTN_SDPA": {"enforce_eager": False, "enable_cpu_offload": True, "attention_backend_env": "TORCH_SDPA",
+                  "expect": {"inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "SDPA"}},
     "ATTN_FLASHINFER": {"enforce_eager": False, "enable_cpu_offload": True, "attention_backend_env": "FLASHINFER_ATTN",
                         "expect": {"inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "FLASHINFER_ATTN"}},
     "ATTN_CUDNN": {"enforce_eager": False, "enable_cpu_offload": True, "attention_backend_env": "CUDNN_ATTN",
                    "expect": {"inductor_active": True, "offload_hooks_present": True, "attention_backend_resolved": "CUDNN_ATTN"}},
 }
 # Environment fields that must be identical across ALL configurations (they are not axes); a difference is INVALID.
-FINGERPRINT_ENVIRONMENT_FIELDS = ("torch", "cuda", "cudnn", "gpu_model", "model_revision", "dtype", "cublas_workspace_config", "tf32_matmul", "tf32_cudnn", "flashinfer_version", "flash_attn_version", "parallel")
+FINGERPRINT_ENVIRONMENT_FIELDS = ("torch", "cuda", "cudnn", "gpu_model", "model_revision", "dtype", "cublas_workspace_config", "tf32_matmul", "tf32_cudnn", "flashinfer_version", "flash_attn_version", "flash_attn_provider", "parallel")
 FINGERPRINT_FIELDS = ("enforce_eager", "inductor_active", "compiled_block_count", "enable_cpu_offload", "offload_hooks_present", "offload_hook_names",
                       "attention_backend_resolved", "attention_backend_names_all", "step_execution", "max_num_seqs", "batch_slot") + FINGERPRINT_ENVIRONMENT_FIELDS
 

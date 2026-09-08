@@ -1,4 +1,4 @@
-# Numerical Compatibility Round 0 — Preregistration (rev 0.2d, 2026-09-07)
+# Numerical Compatibility Round 0 — Preregistration (rev 0.2f, 2026-09-07)
 
 Status: design FROZEN by the user (rev 0.2b, 2026-09-07), implemented as rev 0.2c, and corrected to rev 0.2d after the
 final hostile audit (Section 13, item 14: trajectory-wide invariance and the NO_GO_STATE_PORTABLE outcome). The machine-readable form is
@@ -66,11 +66,12 @@ same step; material-position threshold 0.02).
 ### 4.1 Canonical phi_0
 
 `enable_cpu_offload=True`, `enforce_eager=False` (torch.compile / inductor), attention
-backend = platform default, which on this host resolves to **TORCH_SDPA** (sm_89 L40S, flash_attn
-absent, flashinfer present, cuDNN 9.19, torch 2.11.0+cu128; resolved class recorded at runtime),
-`step_execution=False`, `max_num_seqs=1`, TP=SP=CFG-parallel=1, bf16. Caveat recorded in the
-fingerprint: TORCH_SDPA is PyTorch's unpinned dispatcher, so the kernel it selects is itself a
-torch-version- and shape-dependent choice; phi_0 pins the dispatcher, not a kernel. This is the
+backend = platform default, which on this host resolves to **FLASH_ATTN** (rev 0.2e correction: the FA2
+package `flash_attn` is absent but an FA3 provider, `fa3_fwd_interface` / `flash_attn_interface`, is
+present, so the selector picks FLASH_ATTN; observed in the rev0_2 canonical run 1, which stopped
+fail-closed against the earlier SDPA expectation), sm_89 L40S, flashinfer 0.6.12, cuDNN 9.19,
+torch 2.11.0+cu128; resolved class recorded at runtime. `step_execution=False`, `max_num_seqs=1`,
+TP=SP=CFG-parallel=1, bf16. This is the
 configuration of every frozen prior round, so the rev 4.1 reference finals serve as a
 descriptive cross-session anchor (Section 6.4).
 
@@ -84,8 +85,9 @@ change) and is sanity-only.
 |---|---|---|---|
 | AX_EAGER | `enforce_eager=True` | `setup_compile()` failure falls back to eager with only a warning (`diffusion_model_runner.py`); compile availability differs across images | core |
 | AX_OFFLOAD | `enable_cpu_offload=False` | memory-pressure policy toggled per worker/pool; outside the vLLM-Omni #5512 contract. A `FULL_TRAJECTORY_BIT_INVARIANT` result here is a valid compatibility-matrix cell ("offload preserves the domain"), not a failure | core |
-| AX_ATTN_FLASHINFER | `DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN` | Blackwell hosts default to FLASHINFER/CUDNN while Ada hosts default to SDPA, so a heterogeneous pool mixes them; the selector also silently falls back when a package is missing | core |
-| AX_ATTN_CUDNN | `DIFFUSION_ATTENTION_BACKEND=CUDNN_ATTN` (pins `sdpa_kernel([CUDNN_ATTENTION])`) | CUDNN_ATTN is the Blackwell platform default | core |
+| AX_ATTN_SDPA (rev 0.2f) | `DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA` | platform/package-dependent backend resolution: the selector falls back to TORCH_SDPA when no flash-attention provider is importable; on this host the default is FLASH_ATTN, so FLASH_ATTN <-> SDPA is the availability-driven edge | core |
+| AX_ATTN_FLASHINFER | `DIFFUSION_ATTENTION_BACKEND=FLASHINFER_ATTN` | platform/package-dependent backend resolution: different hosts/images of the same stack resolve to different implementations (this Ada host: FLASH_ATTN via an FA3 provider; other platforms default to CUDNN_ATTN or FLASHINFER_ATTN) | core |
+| AX_ATTN_CUDNN | `DIFFUSION_ATTENTION_BACKEND=CUDNN_ATTN` (pins `sdpa_kernel([CUDNN_ATTENTION])`) | same as above | core |
 | AX_BATCH | `step_execution=True`, `max_num_seqs=2`, target co-batched with the partner | continuous batching; duplicates #5512 Part 2 | **NOT_MEASURED (declared 2026-09-07)**: the Wan2.2 pipeline does not implement `SupportsStepExecution`, so `step_execution=True` is rejected at model-runner init and `max_num_seqs>1` is forced to 1 (`diffusion_engine.py:143`). Co-batching Wan2.2 would require implementing step execution in the trusted pipeline, which is out of Round 0 scope. |
 | AX_PARALLEL | USP or CFG-parallel degree 2 | elastic parallelism / disaggregation | **NOT_MEASURED (declared 2026-09-07)**: the host has two L40S but GPU 1 is allocated to another user; only GPU 0 is available for this round. Multi-GPU layout stays outside the kill scope. |
 
@@ -115,16 +117,16 @@ per-boundary sha256 plus the final latent only.
 |---|---|---|
 | canonical | `F_A` x2 (2 full) | 6 full |
 | exact-resume anchor | `H_{A->A,12}` (1 resume) | 3 resume |
-| per core axis X (4 axes) | `F_X` x2 (2 full); `H_{A->X,0}` anchor, `H_{A->X,12}`, `H_{A->X,20}`, `H_{A->X,28}` (4 resume) | 6 full + 12 resume each -> 24 full + 48 resume |
-| fresh-engine control (descriptive) | `F_X` for p0 only, in a NEW process/engine, for phi_0 and each core axis | 5 full |
+| per core axis X (5 axes) | `F_X` x2 (2 full); `H_{A->X,0}` anchor, `H_{A->X,12}`, `H_{A->X,20}`, `H_{A->X,28}` (4 resume) | 6 full + 12 resume each -> 30 full + 60 resume |
+| fresh-engine control (descriptive) | `F_X` for p0 only, in a NEW process/engine, for phi_0 and each core axis | 6 full |
 | AX_BATCH | NOT_MEASURED (see 4.2) | 0 |
 | AX_PARALLEL | NOT_MEASURED (see 4.2) | 0 |
 
-Totals: 35 full + 51 resume (AX_BATCH and AX_PARALLEL not measured).
+Totals: 42 full + 63 resume = 105 runs (AX_BATCH and AX_PARALLEL not measured).
 Wall-time model from rev 4.1 (full 236 s; per denoising step ~4.5 s plus ~55 s fixed encode/decode,
 so resume(t) ~ 55 + 4.5 (40 - t) s: t=0 235 s, t=12 181 s, t=20 145 s, t=28 109 s):
-canonical 0.54 h; each core axis 0.95 h (x4 = 3.8 h); fresh-engine controls 5 x (~300 s engine +
-236 s) = 0.75 h; 5 engine constructions ~0.4 h -> **~5.5 GPU-h**. Storage: ~70 all-latent runs x ~150 MB -> ~10 GB (per-boundary hashes only for run 2s).
+canonical 0.54 h; each core axis 0.95 h (x5 = 4.75 h); fresh-engine controls 6 x (~300 s engine +
+236 s) = 0.9 h; 6 engine constructions ~0.5 h -> **~6.6 GPU-h**. Storage ~12.5 GB. Storage: ~70 all-latent runs x ~150 MB -> ~10 GB (per-boundary hashes only for run 2s).
 
 ## 6. Measurements and classification
 
@@ -178,7 +180,7 @@ or `CROSS_ENGINE_NONREPRODUCIBLE` (evidence of hidden provenance not captured by
 3. Any `H_{A->X,0}` anchor not `BIT_EXACT` with `F_X` run 1 in 3/3 for a measured axis
    (resume plumbing would confound the hybrid result).
 4. Any recorded fingerprint differs from the declared one for its axis (Section 4.3).
-5. Fewer than 2 core axes measured (core: EAGER, OFFLOAD, ATTN_FLASHINFER, ATTN_CUDNN).
+5. Fewer than 2 core axes measured (core: EAGER, OFFLOAD, ATTN_SDPA, ATTN_FLASHINFER, ATTN_CUDNN).
 6. Any Engine gate error (non-Euler path, wrong step count, probe mismatch), as in prior rounds.
 7. (rev 0.2c) Non-axis environment fingerprint fields (torch, cuda, cuDNN, GPU model, model revision, dtype,
    TF32 flags, cuBLAS workspace, flashinfer/flash_attn versions, parallel degrees) differ between any two runs.
@@ -235,7 +237,8 @@ cross-model claim.
 
 ## 9. Kill scope and claim boundary
 
-Kill scope: Wan2.2-T2V-A14B, 40-step Euler, bf16, single L40S, the listed axes. A NO_GO closes
+Kill scope: Wan2.2-T2V-A14B, 40-step Euler, bf16, single L40S, the five listed axes. The matrix is final:
+no further axes will be added after this revision (more axes would turn Round 0 into a characterisation sweep). A NO_GO closes
 "single-GPU configuration-induced state incompatibility on Wan2.2" only; it says nothing about
 multi-GPU layouts (AX_PARALLEL not measured: GPU 1 occupied), other models, or throughput. No mechanism
 (compatibility domain enforcement, scheduler, canonicalisation) is built or evaluated in Round 0;
@@ -263,13 +266,13 @@ sample when the execution regime changes after the state was created.
 
 ## 11. Phases and artifacts
 
-`cpu | preregister | canonical | axis --axis {EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN}
-| freshcheck --axis {CANONICAL,EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN} | analyze`
+`cpu | preregister | canonical | axis --axis {EAGER,OFFLOAD,ATTN_SDPA,ATTN_FLASHINFER,ATTN_CUDNN}
+| freshcheck --axis {CANONICAL,EAGER,OFFLOAD,ATTN_SDPA,ATTN_FLASHINFER,ATTN_CUDNN} | analyze`
 (AX_BATCH and AX_PARALLEL NOT_MEASURED; no phases for them).
 Each `axis` invocation constructs one engine with that configuration and runs its 18 runs;
 `freshcheck` is a separate process (hence a fresh engine) running `F_X` for p0 once. The worker
 records the resolved fingerprint into every run.json. Output namespace
-`results/numerical_compatibility_round0/rev0_2/` (old namespaces rejected). Trusted-source set for the
+`results/numerical_compatibility_round0/rev0_3/` (rev0_2 is the frozen instrument-mismatch record, pinned as a prior run; old namespaces rejected). Trusted-source set for the
 provenance hash additionally covers the axis mechanisms: attention selector/layer, CUDA platform selector,
 compile.py, sequential offload backend, diffusion model runner. Provenance hash over
 trusted sources + config + commit + relevant dirty status, sealed preregistration sha256,
@@ -331,3 +334,18 @@ relation, hybrid class at 12/20/28, t_portable, k*, final rel-L2, SSIM}).
     `model_revision` made mandatory in the recorded fingerprint (GateError if unresolved, so the environment
     check can never degenerate to None == None); `model` and declared revision also recorded by the pipeline.
     "hybrids then trivially bit-exact" wording removed.
+15. (rev 0.2e, instrument fix before any comparison) The rev0_2 canonical run 1 recorded
+    `attention_backend_resolved = FLASH_ATTN` against the declared SDPA and stopped fail-closed as designed.
+    Cause: the host has an FA3 provider (`fa3_fwd_interface` / `flash_attn_interface`) although the FA2
+    package is absent; the earlier host check only probed `flash_attn`. Canonical/EAGER/OFFLOAD expectation
+    changed to FLASH_ATTN; `flash_attn_provider` added as an environment fingerprint field; namespace moved
+    to rev0_3 with rev0_2 pinned in `prior_runs`. The saved rev0_2 run is bit-exact with the rev 4.1
+    reference final for p0 (cross-session anchor holds). No threshold, axis, or decision rule changed.
+16. (rev 0.2f, user-approved before any comparison) `ATTN_SDPA` core axis added: FLASH_ATTN -> TORCH_SDPA is the
+    availability-driven fallback edge that rev0_2 revealed. Attention runtime reasons generalised to
+    "platform/package-dependent backend resolution"; claim caution: Round 0 says only that backend
+    availability/platform differences can resolve the same serving stack to different attention
+    implementations, nothing about how often a runtime switches. `flash_attn_provider` stays an environment
+    consistency field with no hard-coded expected value. Matrix 42 full + 63 resume = 105 runs, ~6.6 GPU-h,
+    declared final. The rev0_2 cross-session bit-exact observation is descriptive and pre-experimental; the new
+    sealed canonical must pass independently.
