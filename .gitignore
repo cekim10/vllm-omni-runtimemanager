@@ -279,3 +279,4 @@ lance_compare/
 
 # Round-0 preregistered config must be tracked (provenance dirty-check relies on git status)
 !experiments/speculative_contamination_round0/config.json
+!experiments/numerical_compatibility_round0/config.json

@@ -1,0 +1,338 @@
+{
+  "experiment": "numerical-compatibility-round0",
+  "version": "numerical-compatibility-round0-v0.2d",
+  "status": "FROZEN DESIGN rev 0.2d (final hostile audit fixes applied 2026-09-07); sealed by --phase preregister; GPU execution requires separate approval",
+  "primary_question": "Does an intermediate Wan2.2 denoising state created under one execution configuration remain the SAME SAMPLE when denoising is continued under a different single-GPU execution configuration? Observable: H_{A->B,t} = F_B^{t:40}(x_t^A) versus F_A and F_B.",
+  "broken_assumption": "Stateful diffusion systems increasingly checkpoint, reuse, or move intermediate latents, which implicitly requires the consumer execution to interpret the saved state compatibly with its producer; we test whether the effective state is C=(x_t,t) or C=(x_t,t,phi).",
+  "motivation_evidence": {
+    "root": "results/regional_recompute_round0/rev4_1",
+    "preregistration_sha256": "5ec4e76bf9311c046485b5499cb3e09218e9840bda2958de78ca0777a49aeb8f",
+    "provenance_hash": "242049e582ee6a8721b00a12d4adc513b371d527dde260d7451c1f9466ad713f",
+    "statement": "Synthetic sub-half-ulp perturbations confined to 3.8-11% of tokens at t in {12,20,28} produced MATERIAL final divergence in 24/24 cells; final divergence nearly independent of injected magnitude. Motivation only; Round 0 measures whether REAL configuration changes seed such a perturbation."
+  },
+  "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+  "generation": {
+    "height": 480,
+    "width": 832,
+    "num_frames": 33,
+    "num_inference_steps": 40,
+    "guidance_scale": 4.0,
+    "fps": 16.0,
+    "boundary_ratio": 0.875
+  },
+  "scheduler": {
+    "name": "WanEulerScheduler",
+    "sample_solver": "euler",
+    "num_train_timesteps": 1000,
+    "flow_shift": 12.0
+  },
+  "prompts": [
+    {
+      "id": "p0",
+      "category": "static",
+      "prompt": "A red vintage car parked on a quiet cobblestone street at dusk, still camera, cinematic video"
+    },
+    {
+      "id": "p1",
+      "category": "object_motion",
+      "prompt": "A red sports car driving on a snowy road, cinematic video"
+    },
+    {
+      "id": "p2",
+      "category": "articulated_motion",
+      "prompt": "A person in a yellow raincoat jogging along a beach at sunrise, cinematic video"
+    },
+    {
+      "id": "p3",
+      "category": "complex_scene",
+      "prompt": "A busy city intersection at night with crowds, traffic and neon signs, camera slowly panning, cinematic video"
+    }
+  ],
+  "trajectories": [
+    {
+      "id": "p0_s9101",
+      "prompt_id": "p0",
+      "seed": 9101
+    },
+    {
+      "id": "p2_s9101",
+      "prompt_id": "p2",
+      "seed": 9101
+    },
+    {
+      "id": "p3_s9101",
+      "prompt_id": "p3",
+      "seed": 9101
+    }
+  ],
+  "batch_partner": {
+    "id": "p1_s9202",
+    "prompt_id": "p1",
+    "seed": 9202
+  },
+  "canonical_configuration": {
+    "name": "phi_0",
+    "enforce_eager": false,
+    "enable_cpu_offload": true,
+    "attention_backend": "TORCH_SDPA (platform default on sm_89 with flash_attn absent; unpinned torch dispatcher; resolved class recorded at runtime)",
+    "step_execution": false,
+    "max_num_seqs": 1,
+    "parallel": {
+      "tp": 1,
+      "sp": 1,
+      "cfg": 1
+    },
+    "dtype": "bfloat16"
+  },
+  "axes": {
+    "EAGER": {
+      "class": "core",
+      "change": {
+        "enforce_eager": true
+      },
+      "runtime_reason": "setup_compile() failure silently falls back to eager (diffusion_model_runner.py); compile availability differs across images"
+    },
+    "OFFLOAD": {
+      "class": "core",
+      "change": {
+        "enable_cpu_offload": false
+      },
+      "runtime_reason": "memory-pressure policy toggled per worker/pool; outside the #5512 contract",
+      "note": "FULL_TRAJECTORY_BIT_INVARIANT here is a valid compatibility-matrix cell (offload preserves the domain), not a failure"
+    },
+    "ATTN_FLASHINFER": {
+      "class": "core",
+      "change": {
+        "attention_backend": "FLASHINFER_ATTN"
+      },
+      "runtime_reason": "Blackwell hosts default to FLASHINFER/CUDNN, Ada hosts to SDPA -> heterogeneous pools mix them; selector silently falls back when a package is missing"
+    },
+    "ATTN_CUDNN": {
+      "class": "core",
+      "change": {
+        "attention_backend": "CUDNN_ATTN"
+      },
+      "runtime_reason": "CUDNN_ATTN is the Blackwell platform default; pins sdpa_kernel([CUDNN_ATTENTION])"
+    },
+    "BATCH": {
+      "class": "NOT_MEASURED",
+      "change": {
+        "step_execution": true,
+        "max_num_seqs": 2
+      },
+      "reason": "Wan2.2 pipeline does not implement SupportsStepExecution; step_execution=True rejected at model-runner init; max_num_seqs>1 forced to 1 (diffusion_engine.py:143); implementing step execution in the trusted pipeline is out of Round 0 scope; batch invariance is covered by vLLM-Omni #5512 Part 2"
+    },
+    "PARALLEL": {
+      "class": "NOT_MEASURED",
+      "change": {
+        "parallel": "USP or CFG-parallel degree 2"
+      },
+      "reason": "GPU 1 occupied by another user; only GPU 0 available; multi-GPU layout stays outside the kill scope"
+    }
+  },
+  "excluded_axes": [
+    "SAGE_ATTN",
+    "SAGE_ATTN_3",
+    "cache_backend",
+    "LoRA",
+    "quantization",
+    "TF32 flags (recorded, not varied)"
+  ],
+  "fingerprint_fields": [
+    "enforce_eager",
+    "inductor_active (runtime evidence, not the flag)",
+    "enable_cpu_offload",
+    "offload_backend_class",
+    "attention_backend_resolved (selector class name, not requested string)",
+    "step_execution",
+    "max_num_seqs",
+    "batch_slot",
+    "parallel",
+    "dtype",
+    "torch",
+    "cuda",
+    "cudnn",
+    "flashinfer_version",
+    "flash_attn_version",
+    "gpu_model",
+    "model_revision",
+    "cublas_workspace_config",
+    "tf32_matmul",
+    "tf32_cudnn"
+  ],
+  "fingerprint_rule": "recorded fingerprint != declared axis fingerprint -> INVALID for that axis; never relabelled",
+  "checkpoints_t": [
+    12,
+    20,
+    28
+  ],
+  "anchors": {
+    "exact_resume": "H_{A->A,12} bit-exact with F_A run 1 (3/3)",
+    "resume_under_axis": "H_{A->X,0} bit-exact with F_X run 1 (3/3) for every measured axis"
+  },
+  "run_matrix": {
+    "canonical": {
+      "F_A_full": 2
+    },
+    "exact_resume_anchor": {
+      "H_A_to_A_t12": 1
+    },
+    "per_core_axis": {
+      "F_X_full": 2,
+      "H_A_to_X_t": [
+        0,
+        12,
+        20,
+        28
+      ],
+      "note": "t=0 is the resume-plumbing anchor (full length)"
+    },
+    "fresh_engine_control": {
+      "configs": [
+        "CANONICAL",
+        "EAGER",
+        "OFFLOAD",
+        "ATTN_FLASHINFER",
+        "ATTN_CUDNN"
+      ],
+      "trajectory": "p0_s9101",
+      "runs": 1,
+      "process": "new process, new engine",
+      "role": "descriptive"
+    },
+    "latent_capture": "all 41 boundaries float32 for run 1 of each pair and all hybrids; run 2 stores per-boundary sha256 + final only",
+    "decode": true,
+    "totals": "35 full + 51 resume (BATCH and PARALLEL not measured)"
+  },
+  "thresholds": {
+    "same_sample_rel_l2_max": 0.02,
+    "same_sample_frame_ssim_min": 0.95,
+    "material_position_threshold": 0.02,
+    "material_fraction_step_threshold": 0.02,
+    "trajectory_rule": "3/3 trajectories for every class"
+  },
+  "axis_classes": {
+    "WITHIN_REPRODUCIBLE": "F_X run1 == run2 BIT_EXACT (latent+video) 3/3; prerequisite",
+    "WITHIN_NONDETERMINISTIC": "otherwise; excluded from decision, reported with k*",
+    "FULL_TRAJECTORY_BIT_INVARIANT": "F_X vs F_A BIT_EXACT at ALL 41 latent boundaries AND video, 3/3 (rev 0.2d; final-only equality is NOT invariance)",
+    "FULL_SAMPLE_EQUIVALENT": "not trajectory-bit-invariant but STRICT_COMPATIBLE 3/3 (includes final-only bit-exact with differing intermediates)",
+    "FULL_SAMPLE_DIFFERENT": "STRICT_INCOMPATIBLE 3/3",
+    "FULL_MIXED": "otherwise",
+    "CROSS_ENGINE_REPRODUCIBLE": "fresh-engine F_X (p0) BIT_EXACT with run 1 (descriptive)",
+    "rule": "full-run relation is NEVER a qualification condition; hybrids run for every core axis"
+  },
+  "hybrid_classes_at_t12": {
+    "HYBRID_INCOMPATIBLE": "STRICT_INCOMPATIBLE vs F_A and vs F_X in 3/3",
+    "HYBRID_COMPATIBLE_BOTH": "STRICT_COMPATIBLE vs F_A and vs F_X in 3/3 (rev 0.2c: precedence over REPLAY/FRESH)",
+    "HYBRID_REPLAY_LIKE": "STRICT_COMPATIBLE vs F_A 3/3 (not vs F_X)",
+    "HYBRID_FRESH_LIKE": "STRICT_COMPATIBLE vs F_X 3/3 (not vs F_A)",
+    "HYBRID_MIXED": "otherwise",
+    "t_portable": "min t in {12,20,28} with H STRICT_COMPATIBLE vs F_A 3/3 (descriptive)"
+  },
+  "decision": {
+    "D": "core axes that are WITHIN_REPRODUCIBLE and NOT FULL_TRAJECTORY_BIT_INVARIANT",
+    "GO_STRONG_REGIME_CROSSING": "|D| >= 2 and >= 1 axis in D is FULL_SAMPLE_EQUIVALENT and HYBRID_INCOMPATIBLE",
+    "GO_STATE_NOT_PORTABLE": "|D| >= 2 and >= 1 axis in D is HYBRID_INCOMPATIBLE",
+    "WEAK": "|D| == 1 and that axis is HYBRID_INCOMPATIBLE (phenomenon present, generality not shown); no preregistered follow-up",
+    "NO_GO_STATE_PORTABLE": "|D| >= 1 and no axis in D is HYBRID_INCOMPATIBLE (regimes change numerics but crossing creates no third semantics)",
+    "NO_GO_INVARIANT_SINGLE_GPU": "|D| == 0 and every measured core axis FULL_TRAJECTORY_BIT_INVARIANT",
+    "NO_GO": "otherwise"
+  },
+  "invalid_conditions": [
+    "x_0 not BIT_EXACT across phi_0 and every measured core axis",
+    "F_A not WITHIN_REPRODUCIBLE",
+    "exact-resume anchor H_{A->A,12} not BIT_EXACT with F_A run 1 3/3",
+    "any H_{A->X,0} anchor not BIT_EXACT with F_X run 1 3/3",
+    "recorded fingerprint != declared for any axis",
+    "fewer than 2 core axes measured (core: EAGER, OFFLOAD, ATTN_FLASHINFER, ATTN_CUDNN)",
+    "any Engine gate error (non-Euler path, step count, probe mismatch)",
+    "non-axis environment fingerprint fields (torch/cuda/cudnn/gpu/model revision/TF32/cuBLAS workspace/library versions/parallel) differ between any two runs"
+  ],
+  "descriptive_controls": {
+    "cross_session_reproducibility": {
+      "compare": "F_A run 1 final sha256 vs rev4_1 reference final.npy sha256",
+      "p0_s9101_rev4_1_final_prefix": "fef35330b8bd7d45",
+      "on_mismatch": "CROSS_SESSION_NONREPRODUCIBLE (reported, not INVALID; provenance differs)"
+    },
+    "batch_axis_class": "reported",
+    "delta_k_vs_synthetic": "config-axis delta_k curves against frozen W1/L4 curves at their captured steps",
+    "fresh_engine": "per configuration, p0 only, new process; CROSS_ENGINE_* class; not a kill condition"
+  },
+  "hypotheses_non_gating": {
+    "H1_amplification": "final rel-L2 vs F_A >= 10x rel-L2 at boundary k*+4 for every axis in D",
+    "H2_earliest_safe_switch": "t_portable exists (<= 28) for >= 1 axis in D; PREDICTED TO FAIL; approach to F_A with t is structural, only existence of a compatible t is informative",
+    "H3_first_divergence": "k* = 1 for every axis in D (x_0 identical by construction)",
+    "H4_prompt_order": "final divergence p3 > p2 > p0",
+    "H5_cross_engine": "every core axis CROSS_ENGINE_REPRODUCIBLE"
+  },
+  "cost_estimate": {
+    "full_run_s": 236,
+    "resume_model_s": "55 + 4.5*(40-t): t0 235, t12 181, t20 145, t28 109",
+    "canonical_h": 0.54,
+    "per_core_axis_h": 0.95,
+    "fresh_engine_controls_h": 0.75,
+    "engine_constructions_h": 0.4,
+    "storage_gb": 10,
+    "gpu_hours": 5.5
+  },
+  "kill_scope": "Wan2.2-T2V-A14B, 40-step Euler, bf16, single L40S (GPU 0), axes EAGER/OFFLOAD/ATTN_FLASHINFER/ATTN_CUDNN; NO_GO closes single-GPU configuration-induced incompatibility on Wan2.2 only; parallel layout and batching not measured",
+  "claim_boundary": "GO claims only that intermediate state created under phi_0 and continued under >= 1 other single-GPU configuration is a different sample from both replay and fresh runs on this model/host; no frequency, throughput, mechanism or cross-model claims",
+  "novelty_boundary": "Prior work (vLLM-Omni #5512, verl-omni #203, ComfyUI Deterministic Toolkit, CoRun) asks whether the same request stays deterministic under a fixed regime or across batch compositions; Round 0 asks whether intermediate state remains the same sample when the execution regime changes after the state was created.",
+  "phases": [
+    "cpu",
+    "preregister",
+    "canonical",
+    "axis --axis {EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN}",
+    "freshcheck --axis {CANONICAL,EAGER,OFFLOAD,ATTN_FLASHINFER,ATTN_CUDNN}",
+    "analyze"
+  ],
+  "namespace": "results/numerical_compatibility_round0/rev0_2",
+  "open_items_before_freeze": [],
+  "host_facts_2026_09_07": {
+    "gpu": "NVIDIA L40S sm_89",
+    "torch": "2.11.0+cu128",
+    "cudnn": 91900,
+    "flash_attn": "MISSING",
+    "flashinfer": "installed",
+    "sageattention": "MISSING",
+    "gpu_count": "2x L40S visible; GPU 1 allocated to another user -> only GPU 0 usable"
+  },
+  "boundary_indexing": {
+    "x_k": "latent ENTERING step k (k=0..39); x_40 = final",
+    "x_0": "initial noise from the CPU generator seeded by the request seed, before any forward; must be bit-identical across configurations for the same seed"
+  },
+  "vocabulary": {
+    "STATE_DIFFERENT": "final latent rel-L2 > 0.02",
+    "OUTPUT_DIFFERENT": "mean frame SSIM < 0.95",
+    "STRICT_COMPATIBLE": "STATE_SAME and OUTPUT_SAME",
+    "BIT_EXACT": "identical float32 latent sha256 (and video sha256 where decoded)",
+    "different_sample_reserved_for": "STATE_DIFFERENT and OUTPUT_DIFFERENT both true"
+  },
+  "axis_isolation_rule": "each core axis isolates ONE intended execution-regime change relative to phi_0; AX_BATCH is a composite serving-mode configuration (sanity only)",
+  "result_ranking": [
+    "FULL_SAMPLE_EQUIVALENT + HYBRID_INCOMPATIBLE (strongest)",
+    "FULL_SAMPLE_DIFFERENT + HYBRID_INCOMPATIBLE",
+    "everything else"
+  ],
+  "changes_from_rev0_1": [
+    "full-run materiality removed from qualification; hybrids for every axis; FULL_SAMPLE_EQUIVALENT+HYBRID_INCOMPATIBLE is the strongest tier",
+    "boundary indexing defined; H3 k*=1; x_0 anchor",
+    "run matrix and wall-time corrected (35 full + 51 resume; ~6.4 GPU-h)",
+    "STATE/OUTPUT/STRICT vocabulary",
+    "fresh-engine control (descriptive)",
+    "core-axis / composite-BATCH wording",
+    "Section 1 softened",
+    "runtime-evidence fingerprint fields",
+    "t_portable replaces monotonicity",
+    "rev 0.2b: AX_BATCH NOT_MEASURED (pipeline lacks step execution); fingerprint readback requires additive probe-metadata change",
+    "rev 0.2b: AX_PARALLEL NOT_MEASURED (GPU 1 occupied)",
+    "rev 0.2c (implementation-discovered, before seal): HYBRID_COMPATIBLE_BOTH label added with precedence when H is compatible with both F_A and F_X (was ambiguous between REPLAY_LIKE and FRESH_LIKE); environment-field consistency across runs added as INVALID condition; axis keys without AX_ prefix in code",
+    "rev 0.2d (final hostile audit, before seal): FULL_BIT_INVARIANT -> FULL_TRAJECTORY_BIT_INVARIANT (all 41 boundaries + video); D exclusion uses it; '|D|>=2 and no HYBRID_INCOMPATIBLE' moved from WEAK to NO_GO_STATE_PORTABLE; model_revision made mandatory in the recorded fingerprint; 'hybrids then trivially bit-exact' wording removed"
+  ],
+  "fingerprint_recorded_values": {
+    "attention_backend_resolved": "backend.get_name(): SDPA | FLASHINFER_ATTN | CUDNN_ATTN",
+    "inductor_active": "count of repeated transformer blocks whose forward carries a torch.compile wrapper > 0",
+    "offload_hooks_present": "any transformer module _hook_registry contains sequential_offload or layerwise_offload",
+    "model_revision": "resolved snapshot revision from the runner environment document; run is a GateError if unresolved (never None)"
+  }
+}

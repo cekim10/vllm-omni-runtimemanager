@@ -859,6 +859,86 @@ class Wan22Pipeline(
         decoded = decoded.permute(0, 2, 3, 4, 1).contiguous()
         return decoded[0].cpu().numpy()
 
+    def _runtime_fingerprint(self) -> dict[str, Any]:
+        """Runtime-OBSERVED execution provenance (never the declared config alone).
+
+        Additive instrumentation for the numerical-compatibility experiments: which attention backend classes are actually
+        instantiated, whether repeated transformer blocks actually carry a torch.compile wrapper, which offload hooks are
+        actually registered, and the library/device environment.  Errors are recorded, never raised, so probes stay intact.
+        """
+        try:
+            import importlib.metadata as _md
+
+            from vllm_omni.diffusion.attention.layer import Attention as _AttentionLayer
+
+            models = [m for m in (getattr(self, "transformer", None), getattr(self, "transformer_2", None)) if m is not None]
+            backend_names: set[str] = set()
+            compiled_blocks = 0
+            hook_names: set[str] = set()
+            param_dtypes: set[str] = set()
+            for model in models:
+                for _, sub in model.named_modules():
+                    if isinstance(sub, _AttentionLayer):
+                        backend_cls = getattr(sub, "attn_backend", None)
+                        if backend_cls is not None:
+                            backend_names.add(str(backend_cls.get_name()))
+                    fwd = getattr(sub, "forward", None)
+                    if fwd is not None and (hasattr(fwd, "_torchdynamo_orig_callable") or type(fwd).__name__ == "OptimizedModule"):
+                        compiled_blocks += 1
+                    registry = getattr(sub, "_hook_registry", None)
+                    if registry is not None:
+                        hook_names.update(str(k) for k in getattr(registry, "_hooks", {}).keys())
+                for p in model.parameters():
+                    param_dtypes.add(str(p.dtype))
+                    break
+
+            def _version(name: str) -> str | None:
+                try:
+                    return _md.version(name)
+                except Exception:
+                    return None
+
+            od = self.od_config
+            pc = getattr(od, "parallel_config", None)
+            parallel = {
+                "tp": int(getattr(pc, "tensor_parallel_size", 1) or 1),
+                "sp": int(getattr(pc, "sequence_parallel_size", 1) or 1),
+                "ulysses": int(getattr(pc, "ulysses_degree", 1) or 1),
+                "ring": int(getattr(pc, "ring_degree", 1) or 1),
+                "cfg": int(getattr(pc, "cfg_parallel_size", 1) or 1),
+                "pp": int(getattr(pc, "pipeline_parallel_size", 1) or 1),
+            }
+            resolved = sorted(backend_names)
+            return {
+                "model": str(getattr(od, "model", None)),
+                "model_revision_declared": getattr(od, "revision", None),
+                "enforce_eager": bool(getattr(od, "enforce_eager", False)),
+                "inductor_active": bool(compiled_blocks > 0),
+                "compiled_block_count": int(compiled_blocks),
+                "enable_cpu_offload": bool(getattr(od, "enable_cpu_offload", False)),
+                "enable_layerwise_offload": bool(getattr(od, "enable_layerwise_offload", False)),
+                "offload_hooks_present": any("offload" in h for h in hook_names),
+                "offload_hook_names": sorted(hook_names),
+                "attention_backend_resolved": resolved[0] if len(resolved) == 1 else ("MIXED:" + ",".join(resolved) if resolved else None),
+                "attention_backend_names_all": resolved,
+                "step_execution": bool(getattr(od, "step_execution", False)),
+                "max_num_seqs": int(getattr(od, "max_num_seqs", 1) or 1),
+                "parallel": parallel,
+                "dtype": sorted(param_dtypes)[0] if len(param_dtypes) == 1 else sorted(param_dtypes),
+                "torch": str(torch.__version__),
+                "cuda": str(getattr(torch.version, "cuda", None)),
+                "cudnn": torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+                "gpu_model": torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None,
+                "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+                "tf32_matmul": bool(torch.backends.cuda.matmul.allow_tf32),
+                "tf32_cudnn": bool(torch.backends.cudnn.allow_tf32),
+                "flashinfer_version": _version("flashinfer-python") or _version("flashinfer"),
+                "flash_attn_version": _version("flash-attn") or _version("flash_attn"),
+                "attention_backend_env": os.environ.get("DIFFUSION_ATTENTION_BACKEND"),
+            }
+        except Exception as exc:  # pragma: no cover - instrumentation must never break generation
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     def _persist_trajectory_probe(
         self,
         probe_state: dict[str, Any] | None,
@@ -930,6 +1010,8 @@ class Wan22Pipeline(
             "scheduler_class": probe_state["scheduler_class"],
             "flow_shift": probe_state["flow_shift"],
             "records": saved_records,
+            # Additive (2026-09-07): runtime-observed execution provenance for numerical-compatibility experiments.
+            "runtime_fingerprint": self._runtime_fingerprint(),
         }
         metadata_path = artifact_dir / f"{probe_state['label']}_trajectory_probe.json"
         metadata_path.write_text(json.dumps(metadata, indent=2))
